@@ -1,6 +1,6 @@
-# Qwen Code Fine-tuning with RLAIF (Reinforcement Learning from AI Feedback)
+# Code Fine-tuning with RLAIF (Reinforcement Learning from AI Feedback)
 
-This project implements a teacher-student training scheme to fine-tune a Qwen model for generating high-quality C++, Python, and Rust code using Reinforcement Learning from AI Feedback (RLAIF).
+This project implements a teacher-student training scheme to fine-tune any generative AI model for generating high-quality C++, Python, and Rust code using Reinforcement Learning from AI Feedback (RLAIF).
 
 ## Table of Contents
 
@@ -25,7 +25,7 @@ This project implements a teacher-student training scheme to fine-tune a Qwen mo
 
 The training system uses a two-model architecture:
 - **Teacher Model**: OpenAI Codex (GPT-4) or Claude - provides high-quality reference code and scoring
-- **Student Model**: Qwen model (Qwen2.5-7B-Instruct) - being fine-tuned to match teacher quality
+- **Student Model**: Smaller GenAI model (default: Qwen2.5-Coder-3B-Instruct) - being fine-tuned to match teacher quality. Can be customized via `--model` argument.
 
 ## Quick Start
 
@@ -46,7 +46,7 @@ The training system uses a two-model architecture:
 uv pip install -r requirements.txt
 
 # (Optional) Preload model for faster startup
-uv run python preload_model.py --model Qwen/Qwen2.5-7B-Instruct
+uv run python preload_model.py --model Qwen/Qwen2.5-Coder-3B-Instruct
 
 # Generate sample data
 uv run python data_utils.py
@@ -89,7 +89,7 @@ uv run python train_rlaif.py --config config.yaml
 ### Expected Output
 
 ```
-2024-01-XX XX:XX:XX - INFO - Loading base model: Qwen/Qwen2.5-7B-Instruct
+2024-01-XX XX:XX:XX - INFO - Loading base model: Qwen/Qwen2.5-Coder-3B-Instruct
 2024-01-XX XX:XX:XX - INFO - Using MPS (Metal Performance Shaders)
 2024-01-XX XX:XX:XX - INFO - Initializing teacher model: anthropic/claude-3-5-haiku-20241022
 2024-01-XX XX:XX:XX - INFO - Starting RLAIF training...
@@ -225,17 +225,49 @@ Edit `config.yaml` to customize training:
 
 ## Usage
 
+The training script is generic and works with any compatible model. By default, it uses `Qwen/Qwen2.5-Coder-3B-Instruct` (optimized for M5 MacBook), but you can specify any model via the `--model` argument.
+
 ### Basic Training
 
 ```bash
 uv run python train_rlaif.py --config config.yaml
 ```
 
+### Custom Model
+
+You can specify a different model using the `--model` argument. This makes the pipeline generic and works with any compatible model:
+
+```bash
+# Use a different Qwen model
+uv run python train_rlaif.py --config config.yaml --model Qwen/Qwen2.5-7B-Instruct
+
+# Use a local model path
+uv run python train_rlaif.py --config config.yaml --model ./my_local_model
+
+# Use any HuggingFace model
+uv run python train_rlaif.py --config config.yaml --model microsoft/phi-2
+```
+
+**Recommended Models for M5 MacBook (32GB):**
+- `Qwen/Qwen2.5-Coder-3B-Instruct` (default) - Fastest, best for development
+- `Qwen/Qwen2.5-7B-Instruct` - Better quality, slower
+- `Qwen/Qwen2.5-Coder-7B-Instruct` - Best code quality, requires more memory
+
 ### Custom Data Files
 
 ```bash
 uv run python train_rlaif.py \
     --config config.yaml \
+    --train_file ./data/my_train.jsonl \
+    --eval_file ./data/my_eval.jsonl
+```
+
+### Combined Options
+
+```bash
+uv run python train_rlaif.py \
+    --config config.yaml \
+    --model Qwen/Qwen2.5-7B-Instruct \
     --train_file ./data/my_train.jsonl \
     --eval_file ./data/my_eval.jsonl
 ```
@@ -327,7 +359,7 @@ The script is optimized for M5 MacBook:
 To avoid slow loading on every training run, preload the model once:
 
 ```bash
-uv run python preload_model.py --model Qwen/Qwen2.5-7B-Instruct
+uv run python preload_model.py --model Qwen/Qwen2.5-Coder-3B-Instruct
 ```
 
 This will:
@@ -340,7 +372,7 @@ This will:
 
 #### Understanding Loading Times
 
-For Qwen2.5-7B-Instruct with 4-bit quantization:
+For Qwen2.5-Coder-3B-Instruct with 4-bit quantization:
 
 - **Tokenizer Loading**: ~1-2 seconds
 - **Model Config**: ~0.5 seconds
@@ -435,12 +467,12 @@ PyTorch MPS (Metal Performance Shaders) on Apple Silicon provides GPU accelerati
 ```bash
 # Convert HuggingFace model to MLX
 uv run python convert_to_mlx.py \
-    --hf-path Qwen/Qwen2.5-7B-Instruct \
+    --hf-path Qwen/Qwen2.5-Coder-3B-Instruct \
     --mlx-path ./mlx_model
 
 # Or with quantization (smaller, faster)
 uv run python convert_to_mlx.py \
-    --hf-path Qwen/Qwen2.5-7B-Instruct \
+    --hf-path Qwen/Qwen2.5-Coder-3B-Instruct \
     --mlx-path ./mlx_model \
     --quantize q8_bit  # or q4_bit
 ```
@@ -558,7 +590,7 @@ If you see "MLX model not found", the code will fall back to PyTorch MPS. To fix
 
 1. Convert model to MLX:
    ```bash
-   uv run python convert_to_mlx.py --hf-path Qwen/Qwen2.5-7B-Instruct --mlx-path ./mlx_model
+   uv run python convert_to_mlx.py --hf-path Qwen/Qwen2.5-Coder-3B-Instruct --mlx-path ./mlx_model
    ```
 
 2. Update config:
@@ -582,7 +614,7 @@ After training, validate your model to compare pre-training vs post-training qua
 
 ```bash
 uv run python validate_model.py \
-    --base_model Qwen/Qwen2.5-7B-Instruct \
+    --base_model Qwen/Qwen2.5-Coder-3B-Instruct \
     --fine_tuned_path ./checkpoints/checkpoint-500 \
     --test_prompts ./data/eval.jsonl \
     --output ./validation_results.json

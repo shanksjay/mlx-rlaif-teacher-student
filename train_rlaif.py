@@ -747,8 +747,12 @@ class RLAIFTrainer:
             os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
             logger.info("MPS memory management: Set PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0 to allow more memory")
             # Also reduce per-process memory fraction to leave more headroom
-            torch.backends.mps.set_per_process_memory_fraction(0.6)  # Reduced from 0.7 to 0.6
-            logger.info("MPS memory: Set per-process memory fraction to 0.6 (60%)")
+            # Check if method exists (not available in all PyTorch versions)
+            if hasattr(torch.backends.mps, 'set_per_process_memory_fraction'):
+                torch.backends.mps.set_per_process_memory_fraction(0.6)  # Reduced from 0.7 to 0.6
+                logger.info("MPS memory: Set per-process memory fraction to 0.6 (60%)")
+            else:
+                logger.info("MPS memory: set_per_process_memory_fraction not available in this PyTorch version")
         
         # MLX model for faster generation (optional, much faster than PyTorch MPS)
         # Load MLX model if enabled (similar to preload_model.py)
@@ -774,7 +778,7 @@ class RLAIFTrainer:
                     for path in possible_paths:
                         logger.warning(f"  - {path}")
                     logger.warning("To convert model to MLX:")
-                    logger.warning("  uv run python convert_to_mlx.py --hf-path Qwen/Qwen2.5-7B-Instruct --mlx-path ./mlx_model_q8 --quantize q8_bit")
+                    logger.warning(f"  uv run python convert_to_mlx.py --hf-path {self.config.base_model} --mlx-path ./mlx_model_q8 --quantize q8_bit")
                     logger.warning("Falling back to PyTorch MPS for generation (slower)")
             
             # Load MLX model if path was found or specified
@@ -1474,6 +1478,10 @@ class RLAIFTrainer:
         """Perform one training step with RLAIF (optimized for M5)"""
         self.model.train()
         
+        # Initialize variables to avoid "referenced before assignment" errors
+        ref_outputs = None
+        ref_log_probs = None
+        
         # Move to device with non_blocking for faster transfer
         input_ids = batch['input_ids'].to(self.device, non_blocking=True)
         attention_mask = batch['attention_mask'].to(self.device, non_blocking=True)
@@ -1813,7 +1821,8 @@ class RLAIFTrainer:
         
         # Clear intermediate tensors to free memory (optimization for M5)
         # Delete in order to free memory immediately
-        del logits, log_probs, ref_log_probs, selected_log_probs, ref_selected_log_probs, outputs, ref_outputs
+        # Note: ref_outputs was already deleted earlier (line 1535) to free memory immediately
+        del logits, log_probs, ref_log_probs, selected_log_probs, ref_selected_log_probs, outputs
         
         return {
             'loss': total_loss.item(),
@@ -1934,7 +1943,7 @@ class RLAIFTrainer:
                     elif tokens_per_sec < 1.0:
                         # PyTorch MPS is slow - provide actionable advice
                         logger.warning("⚠️  Slow generation. Consider using MLX for 5-10x speedup:")
-                        logger.warning("  1. Convert model: uv run python convert_to_mlx.py --hf-path Qwen/Qwen2.5-7B-Instruct --mlx-path ./mlx_model --quantize q8_bit")
+                        logger.warning(f"  1. Convert model: uv run python convert_to_mlx.py --hf-path {self.config.base_model} --mlx-path ./mlx_model --quantize q8_bit")
                         logger.warning("  2. Update config.yaml: hardware.use_mlx_for_generation: true")
                 
                 # Compute rewards and collect dataset entries (optimized)
@@ -2822,7 +2831,7 @@ def load_config(config_path: str) -> Tuple[RLAIFConfig, dict]:
         return bool(value)
     
     rlaif_config = RLAIFConfig(
-        base_model=model_cfg.get('base_model', 'Qwen/Qwen2.5-7B-Instruct'),
+        base_model=model_cfg.get('base_model', 'Qwen/Qwen2.5-Coder-3B-Instruct'),
         teacher_provider=teacher_cfg.get('provider', 'openai'),
         teacher_model=teacher_cfg.get('model_name', 'claude-3-5-haiku-20241022' if teacher_cfg.get('provider') == 'anthropic' else 'gpt-4-turbo-preview'),
         teacher_api_key_env=teacher_cfg.get('api_key_env', 'OPENAI_API_KEY'),
@@ -2871,12 +2880,34 @@ def load_config(config_path: str) -> Tuple[RLAIFConfig, dict]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="RLAIF Training for Qwen Code Model")
+    parser = argparse.ArgumentParser(
+        description="RLAIF Training for Code Generation Models",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Use default model (Qwen2.5-Coder-3B-Instruct)
+  python train_rlaif.py --config config.yaml
+
+  # Use a different model
+  python train_rlaif.py --config config.yaml --model Qwen/Qwen2.5-7B-Instruct
+
+  # Use a local model
+  python train_rlaif.py --config config.yaml --model ./my_local_model
+
+  # Custom data files
+  python train_rlaif.py --config config.yaml --train_file ./data/train.jsonl
+        """
+    )
     parser.add_argument(
         '--config',
         type=str,
         default='config.yaml',
         help='Path to configuration file'
+    )
+    parser.add_argument(
+        '--model',
+        type=str,
+        help='Model name or path (overrides config, e.g., Qwen/Qwen2.5-Coder-3B-Instruct)'
     )
     parser.add_argument(
         '--train_file',
@@ -2893,6 +2924,11 @@ def main():
     
     # Load configuration
     config, data_cfg = load_config(args.config)
+    
+    # Override model if provided via command line
+    if args.model:
+        config.base_model = args.model
+        logger.info(f"Using model from command line: {config.base_model}")
     
     # Setup logging level
     logging.getLogger().setLevel(getattr(logging, config.log_level))
