@@ -4,7 +4,7 @@
 set -e
 
 echo "=========================================="
-echo "Qwen Code RLAIF Training Setup"
+echo "Small LLM Code RLAIF Training Setup"
 echo "=========================================="
 
 # Check for API key

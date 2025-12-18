@@ -2,7 +2,7 @@
 
 # Model Configuration
 model:
-  base_model: "Qwen/Qwen2.5-7B-Instruct"  # Baseline Qwen model
+  base_model: "Qwen/Qwen2.5-Coder-3B-Instruct"  # Baseline Qwen model (smaller, faster for M5 MacBook)
   use_4bit: true  # Use 4-bit quantization for M5 MacBook
   use_flash_attention: true
   max_length: 512  # Reduced from 1024 to prevent MPS OOM (can increase if memory allows)
