@@ -43,7 +43,7 @@ def create_dataset_card(
     val_count: int,
     eval_count: int,
     base_model: str = "Qwen/Qwen2.5-7B-Instruct",
-    repo_id: str = "mlx-community/qwen-code-rfai-dataset"
+    repo_id: str = "mlx-community/qwen-code-rlaif-dataset"
 ) -> str:
     """Create a dataset card"""
     return f"""---
@@ -57,19 +57,19 @@ tags:
 - python
 - cpp
 - rust
-- rfai
+- rlaif
 - reinforcement-learning
 size_categories:
 - 1K<n<10K
 ---
 
-# Qwen Code RFAI Dataset
+# Qwen Code RLAIF Dataset
 
-This dataset contains prompts, teacher-generated code, student-generated code, and scoring parameters from the RFAI (Reinforcement from AI Feedback) training process.
+This dataset contains prompts, teacher-generated code, student-generated code, and scoring parameters from the RLAIF (Reinforcement Learning from AI Feedback) training process.
 
 ## Dataset Description
 
-This dataset was generated during the fine-tuning of a Qwen model for code generation using RFAI methodology.
+This dataset was generated during the fine-tuning of a Qwen model for code generation using RLAIF methodology.
 
 ## Dataset Structure
 
@@ -137,7 +137,7 @@ def upload_dataset(
             folder_path=str(dataset_dir),
             repo_id=repo_id,
             token=hf_token,
-            commit_message="Upload RFAI training dataset",
+            commit_message="Upload RLAIF training dataset",
             ignore_patterns=["*.pyc", "__pycache__", "*.py"]
         )
         
@@ -160,7 +160,7 @@ def main():
         '--repo_id',
         type=str,
         required=True,
-        help='Hugging Face dataset repository ID (e.g., mlx-community/qwen-code-rfai-dataset)'
+        help='Hugging Face dataset repository ID (e.g., mlx-community/qwen-code-rlaif-dataset)'
     )
     parser.add_argument(
         '--hf_token',
