@@ -84,8 +84,8 @@ hardware:
   mlx_quantization: q8_bit  # Options: "q4_bit", "q8_bit", or null for no quantization
   use_mlx_for_generation: true  # Use MLX for generation (5-10x faster than PyTorch MPS) - enabled by default
   # Auto-detects MLX model if mlx_model_path is null by checking common locations
-  mlx_model_path: null  # Path to MLX model (e.g., "./mlx_model", "./mlx_model_q8", "./mlx_model_q4")
-                         # If null, will auto-detect from: ./mlx_model_q8, ./mlx_model_q4, ./mlx_model
+  mlx_model_path: null  # Path to MLX model (e.g., "./mlx_model/q8", "./mlx_model/q4", "./mlx_model/base")
+                         # If null, will auto-detect from: ./mlx_model/q8, ./mlx_model/q4, ./mlx_model/base
 
 # Hugging Face Upload Configuration
 huggingface:

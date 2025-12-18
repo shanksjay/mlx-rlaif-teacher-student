@@ -128,7 +128,7 @@ Examples:
   python convert_to_mlx.py --hf-path Qwen/Qwen2.5-7B-Instruct --mlx-path ./mlx_model
   
   # Convert with quantization
-  python convert_to_mlx.py --hf-path Qwen/Qwen2.5-7B-Instruct --mlx-path ./mlx_model --quantize q4_bit
+  python convert_to_mlx.py --hf-path Qwen/Qwen2.5-7B-Instruct --mlx-path ./mlx_model/q4 --quantize q4_bit
   
   # Convert from local checkpoint
   python convert_to_mlx.py --hf-path ./checkpoints/checkpoint-500 --mlx-path ./mlx_model

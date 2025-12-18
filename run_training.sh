@@ -24,7 +24,7 @@ mkdir -p logs/tensorboard
 # Generate sample data if it doesn't exist
 if [ ! -f "data/train.jsonl" ]; then
     echo "Generating sample training data..."
-    uv run python data_utils.py
+    uv run python scripts/utils/data_utils.py
 fi
 
 # Check if config exists
@@ -42,7 +42,7 @@ echo "=========================================="
 echo ""
 
 # Run training
-uv run python train_rlaif.py --config config.yaml
+uv run python scripts/training/train_rlaif.py --config config.yaml
 
 echo ""
 echo "=========================================="
