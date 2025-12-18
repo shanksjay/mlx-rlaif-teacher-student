@@ -252,6 +252,26 @@ python load_mlx_model.py \
     --language python
 ```
 
+## MLX Optimization (5-10x Faster Generation)
+
+For **5-10x faster generation** on Apple Silicon, use MLX instead of PyTorch MPS:
+
+1. **Convert model to MLX**:
+   ```bash
+   uv run python convert_to_mlx.py --hf-path Qwen/Qwen2.5-7B-Instruct --mlx-path ./mlx_model
+   ```
+
+2. **Update config.yaml**:
+   ```yaml
+   hardware:
+     use_mlx_for_generation: true
+     mlx_model_path: "./mlx_model"
+   ```
+
+3. **Run training**: Generation will now use MLX (much faster!)
+
+See [MLX_OPTIMIZATION_GUIDE.md](MLX_OPTIMIZATION_GUIDE.md) for detailed instructions.
+
 ## M5 MacBook Optimizations
 
 The script is optimized for M5 MacBook:
@@ -409,11 +429,29 @@ Adjust reward weights in teacher scoring to emphasize:
 - Code quality: Increase quality weight
 - Efficiency: Increase efficiency weight
 
+## Profiling
+
+To profile model loading and training with call stacks and timing:
+
+```bash
+# Profile with Apple Instruments (recommended for macOS)
+uv run python profile_with_instruments.py --method instruments --script profile_model_loading.py
+
+# Profile with py-spy (flamegraph)
+uv run python profile_with_instruments.py --method pyspy --script profile_model_loading.py
+
+# Profile with all methods
+uv run python profile_with_instruments.py --method all --script profile_model_loading.py
+```
+
+See [PROFILING_GUIDE.md](PROFILING_GUIDE.md) for detailed instructions on using Apple Instruments, py-spy, cProfile, and memory profiling tools.
+
 ## References
 
 - [Qwen Models](https://github.com/QwenLM/Qwen)
 - [Reinforcement Learning from Human Feedback](https://arxiv.org/abs/2009.01325)
 - [PPO for Language Models](https://arxiv.org/abs/2009.01325)
+- [Apple Instruments User Guide](https://developer.apple.com/documentation/instruments)
 
 ## License
 

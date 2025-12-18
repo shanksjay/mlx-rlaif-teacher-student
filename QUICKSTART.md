@@ -14,10 +14,13 @@
 
 ```bash
 # Install dependencies
-pip install -r requirements.txt
+uv pip install -r requirements.txt
+
+# (Optional) Preload model for faster startup
+uv run python preload_model.py --model Qwen/Qwen2.5-7B-Instruct
 
 # Generate sample data
-python data_utils.py
+uv run python data_utils.py
 ```
 
 ## Run Training

@@ -45,7 +45,7 @@ class ModelValidator:
         self.baseline_model = AutoModelForCausalLM.from_pretrained(
             base_model,
             device_map="auto",
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,  # Use dtype instead of torch_dtype
         )
         
         # Load fine-tuned model
@@ -53,7 +53,7 @@ class ModelValidator:
         self.fine_tuned_model = AutoModelForCausalLM.from_pretrained(
             fine_tuned_path,
             device_map="auto",
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,  # Use dtype instead of torch_dtype
         )
         
         # Initialize teacher for scoring

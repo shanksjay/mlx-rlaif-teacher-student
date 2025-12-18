@@ -5,24 +5,32 @@ model:
   base_model: "Qwen/Qwen2.5-7B-Instruct"  # Baseline Qwen model
   use_4bit: true  # Use 4-bit quantization for M5 MacBook
   use_flash_attention: true
-  max_length: 2048
+  max_length: 512  # Reduced from 1024 to prevent MPS OOM (can increase if memory allows)
   device_map: "auto"
+  use_safetensors: true  # Use safetensors for faster loading
+  low_cpu_mem_usage: true  # Optimize memory during loading
 
 # Teacher Model Configuration
 teacher:
   provider: "anthropic"  # Options: "openai" or "anthropic"
-  model_name: "claude-3-sonnet-20240229"  # For OpenAI: "gpt-4-turbo-preview", "gpt-3.5-turbo"
-  # For Anthropic: "claude-3-opus-20240229", "claude-3-sonnet-20240229"
+  model_name: "claude-3-5-haiku-20241022"  # For OpenAI: "gpt-4-turbo-preview", "gpt-3.5-turbo"
+  # For Anthropic: Recommended models (will auto-fallback if unavailable):
+  #   - "claude-3-5-haiku-20241022" (fastest, cheapest, recommended)
+  #   - "claude-3-5-sonnet-20241022" (better quality, slower, more expensive)
+  #   - "claude-3-opus-20240229" (deprecated Jan 2026, but may still work)
+  #   - "claude-3-sonnet-20240229" (deprecated Jul 2025, but may still work)
+  # Note: The system will automatically try fallback models if your requested model is unavailable.
+  # Check available models at: https://console.anthropic.com/settings/keys
   api_key_env: "ANTHROPIC_API_KEY"  # or "OPENAI_API_KEY"
   temperature: 0.7
-  max_tokens: 2048
+  max_tokens: 512
 
 # Training Configuration
 training:
   output_dir: "./checkpoints"
   num_epochs: 3
-  batch_size: 4  # Adjust based on M5 memory
-  gradient_accumulation_steps: 8
+  batch_size: 4  
+  gradient_accumulation_steps: 16  # Increased from 8 to maintain effective batch size of 32
   learning_rate: 2e-5
   warmup_steps: 100
   save_steps: 500
@@ -40,7 +48,7 @@ rfai:
   beta: 0.1  # Temperature for reward scaling
   top_k: 50
   top_p: 0.95
-  num_samples_per_prompt: 4  # Number of student samples to generate per prompt
+  num_samples_per_prompt: 2  # Number of student samples to generate per prompt
 
 # Data Configuration
 data:
@@ -74,6 +82,10 @@ hardware:
   dataloader_num_workers: 4
   save_mlx_format: true  # Save model in MLX format for faster inference on Apple Silicon
   mlx_quantization: q8_bit  # Options: "q4_bit", "q8_bit", or null for no quantization
+  use_mlx_for_generation: true  # Use MLX for generation (5-10x faster than PyTorch MPS) - enabled by default
+  # Auto-detects MLX model if mlx_model_path is null by checking common locations
+  mlx_model_path: null  # Path to MLX model (e.g., "./mlx_model", "./mlx_model_q8", "./mlx_model_q4")
+                         # If null, will auto-detect from: ./mlx_model_q8, ./mlx_model_q4, ./mlx_model
 
 # Hugging Face Upload Configuration
 huggingface:

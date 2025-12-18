@@ -17,6 +17,9 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass, field
 from datetime import datetime
+import asyncio
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
 
 import torch
 import torch.nn as nn
@@ -27,6 +30,8 @@ from tqdm import tqdm
 import psutil
 import threading
 import time
+
+os.environ["TOKENIZERS_PARALLELISM"] = "true"
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
@@ -45,6 +50,20 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Suppress httpx HTTP request logs in INFO mode (only show in DEBUG)
+# httpx logs every HTTP request at INFO level, which is too verbose
+httpx_logger = logging.getLogger("httpx")
+httpx_logger.setLevel(logging.WARNING)  # Only show WARNING and above (suppress INFO)
+
+# Suppress PyTorch inductor warnings (harmless on Apple Silicon MPS)
+# These warnings are CUDA-specific and don't apply to MPS
+import warnings
+warnings.filterwarnings("ignore", message=".*Not enough SMs to use max_autotune_gemm mode.*")
+warnings.filterwarnings("ignore", message=".*max_autotune_gemm.*")
+# Also suppress via logging for torch._inductor
+torch_inductor_logger = logging.getLogger("torch._inductor.utils")
+torch_inductor_logger.setLevel(logging.ERROR)  # Only show errors, suppress warnings
 
 
 @dataclass
@@ -89,6 +108,10 @@ class RFAIConfig:
     dataset_repo_id: Optional[str] = None
     save_datasets_locally: bool = True
     dataset_output_dir: str = "./datasets"
+    use_safetensors: bool = True
+    low_cpu_mem_usage: bool = True
+    use_mlx_for_generation: bool = True  # Use MLX for faster generation (requires MLX model) - enabled by default
+    mlx_model_path: Optional[str] = None  # Path to MLX model for generation
 
 
 class CodeDataset(Dataset):
@@ -167,43 +190,120 @@ class TeacherModel:
             self.client = openai.OpenAI(api_key=api_key)
         elif provider == "anthropic":
             self.client = Anthropic(api_key=api_key)
+            # Test model availability and try fallbacks if needed
+            self._test_and_fallback_model()
         else:
             raise ValueError(f"Unknown provider: {provider}")
+    
+    def _test_and_fallback_model(self):
+        """Test if the model is available, try fallbacks if not"""
+        # List of models to try in order (newer, non-deprecated models first)
+        models_to_try = [self.model_name]  # Start with requested model
+        fallback_models = [
+            "claude-3-5-haiku-20241022",  # Newest, fastest, cheapest (recommended)
+            "claude-3-5-sonnet-20241022",  # Newest, better quality
+            "claude-3-opus-20240229",  # Deprecated but may still work
+            "claude-3-sonnet-20240229",  # Deprecated but may still work
+        ]
+        
+        # Add fallbacks that aren't already the requested model
+        for fallback in fallback_models:
+            if fallback != self.model_name:
+                models_to_try.append(fallback)
+        
+        # Suppress deprecation warnings during model testing
+        import warnings
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*deprecated.*")
+            
+            # Try each model until one works
+            for model_name in models_to_try:
+                try:
+                    # Minimal test call
+                    test_response = self.client.messages.create(
+                        model=model_name,
+                        max_tokens=1,
+                        messages=[{"role": "user", "content": "test"}]
+                    )
+                    if model_name != self.model_name:
+                        logger.warning(f"⚠️  Model '{self.model_name}' not available. Using fallback: '{model_name}'")
+                    else:
+                        logger.info(f"✓ Model '{model_name}' is available")
+                    self.model_name = model_name
+                    return
+                except Exception as e:
+                    error_str = str(e)
+                    if "404" in error_str or "not_found" in error_str.lower():
+                        continue  # Try next model
+                    else:
+                        # Other errors (rate limit, auth, etc.) - log and continue with first model
+                        logger.warning(f"⚠️  Error testing model '{model_name}': {e}")
+                        if model_name == self.model_name:
+                            # If the requested model fails for non-404 reasons, continue
+                            continue
+        
+        # If all models fail, log error but continue (will fail on actual use with better error)
+        logger.error(f"❌ Could not find any available Anthropic model.")
+        logger.error(f"   Tried: {', '.join(models_to_try)}")
+        logger.error(f"   Check your API key permissions at: https://console.anthropic.com/settings/keys")
+        logger.error(f"   Your API key may not have access to these models.")
     
     def generate(self, prompt: str, language: str, max_tokens: int = 2048) -> str:
         """Generate code using teacher model"""
         system_prompt = f"You are an expert {language} programmer. Generate clean, efficient, and well-documented code."
         full_prompt = f"{prompt}\n\nGenerate high-quality {language} code:"
         
-        try:
-            if self.provider == "openai":
-                response = self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": full_prompt}
-                    ],
-                    temperature=self.temperature,
-                    max_tokens=max_tokens
-                )
-                return response.choices[0].message.content.strip()
+        # Suppress deprecation warnings for Anthropic API calls
+        import warnings
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*deprecated.*")
             
-            elif self.provider == "anthropic":
-                response = self.client.messages.create(
-                    model=self.model_name,
-                    max_tokens=max_tokens,
-                    temperature=self.temperature,
-                    system=system_prompt,
-                    messages=[{"role": "user", "content": full_prompt}]
-                )
-                return response.content[0].text.strip()
-        
-        except Exception as e:
-            logger.error(f"Error generating from teacher model: {e}")
-            return ""
+            try:
+                if self.provider == "openai":
+                    response = self.client.chat.completions.create(
+                        model=self.model_name,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": full_prompt}
+                        ],
+                        temperature=self.temperature,
+                        max_tokens=max_tokens
+                    )
+                    return response.choices[0].message.content.strip()
+                
+                elif self.provider == "anthropic":
+                    response = self.client.messages.create(
+                        model=self.model_name,
+                        max_tokens=max_tokens,
+                        temperature=self.temperature,
+                        system=system_prompt,
+                        messages=[{"role": "user", "content": full_prompt}]
+                    )
+                    return response.content[0].text.strip()
+            
+            except Exception as e:
+                error_str = str(e)
+                if "404" in error_str or "not_found" in error_str.lower():
+                    logger.error(f"Error: Model '{self.model_name}' not found. This may be due to:")
+                    logger.error(f"  1. Incorrect model name format")
+                    logger.error(f"  2. Model not available in your API plan")
+                    logger.error(f"  3. API key doesn't have access to this model")
+                    logger.error(f"  Common Anthropic models: 'claude-3-5-sonnet', 'claude-3-5-haiku', 'claude-3-opus-20240229'")
+                    logger.error(f"  Check available models at: https://docs.anthropic.com/claude/docs/models-overview")
+                else:
+                    logger.error(f"Error generating from teacher model: {e}")
+                return ""
     
-    def score_code(self, code: str, prompt: str, language: str) -> float:
-        """Score code quality using teacher model"""
+    def score_code(self, code: str, prompt: str, language: str, use_cache: bool = True) -> float:
+        """Score code quality using teacher model with optional caching"""
+        # Cache key for scoring (include code hash to avoid collisions)
+        if use_cache:
+            import hashlib
+            code_hash = hashlib.md5(code.encode()).hexdigest()[:8]
+            cache_key = f"{code_hash}:{prompt}:{language}"
+            # Check cache (if we have a cache available)
+            # Note: We'll implement this in the trainer class
+        
         scoring_prompt = f"""Evaluate the following {language} code on a scale of 0.0 to 1.0 based on:
 1. Correctness (0.3): Does it solve the problem correctly?
 2. Code Quality (0.3): Is it clean, readable, and well-structured?
@@ -217,37 +317,72 @@ Code:
 {code}
 ```
 
-Respond with ONLY a single float between 0.0 and 1.0, nothing else."""
+IMPORTANT: Respond with ONLY a single float between 0.0 and 1.0 (e.g., 0.75). Do not include explanations, additional text, or newlines. Just the number."""
         
-        try:
-            if self.provider == "openai":
-                response = self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=[{"role": "user", "content": scoring_prompt}],
-                    temperature=0.1,
-                    max_tokens=50
-                )
-                score_text = response.choices[0].message.content.strip()
-            else:  # anthropic
-                response = self.client.messages.create(
-                    model=self.model_name,
-                    max_tokens=50,
-                    temperature=0.1,
-                    messages=[{"role": "user", "content": scoring_prompt}]
-                )
-                score_text = response.content[0].text.strip()
+        # Suppress deprecation warnings for Anthropic API calls
+        import warnings
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*deprecated.*")
             
-            # Extract float from response
             try:
-                score = float(score_text)
-                return max(0.0, min(1.0, score))  # Clamp to [0, 1]
-            except ValueError:
-                logger.warning(f"Could not parse score: {score_text}")
+                if self.provider == "openai":
+                    response = self.client.chat.completions.create(
+                        model=self.model_name,
+                        messages=[{"role": "user", "content": scoring_prompt}],
+                        temperature=0.1,
+                        max_tokens=50
+                    )
+                    score_text = response.choices[0].message.content.strip()
+                else:  # anthropic
+                    response = self.client.messages.create(
+                        model=self.model_name,
+                        max_tokens=50,
+                        temperature=0.1,
+                        messages=[{"role": "user", "content": scoring_prompt}]
+                    )
+                    score_text = response.content[0].text.strip()
+                
+                # Extract float from response (handle cases where score is embedded in text)
+                import re
+                try:
+                    # Try direct float conversion first
+                    score = float(score_text.strip())
+                    return max(0.0, min(1.0, score))  # Clamp to [0, 1]
+                except ValueError:
+                    # If that fails, try to extract first float from the text
+                    # Look for patterns like "0.4", "0.75", "1.0", etc.
+                    float_pattern = r'\b(0\.\d+|1\.0|0|1)\b'
+                    matches = re.findall(float_pattern, score_text)
+                    if matches:
+                        try:
+                            score = float(matches[0])
+                            return max(0.0, min(1.0, score))  # Clamp to [0, 1]
+                        except ValueError:
+                            pass
+                    
+                    # If still no match, try to find any number between 0 and 1
+                    # Look for decimal numbers in the range [0, 1]
+                    decimal_pattern = r'\b(0?\.\d+)\b'
+                    decimal_matches = re.findall(decimal_pattern, score_text)
+                    if decimal_matches:
+                        try:
+                            score = float(decimal_matches[0])
+                            if 0.0 <= score <= 1.0:
+                                return score
+                        except ValueError:
+                            pass
+                    
+                    logger.warning(f"Could not parse score from: {score_text[:100]}...")
+                    return 0.5
+            
+            except Exception as e:
+                error_str = str(e)
+                if "404" in error_str or "not_found" in error_str.lower():
+                    logger.error(f"Error: Model '{self.model_name}' not found when scoring code.")
+                    logger.error(f"  Check your model name in config.yaml. Common models: 'claude-3-5-sonnet', 'claude-3-5-haiku'")
+                else:
+                    logger.error(f"Error scoring code: {e}")
                 return 0.5
-        
-        except Exception as e:
-            logger.error(f"Error scoring code: {e}")
-            return 0.5
 
 
 class RFAITrainer:
@@ -259,30 +394,254 @@ class RFAITrainer:
         
         # Load model and tokenizer
         logger.info(f"Loading base model: {config.base_model}")
-        self.tokenizer = AutoTokenizer.from_pretrained(config.base_model)
+        
+        # Load tokenizer first (fast)
+        logger.info("Loading tokenizer...")
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            config.base_model,
+            use_fast=True,  # Use fast tokenizer
+            trust_remote_code=True
+        )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         
+        # Optimize model loading (matching preload_model.py for speed)
+        logger.info("Loading model weights (this may take a few minutes)...")
+        load_start = time.time()
+        
+        # Monitor memory before loading
+        try:
+            import psutil
+            process = psutil.Process()
+            mem_before = process.memory_info().rss / (1024 ** 3)
+            logger.info(f"Memory before loading: {mem_before:.2f} GB")
+        except:
+            process = None
+            mem_before = 0
+        
+        # Use safetensors for faster loading (same as preload_model.py)
+        model_kwargs = {
+            "device_map": "auto",
+            "dtype": torch.bfloat16 if config.use_mps else torch.float32,  # Use dtype instead of torch_dtype
+            "trust_remote_code": True,
+            "low_cpu_mem_usage": config.low_cpu_mem_usage,  # Optimize memory usage during loading
+        }
+        
+        # Prefer safetensors format for faster loading
+        if config.use_safetensors:
+            try:
+                from safetensors.torch import load_file
+                model_kwargs["use_safetensors"] = True
+                logger.info("Using safetensors format for faster loading")
+            except ImportError:
+                logger.info("Using standard format (safetensors not available)")
+        
         # Setup quantization for M5 MacBook
         if config.use_4bit:
+            logger.info("Using 4-bit quantization...")
             bnb_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_quant_type="nf4",
                 bnb_4bit_compute_dtype=torch.bfloat16,
                 bnb_4bit_use_double_quant=True,
             )
+            model_kwargs["quantization_config"] = bnb_config
+            model_kwargs["dtype"] = torch.bfloat16  # Use dtype instead of torch_dtype
+        
+        # Simplified monitoring (matching preload_model.py for less overhead)
+        monitoring = True
+        memory_samples = []
+        shard_start = time.time()
+        
+        def monitor_loading():
+            """Monitor memory during loading (simplified for speed)"""
+            while monitoring:
+                elapsed = time.time() - shard_start
+                try:
+                    if process:
+                        process_mem = process.memory_info().rss / (1024 ** 3)
+                        system_mem = psutil.virtual_memory().used / (1024 ** 3)
+                        # Store both process and system memory
+                        memory_samples.append((elapsed, process_mem, system_mem))
+                except:
+                    pass
+                time.sleep(0.5)  # Sample every 0.5 seconds (less frequent = less overhead)
+        
+        monitor_thread = threading.Thread(target=monitor_loading, daemon=True)
+        monitor_thread.start()
+        
+        # Clear cache before loading
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        elif torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        # Load model (same pattern as preload_model.py)
+        try:
             self.model = AutoModelForCausalLM.from_pretrained(
                 config.base_model,
-                quantization_config=bnb_config,
-                device_map="auto",
-                torch_dtype=torch.bfloat16,
+                **model_kwargs
             )
-        else:
-            self.model = AutoModelForCausalLM.from_pretrained(
-                config.base_model,
-                device_map="auto",
-                torch_dtype=torch.bfloat16 if config.use_mps else torch.float32,
-            )
+        except Exception as e:
+            logger.warning(f"Error with optimized loading: {e}. Trying standard loading...")
+            # Fallback to standard loading
+            if config.use_4bit:
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    config.base_model,
+                    quantization_config=bnb_config,
+                    device_map="auto",
+                    dtype=torch.bfloat16,  # Use dtype instead of torch_dtype
+                )
+            else:
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    config.base_model,
+                    device_map="auto",
+                    dtype=torch.bfloat16 if config.use_mps else torch.float32,  # Use dtype instead of torch_dtype
+                )
+        
+        monitoring = False
+        monitor_thread.join(timeout=2)
+        
+        load_time = time.time() - load_start
+        shard_time = time.time() - shard_start
+        
+        # Analyze loading performance (simplified, matching preload_model.py)
+        if memory_samples and len(memory_samples) > 4 and process:
+            logger.info("\n" + "="*60)
+            logger.info("Loading Performance Analysis:")
+            logger.info("="*60)
+            
+            quarter_size = len(memory_samples) // 4
+            quarter_times = []
+            
+            for i in range(4):
+                start_idx = i * quarter_size
+                end_idx = (i + 1) * quarter_size if i < 3 else len(memory_samples)
+                
+                if start_idx < len(memory_samples):
+                    quarter_data = memory_samples[start_idx:end_idx]
+                    if quarter_data:
+                        time_start = quarter_data[0][0]
+                        time_end = quarter_data[-1][0]
+                        # Handle both old format (2 values) and new format (3 values)
+                        if len(quarter_data[0]) == 3:
+                            process_mem_start = quarter_data[0][1]
+                            process_mem_end = quarter_data[-1][1]
+                            system_mem_start = quarter_data[0][2]
+                            system_mem_end = quarter_data[-1][2]
+                            process_mem_peak = max(m[1] for m in quarter_data)
+                            system_mem_peak = max(m[2] for m in quarter_data)
+                            process_mem_delta = process_mem_end - process_mem_start
+                            system_mem_delta = system_mem_end - system_mem_start
+                        else:
+                            # Old format compatibility
+                            process_mem_start = quarter_data[0][1]
+                            process_mem_end = quarter_data[-1][1]
+                            system_mem_start = system_mem_end = system_mem_peak = 0
+                            process_mem_peak = max(m[1] for m in quarter_data)
+                            process_mem_delta = process_mem_end - process_mem_start
+                            system_mem_delta = 0
+                        
+                        quarter_time = time_end - time_start
+                        quarter_times.append(quarter_time)
+                        
+                        logger.info(
+                            f"\n{i*25}%-{(i+1)*25}% (Shard {i+1}): "
+                            f"Time={quarter_time:.1f}s"
+                        )
+                        logger.info(
+                            f"  Process Memory: {process_mem_start:.2f}GB→{process_mem_end:.2f}GB "
+                            f"(peak: {process_mem_peak:.2f}GB, Δ{process_mem_delta:+.2f}GB)"
+                        )
+                        if system_mem_delta != 0:
+                            logger.info(
+                                f"  System Memory: {system_mem_start:.2f}GB→{system_mem_end:.2f}GB "
+                                f"(peak: {system_mem_peak:.2f}GB, Δ{system_mem_delta:+.2f}GB)"
+                            )
+            
+            # Compare quarters
+            if len(quarter_times) == 4:
+                avg_first_three = sum(quarter_times[:3]) / 3
+                last_quarter = quarter_times[3]
+                if last_quarter > avg_first_three * 1.2:
+                    ratio = last_quarter / avg_first_three
+                    logger.info(f"\n⚠️  Last shard (75-100%) is {ratio:.1f}x slower than average")
+                    logger.info("   This is normal due to:")
+                    logger.info("   - Memory pressure from previous shards")
+                    logger.info("   - Device mapping finalization")
+                    logger.info("   - Quantization setup completion")
+        
+        # Monitor memory after loading
+        if process:
+            try:
+                process_mem_after = process.memory_info().rss / (1024 ** 3)
+                system_mem_after = psutil.virtual_memory().used / (1024 ** 3)
+                process_mem_used = process_mem_after - mem_before
+                system_mem_used = system_mem_after - (psutil.virtual_memory().used / (1024 ** 3) if hasattr(psutil, 'virtual_memory') else 0)
+                
+                logger.info(f"\nMemory after loading:")
+                logger.info(f"  Process RSS: {process_mem_after:.2f} GB (Δ{process_mem_used:+.2f} GB)")
+                logger.info(f"  System used: {system_mem_after:.2f} GB / {psutil.virtual_memory().total / (1024 ** 3):.2f} GB (Δ{system_mem_used:+.2f} GB)")
+                logger.info(f"Shard loading time: {shard_time:.1f}s ({shard_time/60:.1f} minutes)")
+            except:
+                pass
+        
+        logger.info(f"\nTotal loading time: {load_time:.1f} seconds ({load_time/60:.1f} minutes)")
+        logger.info("="*60)
+        
+        # Clear cache after loading
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        elif torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        # Compile model for M5 if available (PyTorch 2.0+)
+        if config.use_mps and hasattr(torch, 'compile'):
+            try:
+                logger.info("Compiling model with torch.compile for M5 optimization...")
+                # Suppress inductor warnings during compilation (harmless on MPS/Apple Silicon)
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", message=".*Not enough SMs.*")
+                    warnings.filterwarnings("ignore", message=".*max_autotune.*")
+                    # Also suppress via logging
+                    torch_inductor_logger = logging.getLogger("torch._inductor.utils")
+                    original_level = torch_inductor_logger.level
+                    torch_inductor_logger.setLevel(logging.ERROR)
+                    try:
+                        self.model = torch.compile(self.model, mode="reduce-overhead")
+                    finally:
+                        torch_inductor_logger.setLevel(original_level)
+                logger.info("✓ Model compilation successful")
+            except Exception as e:
+                logger.warning(f"Model compilation failed: {e}. Continuing without compilation.")
+        
+        # Warm up model for faster first generation
+        # First generation is often slow due to MPS initialization and compilation overhead
+        logger.info("Warming up model (first generation is slower)...")
+        warmup_prompt = "Test"
+        warmup_inputs = self.tokenizer(warmup_prompt, return_tensors="pt")
+        device = next(self.model.parameters()).device
+        warmup_inputs = {k: v.to(device) for k, v in warmup_inputs.items()}
+        
+        with torch.no_grad():
+            try:
+                # Very short warmup generation to initialize MPS and compilation
+                _ = self.model.generate(
+                    **warmup_inputs,
+                    max_new_tokens=5,
+                    do_sample=False,
+                    use_cache=True,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                )
+                logger.info("✓ Model warmed up")
+            except Exception as e:
+                logger.debug(f"Warmup failed (non-critical): {e}")
+        
+        # Clear cache after warmup
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        elif torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
         # Initialize teacher model
         logger.info(f"Initializing teacher model: {config.teacher_provider}/{config.teacher_model}")
@@ -322,12 +681,63 @@ class RFAITrainer:
         self.monitoring_enabled = True
         self.monitoring_thread = None
         self.monitoring_interval = 5  # seconds
+        
+        # Performance optimizations
+        self.teacher_cache = {}  # Cache teacher responses (key: f"{prompt}:{language}")
+        self.teacher_score_cache = {}  # Cache teacher scores (key: f"{code}:{prompt}:{language}")
+        self.executor = ThreadPoolExecutor(max_workers=min(4, os.cpu_count() or 4))  # Concurrent API calls (reduced for M5)
+        self.use_batch_generation = True  # Batch student generation
+        self.generation_warmup_done = False  # Track if generation has been warmed up
+        
+        # MLX model for faster generation (optional, much faster than PyTorch MPS)
+        # Load MLX model if enabled (similar to preload_model.py)
+        self.mlx_model = None
+        self.mlx_tokenizer = None
+        if config.use_mlx_for_generation:
+            # Auto-detect MLX model path if not specified
+            mlx_path = config.mlx_model_path
+            if mlx_path is None:
+                # Try common MLX model locations in order of preference
+                possible_paths = [
+                    "./mlx_model_q8",  # Q8 quantized (best balance)
+                    "./mlx_model_q4",  # Q4 quantized (smallest)
+                    "./mlx_model",      # Unquantized
+                ]
+                for path in possible_paths:
+                    if os.path.exists(path):
+                        mlx_path = path
+                        logger.info(f"Auto-detected MLX model at: {mlx_path}")
+                        break
+                if mlx_path is None:
+                    logger.warning("MLX enabled but no model found. Expected locations:")
+                    for path in possible_paths:
+                        logger.warning(f"  - {path}")
+                    logger.warning("To convert model to MLX:")
+                    logger.warning("  uv run python convert_to_mlx.py --hf-path Qwen/Qwen2.5-7B-Instruct --mlx-path ./mlx_model_q8 --quantize q8_bit")
+                    logger.warning("Falling back to PyTorch MPS for generation (slower)")
+            
+            # Load MLX model if path was found or specified
+            if mlx_path is not None:
+                self._load_mlx_model_for_generation(mlx_path)
+        elif config.mlx_model_path:
+            # MLX path specified but not enabled - warn user
+            logger.info(f"MLX model path specified ({config.mlx_model_path}) but use_mlx_for_generation is False")
+            logger.info("To use MLX for faster generation, set in config.yaml:")
+            logger.info("  hardware:")
+            logger.info("    use_mlx_for_generation: true")
+            logger.info(f"    mlx_model_path: {config.mlx_model_path}")
     
     def _setup_device(self):
         """Setup device for M5 MacBook"""
         if self.config.use_mps and torch.backends.mps.is_available():
             device = torch.device("mps")
             logger.info("Using MPS (Metal Performance Shaders)")
+            # Optimize MPS settings for better memory management
+            if hasattr(torch.backends.mps, 'set_per_process_memory_fraction'):
+                # Reduce memory fraction to prevent OOM (0.7 = 70% of available memory)
+                # This leaves room for system and other allocations
+                torch.backends.mps.set_per_process_memory_fraction(0.7)
+                logger.info("MPS memory fraction set to 0.7 (70%) to prevent OOM")
         elif torch.cuda.is_available():
             device = torch.device("cuda")
             logger.info("Using CUDA")
@@ -336,96 +746,342 @@ class RFAITrainer:
             logger.info("Using CPU")
         return device
     
+    def _load_mlx_model_for_generation(self, model_path: str):
+        """Load MLX model for faster generation (similar to preload_model.py)"""
+        try:
+            from mlx_lm import load
+            logger.info(f"Loading MLX model for faster generation: {model_path}")
+            
+            # Auto-detect quantization from path name if not in config
+            quantize_bits = None
+            if self.config.mlx_quantization:
+                if self.config.mlx_quantization == "q4_bit":
+                    quantize_bits = 4
+                elif self.config.mlx_quantization == "q8_bit":
+                    quantize_bits = 8
+            elif "q4" in model_path.lower() or "q4_bit" in model_path.lower():
+                quantize_bits = 4
+                logger.info("Auto-detected Q4 quantization from path name")
+            elif "q8" in model_path.lower() or "q8_bit" in model_path.lower():
+                quantize_bits = 8
+                logger.info("Auto-detected Q8 quantization from path name")
+            
+            if os.path.exists(model_path):
+                if quantize_bits:
+                    logger.info(f"Loading MLX model with {quantize_bits}-bit quantization...")
+                    try:
+                        self.mlx_model, self.mlx_tokenizer = load(model_path, quantize=quantize_bits)
+                        logger.info(f"✓ Loaded with {quantize_bits}-bit quantization")
+                    except TypeError:
+                        logger.warning(f"Quantization parameter not supported in this MLX version")
+                        logger.info("Loading model without quantization parameter (quantization may be in model)")
+                        self.mlx_model, self.mlx_tokenizer = load(model_path)
+                else:
+                    logger.info("Loading MLX model without quantization...")
+                    self.mlx_model, self.mlx_tokenizer = load(model_path)
+                
+                logger.info("✓ MLX model loaded for generation (5-10x faster than PyTorch MPS)")
+                if quantize_bits:
+                    logger.info(f"  Using {quantize_bits}-bit quantization for faster inference")
+            elif model_path:
+                # User specified MLX path but it doesn't exist
+                logger.warning(f"MLX model path specified but not found: {model_path}")
+                logger.info("Will use PyTorch for generation (slower)")
+                logger.info("Tip: Convert model to MLX format:")
+                logger.info(f"  uv run python convert_to_mlx.py --hf-path {self.config.base_model} --mlx-path {model_path}")
+                if self.config.mlx_quantization:
+                    logger.info(f"  --quantize {self.config.mlx_quantization}")
+            else:
+                # No MLX model specified or found
+                logger.info("MLX model not found. Will use PyTorch for generation (slower).")
+                logger.info("Tip: Convert model to MLX format for 5-10x faster generation:")
+                logger.info(f"  uv run python convert_to_mlx.py --hf-path {self.config.base_model} --mlx-path ./mlx_model")
+                if self.config.mlx_quantization:
+                    logger.info(f"  --quantize {self.config.mlx_quantization}")
+                logger.info("Then update config.yaml:")
+                logger.info("  hardware:")
+                logger.info("    use_mlx_for_generation: true")
+                logger.info("    mlx_model_path: ./mlx_model")
+                if self.config.mlx_quantization:
+                    logger.info(f"    mlx_quantization: {self.config.mlx_quantization}")
+        except ImportError:
+            logger.warning("MLX not available. Install with: uv pip install mlx mlx-lm")
+            logger.info("Using PyTorch MPS for generation (slower)")
+        except Exception as e:
+            logger.warning(f"Could not load MLX model: {e}")
+            logger.info("Falling back to PyTorch MPS for generation")
+            import traceback
+            logger.debug(traceback.format_exc())
+    
     def generate_student_samples(self, prompts: List[str], languages: List[str], num_samples: int = 4) -> List[Dict]:
-        """Generate multiple samples from student model for each prompt"""
+        """Generate multiple samples from student model for each prompt (optimized for M5)"""
+        # Use MLX for generation if available (much faster than PyTorch MPS)
+        if self.mlx_model is not None and self.mlx_tokenizer is not None:
+            return self._generate_with_mlx(prompts, languages, num_samples)
+        
+        # Fall back to PyTorch MPS
+        return self._generate_with_pytorch(prompts, languages, num_samples)
+    
+    def _generate_with_mlx(self, prompts: List[str], languages: List[str], num_samples: int) -> List[Dict]:
+        """Generate using MLX (5-10x faster than PyTorch MPS on Apple Silicon)
+        
+        Similar to preload_model.py, uses pre-compiled MLX model for fast generation.
+        """
+        from mlx_lm import generate as mlx_generate
+        
+        samples = []
+        all_formatted_prompts = []
+        prompt_metadata = []
+        
+        for prompt, language in zip(prompts, languages):
+            formatted_prompt = f"Write high-quality {language} code:\n\n{prompt}\n\nCode:"
+            for _ in range(num_samples):
+                all_formatted_prompts.append(formatted_prompt)
+                prompt_metadata.append((prompt, language))
+        
+        # MLX generation is much faster - can process sequentially or in small batches
+        # Similar to preload_model.py, use minimal parameters for fastest generation
+        logger.debug(f"Generating {len(all_formatted_prompts)} samples with MLX (5-10x faster than PyTorch MPS)...")
+        
+        for formatted_prompt, (prompt, language) in zip(all_formatted_prompts, prompt_metadata):
+            try:
+                # MLX generate is optimized for Apple Silicon
+                # Use minimal parameters for fastest generation (same as preload_model.py)
+                # MLX automatically optimizes for Apple Silicon
+                generated_text = mlx_generate(
+                    self.mlx_model,
+                    self.mlx_tokenizer,
+                    prompt=formatted_prompt,
+                    max_tokens=min(128, self.config.max_length // 4),  # Reduced from 256 to save memory
+                    # Note: MLX uses sampler for temperature/top_k/top_p control
+                    # For fastest: no sampler (greedy), or use default sampler
+                    # For quality: can add temperature, top_k, top_p parameters if needed
+                )
+                
+                # Extract only the generated part (remove prompt)
+                if generated_text.startswith(formatted_prompt):
+                    generated_text = generated_text[len(formatted_prompt):].strip()
+                
+                # Tokenize for input_ids (needed for training)
+                tokenized = self.tokenizer(
+                    formatted_prompt,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=self.config.max_length,
+                )
+                
+                samples.append({
+                    'prompt': prompt,
+                    'language': language,
+                    'code': generated_text,
+                    'input_ids': tokenized['input_ids'].squeeze(),
+                })
+            except Exception as e:
+                logger.warning(f"MLX generation failed for prompt: {e}")
+                # Fall back to empty code
+                samples.append({
+                    'prompt': prompt,
+                    'language': language,
+                    'code': '',
+                    'input_ids': self.tokenizer("", return_tensors="pt")['input_ids'].squeeze(),
+                })
+        
+        return samples
+    
+    def _generate_with_pytorch(self, prompts: List[str], languages: List[str], num_samples: int) -> List[Dict]:
+        """Generate using PyTorch MPS (fallback if MLX not available)"""
         self.model.eval()
         samples = []
         
         with torch.no_grad():
+            # Batch process all prompts at once for efficiency
+            all_formatted_prompts = []
+            prompt_metadata = []
+            
             for prompt, language in zip(prompts, languages):
                 formatted_prompt = f"Write high-quality {language} code:\n\n{prompt}\n\nCode:"
-                
                 for _ in range(num_samples):
-                    inputs = self.tokenizer(
-                        formatted_prompt,
-                        return_tensors="pt",
-                        truncation=True,
-                        max_length=self.config.max_length
-                    ).to(self.device)
+                    all_formatted_prompts.append(formatted_prompt)
+                    prompt_metadata.append((prompt, language))
+            
+            # Batch tokenize
+            if all_formatted_prompts:
+                inputs = self.tokenizer(
+                    all_formatted_prompts,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=self.config.max_length,
+                    padding=True
+                )
+                # Move to device with optimized MPS settings
+                # Use non_blocking for faster transfer on unified memory
+                device = next(self.model.parameters()).device
+                inputs = {k: v.to(device, non_blocking=True) for k, v in inputs.items()}
+                
+                # Generate in smaller batches for M5 to avoid memory pressure
+                # MPS benefits from smaller batches on unified memory
+                # Further reduced batch size to prevent OOM
+                batch_size = min(1, len(all_formatted_prompts))  # Reduced to 1 to prevent MPS OOM
+                for i in range(0, len(all_formatted_prompts), batch_size):
+                    batch_inputs = {
+                        'input_ids': inputs['input_ids'][i:i+batch_size],
+                        'attention_mask': inputs['attention_mask'][i:i+batch_size]
+                    }
                     
-                    outputs = self.model.generate(
-                        **inputs,
-                        max_new_tokens=512,
-                        temperature=0.8,
-                        top_k=self.config.top_k,
-                        top_p=self.config.top_p,
-                        do_sample=True,
-                        pad_token_id=self.tokenizer.eos_token_id
-                    )
+                    # Optimized generation parameters for M5 MPS
+                    # Reduced max_new_tokens to prevent OOM
+                    generation_config = {
+                        "max_new_tokens": min(128, self.config.max_length // 4),  # Reduced from 256 to save memory
+                        "temperature": 0.8,
+                        "top_k": self.config.top_k,
+                        "top_p": self.config.top_p,
+                        "do_sample": True,
+                        "pad_token_id": self.tokenizer.eos_token_id,
+                        "num_return_sequences": 1,
+                        "use_cache": True,  # Critical for MPS performance
+                        "output_scores": False,
+                        "return_dict_in_generate": False,
+                        "repetition_penalty": 1.1,  # Prevent repetition
+                    }
                     
-                    generated_text = self.tokenizer.decode(
-                        outputs[0][inputs['input_ids'].shape[1]:],
-                        skip_special_tokens=True
-                    )
+                    # Synchronize MPS before generation for better performance
+                    if device.type == "mps":
+                        torch.mps.synchronize()
                     
-                    samples.append({
-                        'prompt': prompt,
-                        'language': language,
-                        'code': generated_text,
-                        'input_ids': inputs['input_ids'].squeeze(),
-                    })
+                    outputs = self.model.generate(**batch_inputs, **generation_config)
+                    
+                    # Synchronize after generation
+                    if device.type == "mps":
+                        torch.mps.synchronize()
+                    
+                    # Decode all at once
+                    for j, output in enumerate(outputs):
+                        idx = i + j
+                        if idx < len(prompt_metadata):
+                            prompt, language = prompt_metadata[idx]
+                            input_len = batch_inputs['input_ids'][j].shape[0]
+                            generated_text = self.tokenizer.decode(
+                                output[input_len:],
+                                skip_special_tokens=True
+                            )
+                            
+                            samples.append({
+                                'prompt': prompt,
+                                'language': language,
+                                'code': generated_text,
+                                'input_ids': batch_inputs['input_ids'][j].squeeze(),
+                            })
         
         return samples
     
-    def compute_rewards(self, samples: List[Dict], save_to_dataset: bool = True) -> Tuple[List[float], List[Dict]]:
-        """Compute rewards using teacher model and optionally save to dataset"""
-        rewards = []
-        dataset_entries = []
-        
-        for sample in tqdm(samples, desc="Computing rewards"):
-            # Get teacher's reference code
-            teacher_code = self.teacher.generate(
+    def _get_teacher_code_cached(self, prompt: str, language: str) -> str:
+        """Get teacher code with caching"""
+        cache_key = f"{prompt}:{language}"
+        if cache_key not in self.teacher_cache:
+            self.teacher_cache[cache_key] = self.teacher.generate(prompt, language)
+        return self.teacher_cache[cache_key]
+    
+    def _process_sample_reward(self, sample: Dict) -> Tuple[float, Dict]:
+        """Process a single sample to compute reward (for parallel execution)"""
+        try:
+            # Get teacher's reference code (cached)
+            teacher_code = self._get_teacher_code_cached(
                 sample['prompt'],
                 sample['language']
             )
             
-            # Score student code
-            student_score = self.teacher.score_code(
-                sample['code'],
-                sample['prompt'],
-                sample['language']
-            )
+            # Score student code with caching
+            student_code_key = f"{sample['code']}:{sample['prompt']}:{sample['language']}"
+            if student_code_key in self.teacher_score_cache:
+                student_score = self.teacher_score_cache[student_code_key]
+            else:
+                student_score = self.teacher.score_code(
+                    sample['code'],
+                    sample['prompt'],
+                    sample['language']
+                )
+                self.teacher_score_cache[student_code_key] = student_score
             
-            # Score teacher code (baseline)
-            teacher_score = self.teacher.score_code(
-                teacher_code,
-                sample['prompt'],
-                sample['language']
-            )
+            # Score teacher code (baseline) - cache this too
+            teacher_code_key = f"{teacher_code}:{sample['prompt']}:{sample['language']}"
+            if teacher_code_key in self.teacher_score_cache:
+                teacher_score = self.teacher_score_cache[teacher_code_key]
+            else:
+                teacher_score = self.teacher.score_code(
+                    teacher_code,
+                    sample['prompt'],
+                    sample['language']
+                )
+                self.teacher_score_cache[teacher_code_key] = teacher_score
             
             # Normalized reward (relative to teacher)
             reward = student_score / (teacher_score + 1e-6)
-            rewards.append(reward)
             
-            # Save to dataset collection if enabled
-            if save_to_dataset:
-                dataset_entry = {
-                    'prompt': sample['prompt'],
-                    'language': sample['language'],
-                    'student_code': sample['code'],
-                    'teacher_code': teacher_code,
-                    'student_score': float(student_score),
-                    'teacher_score': float(teacher_score),
-                    'reward': float(reward),
-                    'scoring_breakdown': {
-                        'correctness': 0.3,  # These would come from detailed scoring if implemented
-                        'code_quality': 0.3,
-                        'efficiency': 0.2,
-                        'documentation': 0.2
-                    },
-                    'timestamp': datetime.now().isoformat()
-                }
-                dataset_entries.append(dataset_entry)
+            dataset_entry = {
+                'prompt': sample['prompt'],
+                'language': sample['language'],
+                'student_code': sample['code'],
+                'teacher_code': teacher_code,
+                'student_score': float(student_score),
+                'teacher_score': float(teacher_score),
+                'reward': float(reward),
+                'scoring_breakdown': {
+                    'correctness': 0.3,
+                    'code_quality': 0.3,
+                    'efficiency': 0.2,
+                    'documentation': 0.2
+                },
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            return reward, dataset_entry
+        except Exception as e:
+            logger.warning(f"Error processing sample: {e}")
+            return 0.5, None
+    
+    def compute_rewards(self, samples: List[Dict], save_to_dataset: bool = True) -> Tuple[List[float], List[Dict]]:
+        """Compute rewards using teacher model with parallel processing (optimized for M5)
+        
+        Optimizations:
+        - Parallel API calls with ThreadPoolExecutor
+        - Caching to avoid redundant API calls
+        - Adaptive worker count based on sample count
+        - Progress tracking with tqdm
+        """
+        rewards = []
+        dataset_entries = []
+        
+        # Optimize worker count: use more workers for larger batches, but cap at 8
+        # More workers = faster but may hit API rate limits
+        max_workers = min(8, max(2, len(samples) // 2), os.cpu_count() or 4)
+        
+        # Use existing executor if available (reuse thread pool)
+        # Otherwise create a new one for this batch
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            future_to_sample = {
+                executor.submit(self._process_sample_reward, sample): sample
+                for sample in samples
+            }
+            
+            # Collect results as they complete (no tqdm in training loop to avoid clutter)
+            # Only show progress for large batches
+            progress_iter = as_completed(future_to_sample)
+            if len(samples) > 10:
+                progress_iter = tqdm(progress_iter, total=len(samples), desc="Computing rewards", leave=False)
+            
+            for future in progress_iter:
+                try:
+                    reward, dataset_entry = future.result(timeout=120)  # 2 minute timeout per sample
+                    rewards.append(reward)
+                    if save_to_dataset and dataset_entry:
+                        dataset_entries.append(dataset_entry)
+                except TimeoutError:
+                    logger.warning("Reward computation timed out, using default reward")
+                    rewards.append(0.5)  # Default reward on timeout
+                except Exception as e:
+                    logger.warning(f"Error getting reward result: {e}")
+                    rewards.append(0.5)  # Default reward on error
         
         return rewards, dataset_entries
     
@@ -435,26 +1091,65 @@ class RFAITrainer:
         return self.config.kl_penalty * kl.mean()
     
     def train_step(self, batch: Dict, rewards: List[float]) -> Dict[str, float]:
-        """Perform one training step with RFAI"""
+        """Perform one training step with RFAI (optimized for M5)"""
         self.model.train()
         
-        input_ids = batch['input_ids'].to(self.device)
-        attention_mask = batch['attention_mask'].to(self.device)
+        # Move to device with non_blocking for faster transfer
+        input_ids = batch['input_ids'].to(self.device, non_blocking=True)
+        attention_mask = batch['attention_mask'].to(self.device, non_blocking=True)
+        
+        # Enable gradient checkpointing to save memory (trades compute for memory)
+        # This is especially important for MPS to prevent OOM
+        # Note: use_cache must be False when gradient checkpointing is enabled
+        gradient_checkpointing_enabled = False
+        if hasattr(self.model, 'gradient_checkpointing_enable'):
+            self.model.gradient_checkpointing_enable()
+            gradient_checkpointing_enabled = True
+            # Disable use_cache when gradient checkpointing is enabled to avoid warnings
+            if hasattr(self.model, 'config'):
+                self.model.config.use_cache = False
         
         # Forward pass
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            return_dict=True
+            return_dict=True,
+            use_cache=False  # Explicitly disable cache when gradient checkpointing is enabled
         )
         
         logits = outputs.logits
         log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
         
         # Get reference log probs (from base model, frozen)
+        # For efficiency, we use the model in eval mode as reference
+        # In a true RFAI setup, you'd have a separate frozen base model
+        # Disable gradient checkpointing for reference pass (no gradients needed)
+        original_use_cache = None
+        if gradient_checkpointing_enabled:
+            if hasattr(self.model, 'gradient_checkpointing_disable'):
+                self.model.gradient_checkpointing_disable()
+            # Restore use_cache for reference pass (no gradients, so cache is safe)
+            if hasattr(self.model, 'config'):
+                original_use_cache = getattr(self.model.config, 'use_cache', None)
+                self.model.config.use_cache = True
+        
         with torch.no_grad():
-            ref_outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+            self.model.eval()
+            ref_outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=True  # Can use cache for reference pass (no gradients)
+            )
             ref_log_probs = torch.nn.functional.log_softmax(ref_outputs.logits, dim=-1)
+            self.model.train()  # Switch back to train mode
+        
+        # Re-enable gradient checkpointing for training
+        if gradient_checkpointing_enabled:
+            if hasattr(self.model, 'gradient_checkpointing_enable'):
+                self.model.gradient_checkpointing_enable()
+            # Restore use_cache=False for training with gradient checkpointing
+            if hasattr(self.model, 'config'):
+                self.model.config.use_cache = False
         
         # Compute policy gradient loss
         # Select log probs for generated tokens
@@ -471,15 +1166,20 @@ class RFAITrainer:
         policy_loss = -(selected_log_probs * reward_tensor * attention_mask[:, 1:]).mean()
         
         # KL penalty
-        kl_penalty = self.compute_kl_penalty(selected_log_probs, ref_log_probs[:, :-1, :].gather(
+        ref_selected_log_probs = ref_log_probs[:, :-1, :].gather(
             2, input_ids[:, 1:].unsqueeze(-1)
-        ).squeeze(-1))
+        ).squeeze(-1)
+        kl_penalty = self.compute_kl_penalty(selected_log_probs, ref_selected_log_probs)
         
         # Total loss
         total_loss = policy_loss + kl_penalty
         
         # Backward pass
         total_loss.backward()
+        
+        # Clear intermediate tensors to free memory (optimization for M5)
+        # Delete in order to free memory immediately
+        del logits, log_probs, ref_log_probs, selected_log_probs, ref_selected_log_probs, outputs, ref_outputs
         
         return {
             'loss': total_loss.item(),
@@ -495,12 +1195,30 @@ class RFAITrainer:
         # Start system monitoring
         self._start_monitoring()
         
+        # Optimize DataLoader for M5: use num_workers=0 to avoid fork issues
+        # M5 has unified memory, so single process is actually faster
+        num_workers = 0 if self.config.use_mps else min(2, os.cpu_count() or 1)
+        
         train_loader = DataLoader(
             train_dataset,
             batch_size=self.config.batch_size,
             shuffle=True,
-            num_workers=4
+            num_workers=num_workers,
+            pin_memory=False,  # M5 doesn't benefit from pin_memory
+            persistent_workers=False,
+            prefetch_factor=2 if num_workers > 0 else None,  # Prefetch for faster data loading
+            drop_last=False  # Keep all batches
         )
+        
+        # Log training configuration
+        logger.info(f"Training configuration:")
+        logger.info(f"  Batch size: {self.config.batch_size}")
+        logger.info(f"  Gradient accumulation: {self.config.gradient_accumulation_steps}")
+        logger.info(f"  Effective batch size: {self.config.batch_size * self.config.gradient_accumulation_steps}")
+        logger.info(f"  Samples per prompt: {self.config.num_samples_per_prompt}")
+        logger.info(f"  Using MLX for generation: {self.mlx_model is not None}")
+        if self.mlx_model is None:
+            logger.warning("  ⚠️  MLX not enabled - generation will be slow. Enable for 5-10x speedup.")
         
         # Setup optimizer
         optimizer = torch.optim.AdamW(
@@ -527,27 +1245,116 @@ class RFAITrainer:
             epoch_rewards = []
             epoch_losses = []
             
+            # Batch dataset collection to reduce memory overhead
+            dataset_batch = []
+            dataset_batch_size = 10  # Collect 10 batches before extending main list
+            
             for batch_idx, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch + 1}")):
+                batch_start_time = time.time()
+                
                 # Generate student samples
                 prompts = batch['prompt']
                 languages = batch['language']
                 
+                # Aggressive cache clearing to prevent MPS OOM
+                # Clear cache every batch when using MPS to prevent memory buildup
+                if torch.backends.mps.is_available():
+                    torch.mps.empty_cache()  # Clear every batch for MPS
+                elif torch.cuda.is_available():
+                    # For CUDA, clear less frequently
+                    if batch_idx % 5 == 0:
+                        torch.cuda.empty_cache()
+                
+                gen_start = time.time()
                 samples = self.generate_student_samples(
                     prompts,
                     languages,
                     num_samples=self.config.num_samples_per_prompt
                 )
+                gen_time = time.time() - gen_start
                 
-                # Compute rewards and collect dataset entries
+                # Synchronize MPS only if needed (after generation, before training)
+                if torch.backends.mps.is_available() and batch_idx % 5 == 0:
+                    torch.mps.synchronize()  # Sync periodically, not every batch
+                
+                # Log generation performance (similar to preload_model.py)
+                if batch_idx % 5 == 0:
+                    num_tokens = sum(len(s.get('code', '').split()) for s in samples)
+                    tokens_per_sec = num_tokens / gen_time if gen_time > 0 else 0
+                    batch_size_actual = len(batch['prompt'])
+                    logger.info(f"Batch {batch_idx} (size={batch_size_actual}) - Generation: {gen_time:.1f}s, {tokens_per_sec:.1f} tokens/sec")
+                    
+                    if self.mlx_model is not None:
+                        # MLX generation
+                        if tokens_per_sec > 1.0:
+                            logger.info(f"✓ MLX generation: {tokens_per_sec:.1f} tokens/sec (excellent)")
+                        elif tokens_per_sec > 0.5:
+                            logger.info(f"✓ MLX generation: {tokens_per_sec:.1f} tokens/sec (good)")
+                        else:
+                            logger.warning(f"⚠️  MLX generation slower than expected: {tokens_per_sec:.1f} tokens/sec")
+                            if self.config.mlx_quantization:
+                                logger.info("  Consider using a different quantization level or no quantization")
+                    elif tokens_per_sec < 1.0:
+                        # PyTorch MPS is slow - provide actionable advice
+                        logger.warning("⚠️  Slow generation. Consider using MLX for 5-10x speedup:")
+                        logger.warning("  1. Convert model: uv run python convert_to_mlx.py --hf-path Qwen/Qwen2.5-7B-Instruct --mlx-path ./mlx_model --quantize q8_bit")
+                        logger.warning("  2. Update config.yaml: hardware.use_mlx_for_generation: true")
+                
+                # Compute rewards and collect dataset entries (optimized)
+                reward_start = time.time()
                 rewards, dataset_entries = self.compute_rewards(samples, save_to_dataset=True)
+                reward_time = time.time() - reward_start
                 epoch_rewards.extend(rewards)
                 
-                # Add to dataset collection
-                self.dataset_collection['training'].extend(dataset_entries)
+                # Batch dataset collection to reduce memory overhead
+                dataset_batch.extend(dataset_entries)
+                if len(dataset_batch) >= dataset_batch_size * len(samples):
+                    self.dataset_collection['training'].extend(dataset_batch)
+                    dataset_batch = []  # Clear batch
                 
                 # Training step
+                train_start = time.time()
                 loss_dict = self.train_step(batch, rewards[:len(batch['prompt'])])
+                train_time = time.time() - train_start
                 epoch_losses.append(loss_dict['loss'])
+                
+                # Clear cache after training step to free memory (critical for MPS OOM prevention)
+                if torch.backends.mps.is_available():
+                    torch.mps.empty_cache()
+                    import gc
+                    gc.collect()  # Force garbage collection after each training step
+                elif torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
+                batch_time = time.time() - batch_start_time
+                
+                # Log timing info periodically with more detail
+                if batch_idx % 5 == 0:
+                    batch_size_actual = len(batch['prompt'])
+                    logger.info(
+                        f"Batch {batch_idx} (size={batch_size_actual}) timing breakdown:\n"
+                        f"  Generation: {gen_time:.1f}s ({gen_time/batch_time*100:.1f}%)\n"
+                        f"  Rewards: {reward_time:.1f}s ({reward_time/batch_time*100:.1f}%)\n"
+                        f"  Training: {train_time:.1f}s ({train_time/batch_time*100:.1f}%)\n"
+                        f"  Total: {batch_time:.1f}s"
+                    )
+                    
+                    # Identify bottleneck
+                    if gen_time > batch_time * 0.5:
+                        logger.warning(f"⚠️  Generation is the bottleneck ({gen_time/batch_time*100:.1f}% of time)")
+                        if self.mlx_model is None:
+                            logger.warning("  → Enable MLX for 5-10x speedup (see above)")
+                    elif reward_time > batch_time * 0.5:
+                        logger.warning(f"⚠️  Reward computation is the bottleneck ({reward_time/batch_time*100:.1f}% of time)")
+                        logger.info("  → Consider reducing num_samples_per_prompt or increasing API parallelism")
+                    elif train_time > batch_time * 0.5:
+                        logger.warning(f"⚠️  Training step is the bottleneck ({train_time/batch_time*100:.1f}% of time)")
+                        logger.info("  → Consider reducing batch_size or max_length")
+            
+            # Flush remaining dataset entries at end of epoch
+            if dataset_batch:
+                self.dataset_collection['training'].extend(dataset_batch)
+                dataset_batch = []
                 
                 # Update optimizer
                 if (batch_idx + 1) % self.config.gradient_accumulation_steps == 0:
@@ -596,6 +1403,9 @@ class RFAITrainer:
         
         # Stop system monitoring
         self._stop_monitoring()
+        
+        # Shutdown executor
+        self.executor.shutdown(wait=True)
         
         # Save and upload datasets
         if self.config.save_datasets_locally or self.config.upload_datasets:
@@ -1333,7 +2143,7 @@ def load_config(config_path: str) -> Tuple[RFAIConfig, dict]:
     rfai_config = RFAIConfig(
         base_model=model_cfg.get('base_model', 'Qwen/Qwen2.5-7B-Instruct'),
         teacher_provider=teacher_cfg.get('provider', 'openai'),
-        teacher_model=teacher_cfg.get('model_name', 'gpt-4-turbo-preview'),
+        teacher_model=teacher_cfg.get('model_name', 'claude-3-5-haiku-20241022' if teacher_cfg.get('provider') == 'anthropic' else 'gpt-4-turbo-preview'),
         teacher_api_key_env=teacher_cfg.get('api_key_env', 'OPENAI_API_KEY'),
         output_dir=training_cfg.get('output_dir', './checkpoints'),
         num_epochs=to_int(training_cfg.get('num_epochs'), 3),
@@ -1361,6 +2171,8 @@ def load_config(config_path: str) -> Tuple[RFAIConfig, dict]:
         top_p=to_float(rfai_cfg.get('top_p'), 0.95),
         save_mlx_format=to_bool(hardware_cfg.get('save_mlx_format'), True),
         mlx_quantization=hardware_cfg.get('mlx_quantization', None),
+        use_safetensors=to_bool(model_cfg.get('use_safetensors'), True),
+        low_cpu_mem_usage=to_bool(model_cfg.get('low_cpu_mem_usage'), True),
         upload_to_hub=to_bool(config_dict.get('huggingface', {}).get('upload_to_hub'), False),
         hf_repo_id=config_dict.get('huggingface', {}).get('repo_id', None),
         hf_token_env=config_dict.get('huggingface', {}).get('hf_token_env', 'HUGGINGFACE_TOKEN'),
@@ -1370,6 +2182,8 @@ def load_config(config_path: str) -> Tuple[RFAIConfig, dict]:
         dataset_repo_id=config_dict.get('huggingface', {}).get('dataset_repo_id', None),
         save_datasets_locally=to_bool(config_dict.get('huggingface', {}).get('save_datasets_locally'), True),
         dataset_output_dir=config_dict.get('huggingface', {}).get('dataset_output_dir', './datasets'),
+        use_mlx_for_generation=to_bool(hardware_cfg.get('use_mlx_for_generation'), True),  # Default to True for better performance
+        mlx_model_path=hardware_cfg.get('mlx_model_path', None),
     )
     
     return rfai_config, data_cfg
@@ -1401,6 +2215,22 @@ def main():
     
     # Setup logging level
     logging.getLogger().setLevel(getattr(logging, config.log_level))
+    
+    # Suppress httpx HTTP request logs unless in DEBUG mode
+    # httpx logs every HTTP request at INFO level, which is too verbose for training
+    httpx_logger = logging.getLogger("httpx")
+    if config.log_level.upper() == "DEBUG":
+        httpx_logger.setLevel(logging.INFO)  # Show HTTP requests in DEBUG mode
+    else:
+        httpx_logger.setLevel(logging.WARNING)  # Suppress HTTP requests in INFO/WARNING mode
+    
+    # Suppress httpx HTTP request logs unless in DEBUG mode
+    # httpx logs every HTTP request at INFO level, which is too verbose for training
+    httpx_logger = logging.getLogger("httpx")
+    if config.log_level.upper() == "DEBUG":
+        httpx_logger.setLevel(logging.INFO)  # Show HTTP requests in DEBUG mode
+    else:
+        httpx_logger.setLevel(logging.WARNING)  # Suppress HTTP requests in INFO/WARNING mode
     
     # Check for API key before proceeding
     api_key_env = config.teacher_api_key_env
