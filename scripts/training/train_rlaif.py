@@ -2640,7 +2640,7 @@ size_categories:
 - 1K<n<10K
 ---
 
-# Qwen Code RLAIF Dataset
+# Code RLAIF Dataset
 
 This dataset contains prompts, teacher-generated code, student-generated code, and scoring parameters from the RLAIF (Reinforcement Learning from AI Feedback) training process.
 
@@ -2684,7 +2684,7 @@ Each example contains:
 ```python
 from datasets import load_dataset
 
-dataset = load_dataset("{self.config.dataset_repo_id or 'mlx-community/qwen-code-rlaif-dataset'}")
+dataset = load_dataset("{self.config.dataset_repo_id or 'mlx-community/code-rlaif-dataset'}")
 
 # Access training data
 train_data = dataset['train']
@@ -2726,11 +2726,11 @@ Scores are computed using the teacher model evaluating code on:
 If you use this dataset, please cite:
 
 ```bibtex
-@dataset{{qwen_code_rlaif_dataset,
-  title={{Qwen Code RLAIF Dataset}},
+@dataset{{code_rlaif_dataset,
+  title={{Code RLAIF Dataset}},
   author={{MLX Community}},
   year={{2024}},
-  url={{https://huggingface.co/datasets/{self.config.dataset_repo_id or 'mlx-community/qwen-code-rlaif-dataset'}}}
+  url={{https://huggingface.co/datasets/{self.config.dataset_repo_id or 'mlx-community/code-rlaif-dataset'}}}
 }}
 ```
 

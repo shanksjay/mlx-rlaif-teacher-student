@@ -1,4 +1,4 @@
-# Training Configuration for Qwen Code Fine-tuning with RLAIF
+# Training Configuration for Code Fine-tuning with RLAIF
 
 # Model Configuration
 model:
@@ -72,7 +72,7 @@ logging:
   use_tensorboard: true
   tensorboard_dir: "./logs/tensorboard"
   use_wandb: false
-  wandb_project: "qwen-code-rlaif"
+  wandb_project: "code-rlaif"
   log_level: "INFO"
 
 # Hardware Configuration (M5 MacBook)
@@ -90,12 +90,12 @@ hardware:
 # Hugging Face Upload Configuration
 huggingface:
   upload_to_hub: false  # Set to true to upload model to Hugging Face
-  repo_id: "mlx-community/qwen-code-rlaif"  # Format: mlx-community/model-name
+  repo_id: "mlx-community/code-rlaif"  # Format: mlx-community/model-name
   hf_token_env: "HUGGINGFACE_TOKEN"  # Environment variable with HF token
   upload_quantized: true  # Upload quantized version (4-bit) to HF
   private: false  # Make repository private
   upload_datasets: true  # Upload training/validation/evaluation datasets
-  dataset_repo_id: "mlx-community/qwen-code-rlaif-dataset"  # Dataset repository ID
+  dataset_repo_id: "mlx-community/code-rlaif-dataset"  # Dataset repository ID
   save_datasets_locally: true  # Save datasets locally before upload
   dataset_output_dir: "./datasets"  # Local directory to save datasets
 
