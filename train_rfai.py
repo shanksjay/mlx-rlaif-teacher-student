@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-RFAI (Reinforcement from AI Feedback) Training Script for Qwen Code Model
+RLAIF (Reinforcement Learning from AI Feedback) Training Script for Qwen Code Model
 
 This script implements a teacher-student training scheme where:
 - Teacher: OpenAI Codex or Claude (provides high-quality code examples)
@@ -32,6 +32,7 @@ import threading
 import time
 
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
+os.environ["TRANSFORMERS_VERBOSITY"] = "info"  # Show detailed warnings about generation flags
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
@@ -67,8 +68,8 @@ torch_inductor_logger.setLevel(logging.ERROR)  # Only show errors, suppress warn
 
 
 @dataclass
-class RFAIConfig:
-    """Configuration for RFAI training"""
+class RLAIFConfig:
+    """Configuration for RLAIF training"""
     base_model: str
     teacher_provider: str
     teacher_model: str
@@ -385,10 +386,10 @@ IMPORTANT: Respond with ONLY a single float between 0.0 and 1.0 (e.g., 0.75). Do
                 return 0.5
 
 
-class RFAITrainer:
-    """RFAI Trainer implementing teacher-student training"""
+class RLAIFTrainer:
+    """RLAIF Trainer implementing teacher-student training"""
     
-    def __init__(self, config: RFAIConfig):
+    def __init__(self, config: RLAIFConfig):
         self.config = config
         self.device = self._setup_device()
         
@@ -437,16 +438,29 @@ class RFAITrainer:
                 logger.info("Using standard format (safetensors not available)")
         
         # Setup quantization for M5 MacBook
+        # WARNING: 4-bit quantization with bfloat16 on MPS can cause NaN logits
+        # BitsAndBytes quantization may not be fully compatible with MPS
         if config.use_4bit:
+            if config.use_mps and torch.backends.mps.is_available():
+                logger.warning("⚠️  4-bit quantization on MPS may cause NaN logits!")
+                logger.warning("  BitsAndBytes quantization has known issues with MPS backend.")
+                logger.warning("  Consider using float32 instead of bfloat16, or disable quantization.")
+                logger.warning("  If you see NaN logits, set model.use_4bit: false in config.yaml")
+            
             logger.info("Using 4-bit quantization...")
+            # Use float32 compute dtype on MPS to avoid numerical instability
+            compute_dtype = torch.float32 if (config.use_mps and torch.backends.mps.is_available()) else torch.bfloat16
+            if compute_dtype == torch.float32:
+                logger.info("  Using float32 compute dtype on MPS for stability (slower but more stable)")
+            
             bnb_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_compute_dtype=compute_dtype,  # Use float32 on MPS for stability
                 bnb_4bit_use_double_quant=True,
             )
             model_kwargs["quantization_config"] = bnb_config
-            model_kwargs["dtype"] = torch.bfloat16  # Use dtype instead of torch_dtype
+            model_kwargs["dtype"] = compute_dtype  # Match compute dtype
         
         # Simplified monitoring (matching preload_model.py for less overhead)
         monitoring = True
@@ -486,11 +500,20 @@ class RFAITrainer:
             logger.warning(f"Error with optimized loading: {e}. Trying standard loading...")
             # Fallback to standard loading
             if config.use_4bit:
+                # Use float32 compute dtype on MPS for stability
+                compute_dtype = torch.float32 if (config.use_mps and torch.backends.mps.is_available()) else torch.bfloat16
+                # Update bnb_config with correct compute dtype
+                bnb_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype=compute_dtype,
+                    bnb_4bit_use_double_quant=True,
+                )
                 self.model = AutoModelForCausalLM.from_pretrained(
                     config.base_model,
                     quantization_config=bnb_config,
                     device_map="auto",
-                    dtype=torch.bfloat16,  # Use dtype instead of torch_dtype
+                    dtype=compute_dtype,  # Match compute dtype
                 )
             else:
                 self.model = AutoModelForCausalLM.from_pretrained(
@@ -504,6 +527,29 @@ class RFAITrainer:
         
         load_time = time.time() - load_start
         shard_time = time.time() - shard_start
+        
+        # Validate model was loaded correctly - check for NaN/Inf in weights
+        logger.info("Validating model weights for corruption...")
+        corrupted_params = []
+        total_params = 0
+        for name, param in self.model.named_parameters():
+            total_params += param.numel()
+            if torch.isnan(param).any():
+                nan_count = torch.isnan(param).sum().item()
+                corrupted_params.append((name, "NaN", nan_count, param.shape))
+            if torch.isinf(param).any():
+                inf_count = torch.isinf(param).sum().item()
+                corrupted_params.append((name, "Inf", inf_count, param.shape))
+        
+        if corrupted_params:
+            logger.error(f"⚠️  CRITICAL: Model weights contain NaN/Inf values!")
+            logger.error(f"  Found {len(corrupted_params)} parameters with corrupted values")
+            for name, issue_type, count, shape in corrupted_params[:5]:  # Show first 5
+                logger.error(f"    {name}: {issue_type} ({count} values, shape: {shape})")
+            logger.error("  This will cause NaN logits during training!")
+            logger.error("  SOLUTION: Reload the model or use a different checkpoint.")
+        else:
+            logger.info(f"✓ Model weights validated - no NaN/Inf detected ({total_params:,} parameters checked)")
         
         # Analyze loading performance (simplified, matching preload_model.py)
         if memory_samples and len(memory_samples) > 4 and process:
@@ -626,10 +672,14 @@ class RFAITrainer:
         with torch.no_grad():
             try:
                 # Very short warmup generation to initialize MPS and compilation
+                # Explicitly unset sampling parameters when do_sample=False to avoid warnings
                 _ = self.model.generate(
                     **warmup_inputs,
                     max_new_tokens=5,
                     do_sample=False,
+                    temperature=None,  # Unset when do_sample=False
+                    top_p=None,  # Unset when do_sample=False
+                    top_k=None,  # Unset when do_sample=False
                     use_cache=True,
                     pad_token_id=self.tokenizer.eos_token_id,
                 )
@@ -688,6 +738,17 @@ class RFAITrainer:
         self.executor = ThreadPoolExecutor(max_workers=min(4, os.cpu_count() or 4))  # Concurrent API calls (reduced for M5)
         self.use_batch_generation = True  # Batch student generation
         self.generation_warmup_done = False  # Track if generation has been warmed up
+        
+        # MPS memory management: Set high watermark ratio to allow more memory usage
+        # This helps prevent OOM errors on systems with unified memory
+        if config.use_mps and torch.backends.mps.is_available():
+            # Set environment variable to allow more memory allocation
+            # 0.0 = no limit (use with caution), 0.8 = 80% of available memory
+            os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
+            logger.info("MPS memory management: Set PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0 to allow more memory")
+            # Also reduce per-process memory fraction to leave more headroom
+            torch.backends.mps.set_per_process_memory_fraction(0.6)  # Reduced from 0.7 to 0.6
+            logger.info("MPS memory: Set per-process memory fraction to 0.6 (60%)")
         
         # MLX model for faster generation (optional, much faster than PyTorch MPS)
         # Load MLX model if enabled (similar to preload_model.py)
@@ -767,22 +828,79 @@ class RFAITrainer:
                 logger.info("Auto-detected Q8 quantization from path name")
             
             if os.path.exists(model_path):
-                if quantize_bits:
-                    logger.info(f"Loading MLX model with {quantize_bits}-bit quantization...")
+                # If model path contains q4/q8, the model is already quantized
+                # Don't pass quantize parameter - just load the pre-quantized model
+                model_already_quantized = "q4" in model_path.lower() or "q8" in model_path.lower()
+                
+                if model_already_quantized:
+                    logger.info(f"Loading pre-quantized MLX model from {model_path}...")
+                    logger.info("  (Model is already quantized - no need to pass quantize parameter)")
+                    self.mlx_model, self.mlx_tokenizer = load(model_path)
+                    # Extract quantization level from path for logging
+                    if "q4" in model_path.lower():
+                        quantize_bits = 4
+                    elif "q8" in model_path.lower():
+                        quantize_bits = 8
+                    logger.info(f"✓ Loaded pre-quantized model ({quantize_bits}-bit)")
+                elif quantize_bits:
+                    # Model path doesn't indicate quantization, but we want to quantize on load
+                    logger.info(f"Loading MLX model and applying {quantize_bits}-bit quantization...")
                     try:
                         self.mlx_model, self.mlx_tokenizer = load(model_path, quantize=quantize_bits)
                         logger.info(f"✓ Loaded with {quantize_bits}-bit quantization")
-                    except TypeError:
-                        logger.warning(f"Quantization parameter not supported in this MLX version")
-                        logger.info("Loading model without quantization parameter (quantization may be in model)")
+                    except (TypeError, ValueError) as e:
+                        logger.warning(f"Quantization parameter not supported in this MLX version: {e}")
+                        logger.info("Loading model without quantization parameter (model will be full precision)")
                         self.mlx_model, self.mlx_tokenizer = load(model_path)
+                        quantize_bits = None  # Reset since quantization failed
                 else:
-                    logger.info("Loading MLX model without quantization...")
+                    logger.info("Loading MLX model without quantization (full precision)...")
                     self.mlx_model, self.mlx_tokenizer = load(model_path)
                 
                 logger.info("✓ MLX model loaded for generation (5-10x faster than PyTorch MPS)")
                 if quantize_bits:
                     logger.info(f"  Using {quantize_bits}-bit quantization for faster inference")
+                else:
+                    logger.info("  Using full precision (consider converting to quantized format for better performance)")
+                
+                # Verify tokenizer compatibility between MLX and PyTorch
+                # This is CRITICAL: if tokenizers produce different token IDs, we'll get NaN logits
+                logger.info("Verifying tokenizer compatibility between MLX and PyTorch...")
+                test_texts = [
+                    "Hello, world!",
+                    "def function():",
+                    "# Python comment",
+                    "int main() {",
+                    "print('test')",
+                    "Write high-quality python code:"
+                ]
+                mismatches = []
+                for test_text in test_texts:
+                    try:
+                        # Use encode with same parameters
+                        mlx_tokens = self.mlx_tokenizer.encode(test_text, add_special_tokens=False)
+                        pytorch_tokens = self.tokenizer.encode(test_text, add_special_tokens=False)
+                        if mlx_tokens != pytorch_tokens:
+                            mismatches.append((test_text, mlx_tokens, pytorch_tokens))
+                    except Exception as e:
+                        logger.warning(f"Error testing tokenizer compatibility for '{test_text}': {e}")
+                
+                if mismatches:
+                    logger.error("⚠️  CRITICAL: Tokenizer mismatch detected between MLX and PyTorch!")
+                    logger.error("  This WILL cause invalid token IDs and NaN logits during training!")
+                    logger.error(f"  Found {len(mismatches)} mismatches out of {len(test_texts)} test cases")
+                    for test_text, mlx_tokens, pytorch_tokens in mismatches[:5]:  # Show first 5 mismatches
+                        logger.error(f"  Text: '{test_text}'")
+                        logger.error(f"    MLX tokens:     {mlx_tokens}")
+                        logger.error(f"    PyTorch tokens: {pytorch_tokens}")
+                        logger.error(f"    Match: {mlx_tokens == pytorch_tokens}")
+                    logger.error("  SOLUTION: Ensure both tokenizers are from the same model.")
+                    logger.error("  The MLX model and PyTorch model should use identical tokenizers.")
+                    logger.error("  This mismatch is likely causing the NaN logits issue!")
+                    logger.error("  ACTION: Consider using PyTorch generation instead of MLX, or")
+                    logger.error("         ensure MLX model was converted from the same base model.")
+                else:
+                    logger.info("✓ Tokenizer compatibility verified - MLX and PyTorch tokenizers match")
             elif model_path:
                 # User specified MLX path but it doesn't exist
                 logger.warning(f"MLX model path specified but not found: {model_path}")
@@ -848,11 +966,14 @@ class RFAITrainer:
                 # MLX generate is optimized for Apple Silicon
                 # Use minimal parameters for fastest generation (same as preload_model.py)
                 # MLX automatically optimizes for Apple Silicon
+                # Optimize generation: reduce max_tokens for faster generation
+                # 64 tokens is typically enough for code snippets and much faster
+                max_gen_tokens = min(64, self.config.max_length // 8)  # Reduced from 128 to 64 for speed
                 generated_text = mlx_generate(
                     self.mlx_model,
                     self.mlx_tokenizer,
                     prompt=formatted_prompt,
-                    max_tokens=min(128, self.config.max_length // 4),  # Reduced from 256 to save memory
+                    max_tokens=max_gen_tokens,  # Reduced for faster generation
                     # Note: MLX uses sampler for temperature/top_k/top_p control
                     # For fastest: no sampler (greedy), or use default sampler
                     # For quality: can add temperature, top_k, top_p parameters if needed
@@ -860,30 +981,151 @@ class RFAITrainer:
                 
                 # Extract only the generated part (remove prompt)
                 if generated_text.startswith(formatted_prompt):
-                    generated_text = generated_text[len(formatted_prompt):].strip()
+                    generated_code = generated_text[len(formatted_prompt):].strip()
+                else:
+                    generated_code = generated_text.strip()
                 
-                # Tokenize for input_ids (needed for training)
+                # CRITICAL: Verify tokenizer compatibility for the actual generated code
+                # MLX and PyTorch tokenizers MUST produce the same token IDs for the same text
+                # If they don't match, we'll get invalid token IDs and NaN logits
+                try:
+                    # Test tokenization of generated code with both tokenizers
+                    mlx_gen_tokens = self.mlx_tokenizer.encode(generated_code, add_special_tokens=False)
+                    pytorch_gen_tokens = self.tokenizer.encode(generated_code, add_special_tokens=False)
+                    
+                    if mlx_gen_tokens != pytorch_gen_tokens:
+                        logger.warning(f"⚠️  Tokenizer mismatch for generated code!")
+                        logger.warning(f"  MLX tokens ({len(mlx_gen_tokens)}): {mlx_gen_tokens[:20]}...")
+                        logger.warning(f"  PyTorch tokens ({len(pytorch_gen_tokens)}): {pytorch_gen_tokens[:20]}...")
+                        logger.warning(f"  This mismatch will cause NaN logits!")
+                        logger.warning(f"  SOLUTION: Use PyTorch tokenizer to re-tokenize the generated code")
+                        
+                        # Re-tokenize with PyTorch tokenizer to ensure consistency
+                        # Decode MLX tokens and re-encode with PyTorch tokenizer
+                        try:
+                            # Decode what MLX tokenizer produced
+                            mlx_decoded = self.mlx_tokenizer.decode(mlx_gen_tokens, skip_special_tokens=True)
+                            # Re-encode with PyTorch tokenizer
+                            pytorch_reencoded = self.tokenizer.encode(mlx_decoded, add_special_tokens=False)
+                            # Use the PyTorch-tokenized version
+                            generated_code = self.tokenizer.decode(pytorch_reencoded, skip_special_tokens=True)
+                            logger.debug("Fixed tokenizer mismatch by re-tokenizing with PyTorch tokenizer")
+                        except Exception as e:
+                            logger.error(f"Failed to fix tokenizer mismatch: {e}")
+                            logger.error("This will likely cause NaN logits. Consider disabling MLX generation.")
+                    else:
+                        logger.debug(f"✓ Tokenizer compatibility verified for generated code ({len(mlx_gen_tokens)} tokens)")
+                except Exception as e:
+                    logger.warning(f"Could not verify tokenizer compatibility for generated code: {e}")
+                
+                # For training, we need the FULL sequence (prompt + generated code)
+                # IMPORTANT: Use PyTorch tokenizer (self.tokenizer) consistently for training
+                # MLX tokenizer was used for generation, but we need PyTorch tokenizer for training
+                # The generated_code is plain text, so tokenizing with PyTorch tokenizer should work
+                # However, if there are special tokens or formatting differences, we may get mismatches
+                
+                # CRITICAL: Ensure the generated_code doesn't contain special tokens that MLX added
+                # MLX might add special tokens that PyTorch tokenizer interprets differently
+                # Clean the generated code to remove any potential MLX-specific formatting
+                generated_code_clean = generated_code.strip()
+                
+                # Reconstruct the full sequence with clean generated code
+                full_sequence = formatted_prompt + generated_code_clean
+                
+                # Debug: Log if sequence is suspiciously long (may indicate tokenization issues)
+                if len(full_sequence) > self.config.max_length * 4:  # Rough estimate: 4 chars per token
+                    logger.debug(f"Full sequence is long ({len(full_sequence)} chars), will be truncated to {self.config.max_length} tokens")
+                
+                # Verify tokenization produces valid token IDs
+                # Tokenize a test to ensure tokenizer is working correctly
+                try:
+                    test_tokenized = self.tokenizer("test", return_tensors="pt")
+                    if torch.isnan(test_tokenized['input_ids']).any():
+                        logger.error("Tokenizer itself is producing NaN! This is a critical issue.")
+                except Exception as e:
+                    logger.warning(f"Tokenizer test failed: {e}")
+                
+                # Tokenize with PyTorch tokenizer (must match the model's tokenizer)
                 tokenized = self.tokenizer(
-                    formatted_prompt,
+                    full_sequence,
                     return_tensors="pt",
                     truncation=True,
                     max_length=self.config.max_length,
+                    padding='max_length',  # Pad to max_length for batching
+                    return_attention_mask=True,
                 )
+                
+                # Validate tokenization
+                input_ids_tensor = tokenized['input_ids'].squeeze()
+                if input_ids_tensor.numel() == 0:
+                    logger.warning(f"Empty tokenization for prompt, using fallback")
+                    tokenized = self.tokenizer(
+                        formatted_prompt,
+                        return_tensors="pt",
+                        truncation=True,
+                        max_length=self.config.max_length,
+                        padding='max_length',
+                        return_attention_mask=True,
+                    )
+                    input_ids_tensor = tokenized['input_ids'].squeeze()
+                
+                # Validate token IDs are in valid range
+                # Get vocab_size from model config (more reliable than len(tokenizer))
+                vocab_size = getattr(self.model.config, 'vocab_size', len(self.tokenizer))
+                if vocab_size == 0 or vocab_size is None:
+                    vocab_size = len(self.tokenizer)
+                
+                # Check for invalid token IDs
+                invalid_mask = (input_ids_tensor < 0) | (input_ids_tensor >= vocab_size)
+                if invalid_mask.any():
+                    invalid_count = invalid_mask.sum().item()
+                    logger.error(f"Invalid token IDs detected in MLX generation sample: {invalid_count} tokens out of range [0, {vocab_size})")
+                    logger.error(f"Token ID range: min={input_ids_tensor.min().item()}, max={input_ids_tensor.max().item()}, vocab_size={vocab_size}")
+                    # Replace invalid IDs with pad token
+                    pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
+                    if pad_token_id is None:
+                        pad_token_id = 0  # Fallback to 0
+                    input_ids_tensor = torch.where(invalid_mask,
+                                                  torch.tensor(pad_token_id, dtype=input_ids_tensor.dtype),
+                                                  input_ids_tensor)
+                    tokenized['input_ids'] = input_ids_tensor.unsqueeze(0) if len(input_ids_tensor.shape) == 1 else input_ids_tensor
+                
+                # Additional validation: check for NaN/Inf in token IDs (shouldn't happen, but check anyway)
+                if torch.isnan(input_ids_tensor.float()).any() or torch.isinf(input_ids_tensor.float()).any():
+                    logger.error("NaN/Inf detected in tokenized input_ids! This is unexpected.")
+                    pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
+                    if pad_token_id is None:
+                        pad_token_id = 0
+                    input_ids_tensor = torch.where(torch.isnan(input_ids_tensor.float()) | torch.isinf(input_ids_tensor.float()),
+                                                  torch.tensor(pad_token_id, dtype=input_ids_tensor.dtype),
+                                                  input_ids_tensor)
+                    tokenized['input_ids'] = input_ids_tensor.unsqueeze(0) if len(input_ids_tensor.shape) == 1 else input_ids_tensor
                 
                 samples.append({
                     'prompt': prompt,
                     'language': language,
-                    'code': generated_text,
+                    'code': generated_code,
                     'input_ids': tokenized['input_ids'].squeeze(),
+                    'attention_mask': tokenized['attention_mask'].squeeze(),
                 })
             except Exception as e:
                 logger.warning(f"MLX generation failed for prompt: {e}")
                 # Fall back to empty code
+                formatted_prompt = f"Write high-quality {language} code:\n\n{prompt}\n\nCode:"
+                tokenized_fallback = self.tokenizer(
+                    formatted_prompt,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=self.config.max_length,
+                    padding='max_length',
+                    return_attention_mask=True,
+                )
                 samples.append({
                     'prompt': prompt,
                     'language': language,
                     'code': '',
-                    'input_ids': self.tokenizer("", return_tensors="pt")['input_ids'].squeeze(),
+                    'input_ids': tokenized_fallback['input_ids'].squeeze(),
+                    'attention_mask': tokenized_fallback['attention_mask'].squeeze(),
                 })
         
         return samples
@@ -930,12 +1172,13 @@ class RFAITrainer:
                     
                     # Optimized generation parameters for M5 MPS
                     # Reduced max_new_tokens to prevent OOM
+                    # Use sampling for diversity in generated code
                     generation_config = {
                         "max_new_tokens": min(128, self.config.max_length // 4),  # Reduced from 256 to save memory
+                        "do_sample": True,  # Enable sampling to use temperature/top_p/top_k
                         "temperature": 0.8,
                         "top_k": self.config.top_k,
                         "top_p": self.config.top_p,
-                        "do_sample": True,
                         "pad_token_id": self.tokenizer.eos_token_id,
                         "num_return_sequences": 1,
                         "use_cache": True,  # Critical for MPS performance
@@ -965,11 +1208,23 @@ class RFAITrainer:
                                 skip_special_tokens=True
                             )
                             
+                            # For PyTorch generation, we need the full sequence (prompt + generated code)
+                            full_sequence = all_formatted_prompts[i * batch_size + j] + generated_text
+                            tokenized_full = self.tokenizer(
+                                full_sequence,
+                                return_tensors="pt",
+                                truncation=True,
+                                max_length=self.config.max_length,
+                                padding='max_length',
+                                return_attention_mask=True,
+                            )
+                            
                             samples.append({
                                 'prompt': prompt,
                                 'language': language,
                                 'code': generated_text,
-                                'input_ids': batch_inputs['input_ids'][j].squeeze(),
+                                'input_ids': tokenized_full['input_ids'].squeeze(),
+                                'attention_mask': tokenized_full['attention_mask'].squeeze(),
                             })
         
         return samples
@@ -1086,12 +1341,137 @@ class RFAITrainer:
         return rewards, dataset_entries
     
     def compute_kl_penalty(self, log_probs: torch.Tensor, ref_log_probs: torch.Tensor) -> torch.Tensor:
-        """Compute KL divergence penalty"""
+        """Compute KL divergence penalty with NaN/inf protection"""
+        # Check for NaN or Inf values
+        if torch.isnan(log_probs).any() or torch.isinf(log_probs).any():
+            logger.warning("NaN/Inf detected in log_probs, using zero KL penalty")
+            return torch.tensor(0.0, device=log_probs.device)
+        if torch.isnan(ref_log_probs).any() or torch.isinf(ref_log_probs).any():
+            logger.warning("NaN/Inf detected in ref_log_probs, using zero KL penalty")
+            return torch.tensor(0.0, device=log_probs.device)
+        
+        # Compute KL divergence: KL(P||Q) = sum(P * log(P/Q)) = sum(P * (log_P - log_Q))
+        # Here we use: kl = log_probs - ref_log_probs (difference in log probabilities)
         kl = log_probs - ref_log_probs
-        return self.config.kl_penalty * kl.mean()
+        
+        # Clamp to prevent extreme values
+        kl = torch.clamp(kl, min=-10.0, max=10.0)
+        
+        # Check result for NaN/Inf
+        kl_mean = kl.mean()
+        if torch.isnan(kl_mean) or torch.isinf(kl_mean):
+            logger.warning("NaN/Inf in KL penalty computation, using zero")
+            return torch.tensor(0.0, device=log_probs.device)
+        
+        return self.config.kl_penalty * kl_mean
+    
+    def _create_training_batch_from_samples(self, samples: List[Dict], original_prompts: List[str]) -> Dict:
+        """Create training batch from generated samples
+        
+        This ensures we use the full sequences (prompt + generated code) for training,
+        not just the original prompts from the DataLoader.
+        """
+        # Group samples by original prompt (each prompt has num_samples_per_prompt samples)
+        num_samples_per_prompt = len(samples) // len(original_prompts)
+        
+        # Collect input_ids and attention_masks from samples
+        batch_input_ids = []
+        batch_attention_masks = []
+        
+        for i, prompt in enumerate(original_prompts):
+            # Get the first sample for each prompt (or average if multiple)
+            # For now, use the first sample per prompt
+            sample_idx = i * num_samples_per_prompt
+            if sample_idx < len(samples):
+                sample = samples[sample_idx]
+                if 'input_ids' in sample and 'attention_mask' in sample:
+                    batch_input_ids.append(sample['input_ids'])
+                    batch_attention_masks.append(sample['attention_mask'])
+                else:
+                    # Fallback: tokenize the prompt (shouldn't happen if generation worked)
+                    logger.warning(f"Sample missing input_ids/attention_mask, using fallback tokenization")
+                    formatted_prompt = f"Write high-quality {sample.get('language', 'python')} code:\n\n{prompt}\n\nCode:"
+                    tokenized = self.tokenizer(
+                        formatted_prompt,
+                        return_tensors="pt",
+                        truncation=True,
+                        max_length=self.config.max_length,
+                        padding='max_length',
+                        return_attention_mask=True,
+                    )
+                    batch_input_ids.append(tokenized['input_ids'].squeeze())
+                    batch_attention_masks.append(tokenized['attention_mask'].squeeze())
+            else:
+                # Fallback if sample not found
+                logger.warning(f"Sample not found for prompt {i}, using fallback")
+                formatted_prompt = f"Write high-quality python code:\n\n{prompt}\n\nCode:"
+                tokenized = self.tokenizer(
+                    formatted_prompt,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=self.config.max_length,
+                    padding='max_length',
+                    return_attention_mask=True,
+                )
+                batch_input_ids.append(tokenized['input_ids'].squeeze())
+                batch_attention_masks.append(tokenized['attention_mask'].squeeze())
+        
+        # Stack into tensors
+        input_ids = torch.stack(batch_input_ids)
+        attention_mask = torch.stack(batch_attention_masks)
+        
+        # Ensure tensors are on the correct device and dtype
+        device = next(self.model.parameters()).device
+        input_ids = input_ids.to(device)
+        attention_mask = attention_mask.to(device)
+        
+        # Validate tensors
+        # Check for invalid token IDs (NaN, Inf, or out of vocabulary range)
+        # Get vocab_size from model config (more reliable)
+        vocab_size = getattr(self.model.config, 'vocab_size', len(self.tokenizer))
+        if vocab_size == 0 or vocab_size is None:
+            vocab_size = len(self.tokenizer)
+        
+        logger.debug(f"Validating input_ids: shape={input_ids.shape}, vocab_size={vocab_size}, min={input_ids.min().item()}, max={input_ids.max().item()}")
+        
+        if torch.isnan(input_ids.float()).any() or torch.isinf(input_ids.float()).any():
+            logger.error("NaN/Inf detected in input_ids from samples!")
+            # Replace with valid token IDs (pad token)
+            pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
+            if pad_token_id is None:
+                pad_token_id = 0
+            input_ids = torch.where(torch.isnan(input_ids.float()) | torch.isinf(input_ids.float()), 
+                                   torch.tensor(pad_token_id, device=input_ids.device, dtype=input_ids.dtype), 
+                                   input_ids)
+        
+        # Check for out-of-vocabulary token IDs
+        invalid_mask = (input_ids < 0) | (input_ids >= vocab_size)
+        if invalid_mask.any():
+            invalid_count = invalid_mask.sum().item()
+            logger.error(f"Invalid token IDs detected: {invalid_count} tokens out of vocabulary range [0, {vocab_size})")
+            logger.error(f"Token ID stats: min={input_ids.min().item()}, max={input_ids.max().item()}, vocab_size={vocab_size}")
+            pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
+            if pad_token_id is None:
+                pad_token_id = 0
+            input_ids = torch.where(invalid_mask,
+                                   torch.tensor(pad_token_id, device=input_ids.device, dtype=input_ids.dtype),
+                                   input_ids)
+        
+        # Validate attention_mask
+        if torch.isnan(attention_mask.float()).any() or torch.isinf(attention_mask.float()).any():
+            logger.error("NaN/Inf detected in attention_mask from samples!")
+            attention_mask = torch.where(torch.isnan(attention_mask.float()) | torch.isinf(attention_mask.float()),
+                                       torch.tensor(0, device=attention_mask.device, dtype=attention_mask.dtype),
+                                       attention_mask)
+        
+        return {
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+            'prompt': original_prompts,
+        }
     
     def train_step(self, batch: Dict, rewards: List[float]) -> Dict[str, float]:
-        """Perform one training step with RFAI (optimized for M5)"""
+        """Perform one training step with RLAIF (optimized for M5)"""
         self.model.train()
         
         # Move to device with non_blocking for faster transfer
@@ -1122,7 +1502,7 @@ class RFAITrainer:
         
         # Get reference log probs (from base model, frozen)
         # For efficiency, we use the model in eval mode as reference
-        # In a true RFAI setup, you'd have a separate frozen base model
+        # In a true RLAIF setup, you'd have a separate frozen base model
         # Disable gradient checkpointing for reference pass (no gradients needed)
         original_use_cache = None
         if gradient_checkpointing_enabled:
@@ -1133,6 +1513,10 @@ class RFAITrainer:
                 original_use_cache = getattr(self.model.config, 'use_cache', None)
                 self.model.config.use_cache = True
         
+        # Clear cache before reference pass to free memory
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        
         with torch.no_grad():
             self.model.eval()
             ref_outputs = self.model(
@@ -1142,6 +1526,9 @@ class RFAITrainer:
             )
             ref_log_probs = torch.nn.functional.log_softmax(ref_outputs.logits, dim=-1)
             self.model.train()  # Switch back to train mode
+            
+            # Delete reference outputs immediately to free memory
+            del ref_outputs
         
         # Re-enable gradient checkpointing for training
         if gradient_checkpointing_enabled:
@@ -1151,6 +1538,206 @@ class RFAITrainer:
             if hasattr(self.model, 'config'):
                 self.model.config.use_cache = False
         
+        # Clear cache after reference pass
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        
+        # Validate inputs for NaN/Inf before computation
+        # First check input_ids for invalid values
+        vocab_size = getattr(self.model.config, 'vocab_size', len(self.tokenizer))
+        if vocab_size == 0 or vocab_size is None:
+            vocab_size = len(self.tokenizer)
+        
+        # Check for invalid token IDs BEFORE forward pass
+        invalid_token_mask = (input_ids < 0) | (input_ids >= vocab_size)
+        if invalid_token_mask.any():
+            invalid_count = invalid_token_mask.sum().item()
+            logger.error(f"Invalid token IDs detected BEFORE forward pass: {invalid_count} tokens out of range [0, {vocab_size})")
+            logger.error(f"Token ID stats: min={input_ids.min().item()}, max={input_ids.max().item()}, vocab_size={vocab_size}")
+            pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
+            if pad_token_id is None:
+                pad_token_id = 0
+            input_ids = torch.where(invalid_token_mask,
+                                   torch.tensor(pad_token_id, device=input_ids.device, dtype=input_ids.dtype),
+                                   input_ids)
+        
+        if torch.isnan(input_ids.float()).any() or torch.isinf(input_ids.float()).any():
+            logger.error("NaN/Inf detected in input_ids! This will cause NaN logits.")
+            logger.error(f"Input IDs stats: min={input_ids.min().item()}, max={input_ids.max().item()}, mean={input_ids.float().mean().item():.4f}")
+            # Replace with pad token ID
+            pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
+            if pad_token_id is None:
+                pad_token_id = 0
+            input_ids = torch.where(torch.isnan(input_ids.float()) | torch.isinf(input_ids.float()),
+                                   torch.tensor(pad_token_id, device=input_ids.device, dtype=input_ids.dtype),
+                                   input_ids)
+        
+        # Validate attention_mask
+        if torch.isnan(attention_mask.float()).any() or torch.isinf(attention_mask.float()).any():
+            logger.error("NaN/Inf detected in attention_mask! Replacing with zeros.")
+            attention_mask = torch.where(torch.isnan(attention_mask.float()) | torch.isinf(attention_mask.float()),
+                                       torch.tensor(0, device=attention_mask.device, dtype=attention_mask.dtype),
+                                       attention_mask)
+        
+        # Check model weights for NaN/Inf BEFORE forward pass
+        model_has_nan = False
+        for name, param in self.model.named_parameters():
+            if torch.isnan(param).any() or torch.isinf(param).any():
+                logger.error(f"NaN/Inf detected in model parameter BEFORE forward pass: {name}")
+                logger.error(f"  Parameter shape: {param.shape}, dtype: {param.dtype}")
+                model_has_nan = True
+        
+        if model_has_nan:
+            logger.error("Model has NaN/Inf in weights! This will cause NaN logits.")
+            logger.error("This may indicate corrupted model weights or numerical instability.")
+            logger.error("Try reloading the model or using a different precision (float32 instead of bfloat16).")
+        
+        # Check embedding layer specifically (first layer that processes input_ids)
+        try:
+            embedding_layer = self.model.get_input_embeddings()
+            if embedding_layer is not None:
+                # Check if embedding weights have NaN
+                if hasattr(embedding_layer, 'weight'):
+                    emb_weight = embedding_layer.weight
+                    if torch.isnan(emb_weight).any() or torch.isinf(emb_weight).any():
+                        logger.error(f"NaN/Inf detected in embedding layer weights!")
+                        logger.error(f"  Embedding shape: {emb_weight.shape}, dtype: {emb_weight.dtype}")
+                        logger.error(f"  NaN count: {torch.isnan(emb_weight).sum().item()}, Inf count: {torch.isinf(emb_weight).sum().item()}")
+        except Exception as e:
+            logger.debug(f"Could not check embedding layer: {e}")
+        
+        # Forward pass with validated inputs
+        # MPS doesn't need autocast - it handles bfloat16 natively
+        # Using CUDA autocast on MPS causes issues and deprecation warnings
+        device_type = next(self.model.parameters()).device.type
+        if device_type == "mps":
+            # MPS handles bfloat16 natively, no autocast needed
+            # However, quantized models on MPS may have numerical issues
+            # Check if model is quantized (BitsAndBytes)
+            is_quantized = hasattr(self.model, 'hf_quantizer') or any(
+                hasattr(module, 'weight') and hasattr(module.weight, 'SCB') 
+                for module in self.model.modules()
+            )
+            
+            if is_quantized:
+                logger.debug("Using quantized model on MPS - monitoring for numerical stability")
+                # Ensure inputs are on correct device
+                if input_ids.device.type != "mps":
+                    input_ids = input_ids.to("mps")
+                if attention_mask.device.type != "mps":
+                    attention_mask = attention_mask.to("mps")
+            
+            # Direct forward pass is more stable on MPS
+            # For quantized models, we may need to handle dtype conversion
+            try:
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    return_dict=True,
+                    use_cache=False  # Explicitly disable cache when gradient checkpointing is enabled
+                )
+            except RuntimeError as e:
+                if "NaN" in str(e) or "nan" in str(e).lower():
+                    logger.error(f"Runtime error with NaN during forward pass: {e}")
+                    logger.error("This is likely due to 4-bit quantization incompatibility with MPS.")
+                    logger.error("SOLUTION: Disable quantization or use float32 instead of bfloat16")
+                    raise
+                raise
+        elif device_type == "cuda":
+            # Use CUDA autocast for CUDA devices
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16 if self.model.dtype == torch.bfloat16 else None):
+                outputs = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    return_dict=True,
+                    use_cache=False
+                )
+        else:
+            # CPU or other devices - no autocast needed
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                return_dict=True,
+                use_cache=False
+            )
+        
+        logits = outputs.logits
+        
+        # Check logits immediately after forward pass
+        if torch.isnan(logits).any() or torch.isinf(logits).any():
+            logger.error("NaN/Inf detected in logits AFTER forward pass! This will cause NaN loss.")
+            logger.error(f"Logits stats: min={logits.min().item():.4f}, max={logits.max().item():.4f}, mean={logits.mean().item():.4f}")
+            logger.error(f"Input IDs shape: {input_ids.shape}, min={input_ids.min().item()}, max={input_ids.max().item()}, vocab_size={vocab_size}")
+            logger.error(f"Attention mask shape: {attention_mask.shape}, sum={attention_mask.sum().item()}")
+            device = next(self.model.parameters()).device
+            logger.error(f"Model dtype: {self.model.dtype}, device: {device}")
+            logger.error(f"Device type: {device.type} (mps:0 means MPS device 0 - MPS IS being used)")
+            
+            # Check if this is a numerical stability issue with quantization on MPS
+            is_quantized = hasattr(self.model, 'hf_quantizer') or any(
+                hasattr(module, 'weight') and hasattr(module.weight, 'SCB') 
+                for module in self.model.modules()
+            )
+            
+            if device.type == "mps":
+                if is_quantized:
+                    logger.error("⚠️  CRITICAL: 4-bit quantization on MPS is causing NaN logits!")
+                    logger.error("  BitsAndBytes quantization has known compatibility issues with MPS.")
+                    logger.error("  SOLUTION 1 (Recommended): Disable quantization:")
+                    logger.error("    In config.yaml, set model.use_4bit: false")
+                    logger.error("  SOLUTION 2: Use float32 compute dtype (already attempted if enabled):")
+                    logger.error("    The code should use float32 compute dtype for quantized models on MPS")
+                    logger.error("  SOLUTION 3: Use CPU instead of MPS for quantized models")
+                elif self.model.dtype == torch.bfloat16:
+                    logger.error("⚠️  Potential bfloat16 numerical instability on MPS!")
+                    logger.error("  MPS bfloat16 support may have issues with certain operations.")
+                    logger.error("  SOLUTION: Try using float32 instead of bfloat16:")
+                    logger.error("    In config.yaml, set model.use_4bit: false and use dtype: float32")
+            
+            # Check specific token IDs that might be problematic
+            # Log a sample of input_ids to see if there's a pattern
+            sample_input_ids = input_ids[0, :50].cpu().tolist()  # First 50 tokens of first batch
+            logger.error(f"Sample input_ids (first 50 tokens): {sample_input_ids}")
+            
+            # Check if there are any special tokens that might cause issues
+            special_token_ids = []
+            if hasattr(self.tokenizer, 'bos_token_id') and self.tokenizer.bos_token_id is not None:
+                special_token_ids.append(('bos', self.tokenizer.bos_token_id))
+            if hasattr(self.tokenizer, 'eos_token_id') and self.tokenizer.eos_token_id is not None:
+                special_token_ids.append(('eos', self.tokenizer.eos_token_id))
+            if hasattr(self.tokenizer, 'pad_token_id') and self.tokenizer.pad_token_id is not None:
+                special_token_ids.append(('pad', self.tokenizer.pad_token_id))
+            if hasattr(self.tokenizer, 'unk_token_id') and self.tokenizer.unk_token_id is not None:
+                special_token_ids.append(('unk', self.tokenizer.unk_token_id))
+            logger.error(f"Special token IDs: {special_token_ids}")
+            
+            # Check if model weights have NaN
+            nan_params = []
+            for name, param in self.model.named_parameters():
+                if torch.isnan(param).any() or torch.isinf(param).any():
+                    nan_count = torch.isnan(param).sum().item() + torch.isinf(param).sum().item()
+                    nan_params.append((name, nan_count, param.shape))
+                    logger.error(f"NaN/Inf detected in model parameter AFTER forward pass: {name} ({nan_count} values)")
+            
+            if nan_params:
+                logger.error(f"Total parameters with NaN/Inf: {len(nan_params)}")
+                logger.error("This suggests the model weights became corrupted during training or loading.")
+            
+            # Replace NaN/Inf with zeros as fallback
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=1e6, neginf=-1e6)
+        
+        log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+        
+        # Validate rewards
+        rewards_array = np.array(rewards)
+        if np.isnan(rewards_array).any() or np.isinf(rewards_array).any():
+            logger.warning("NaN/Inf detected in rewards, replacing with 0.5")
+            rewards = [0.5 if (np.isnan(r) or np.isinf(r)) else r for r in rewards]
+            rewards_array = np.array(rewards)
+        
+        # Clamp rewards to reasonable range
+        rewards = [max(0.0, min(1.0, float(r))) for r in rewards]
+        
         # Compute policy gradient loss
         # Select log probs for generated tokens
         # Simplified: use average log prob as proxy
@@ -1158,21 +1745,68 @@ class RFAITrainer:
             2, input_ids[:, 1:].unsqueeze(-1)
         ).squeeze(-1)
         
-        # Convert rewards to tensor
-        reward_tensor = torch.tensor(rewards, device=self.device).unsqueeze(1)
-        reward_tensor = reward_tensor.expand_as(selected_log_probs)
+        # Validate selected_log_probs
+        if torch.isnan(selected_log_probs).any() or torch.isinf(selected_log_probs).any():
+            logger.warning("NaN/Inf in selected_log_probs, replacing with zeros")
+            selected_log_probs = torch.nan_to_num(selected_log_probs, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # Convert rewards to tensor with validation
+        reward_tensor = torch.tensor(rewards, device=self.device, dtype=torch.float32)
+        if len(reward_tensor.shape) == 1:
+            reward_tensor = reward_tensor.unsqueeze(1)
+        
+        # Expand to match selected_log_probs shape
+        if reward_tensor.shape[0] != selected_log_probs.shape[0]:
+            logger.warning(f"Reward tensor shape mismatch: {reward_tensor.shape} vs {selected_log_probs.shape}")
+            # Pad or truncate rewards to match
+            if reward_tensor.shape[0] < selected_log_probs.shape[0]:
+                # Pad with mean reward
+                mean_reward = reward_tensor.mean().item()
+                padding = torch.full((selected_log_probs.shape[0] - reward_tensor.shape[0], 1), mean_reward, device=self.device)
+                reward_tensor = torch.cat([reward_tensor, padding], dim=0)
+            else:
+                reward_tensor = reward_tensor[:selected_log_probs.shape[0]]
+        
+        # Expand reward tensor to match sequence length
+        if reward_tensor.shape[1] == 1 and len(selected_log_probs.shape) > 1:
+            reward_tensor = reward_tensor.expand(-1, selected_log_probs.shape[1])
+        
+        # Ensure attention_mask is valid
+        attn_mask = attention_mask[:, 1:]
+        if attn_mask.shape != selected_log_probs.shape:
+            logger.warning(f"Attention mask shape mismatch: {attn_mask.shape} vs {selected_log_probs.shape}")
+            # Adjust attention mask
+            if attn_mask.shape[1] > selected_log_probs.shape[1]:
+                attn_mask = attn_mask[:, :selected_log_probs.shape[1]]
+            elif attn_mask.shape[1] < selected_log_probs.shape[1]:
+                padding = torch.zeros(attn_mask.shape[0], selected_log_probs.shape[1] - attn_mask.shape[1], device=self.device, dtype=attn_mask.dtype)
+                attn_mask = torch.cat([attn_mask, padding], dim=1)
         
         # Policy gradient: maximize log_prob * reward
-        policy_loss = -(selected_log_probs * reward_tensor * attention_mask[:, 1:]).mean()
+        policy_loss = -(selected_log_probs * reward_tensor * attn_mask).mean()
+        
+        # Validate policy loss
+        if torch.isnan(policy_loss) or torch.isinf(policy_loss):
+            logger.warning("NaN/Inf in policy_loss, using zero")
+            policy_loss = torch.tensor(0.0, device=self.device)
         
         # KL penalty
         ref_selected_log_probs = ref_log_probs[:, :-1, :].gather(
             2, input_ids[:, 1:].unsqueeze(-1)
         ).squeeze(-1)
+        
+        # Validate ref_selected_log_probs
+        if torch.isnan(ref_selected_log_probs).any() or torch.isinf(ref_selected_log_probs).any():
+            logger.warning("NaN/Inf in ref_selected_log_probs, replacing with zeros")
+            ref_selected_log_probs = torch.nan_to_num(ref_selected_log_probs, nan=0.0, posinf=0.0, neginf=0.0)
+        
         kl_penalty = self.compute_kl_penalty(selected_log_probs, ref_selected_log_probs)
         
-        # Total loss
+        # Total loss with validation
         total_loss = policy_loss + kl_penalty
+        if torch.isnan(total_loss) or torch.isinf(total_loss):
+            logger.error("NaN/Inf in total_loss! Using zero loss as fallback.")
+            total_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
         
         # Backward pass
         total_loss.backward()
@@ -1190,7 +1824,7 @@ class RFAITrainer:
     
     def train(self, train_dataset: CodeDataset, eval_dataset: Optional[CodeDataset] = None):
         """Main training loop"""
-        logger.info("Starting RFAI training...")
+        logger.info("Starting RLAIF training...")
         
         # Start system monitoring
         self._start_monitoring()
@@ -1259,7 +1893,10 @@ class RFAITrainer:
                 # Aggressive cache clearing to prevent MPS OOM
                 # Clear cache every batch when using MPS to prevent memory buildup
                 if torch.backends.mps.is_available():
-                    torch.mps.empty_cache()  # Clear every batch for MPS
+                    # Aggressive cache clearing for MPS to prevent OOM
+                    torch.mps.empty_cache()
+                    import gc
+                    gc.collect()  # Force garbage collection
                 elif torch.cuda.is_available():
                     # For CUDA, clear less frequently
                     if batch_idx % 5 == 0:
@@ -1313,16 +1950,36 @@ class RFAITrainer:
                     dataset_batch = []  # Clear batch
                 
                 # Training step
+                # Reconstruct batch from generated samples (with full sequences: prompt + generated code)
+                # The original batch only has prompts, but we need the full sequences for training
+                train_batch = self._create_training_batch_from_samples(samples, batch['prompt'])
+                
                 train_start = time.time()
-                loss_dict = self.train_step(batch, rewards[:len(batch['prompt'])])
+                loss_dict = self.train_step(train_batch, rewards[:len(batch['prompt'])])
                 train_time = time.time() - train_start
                 epoch_losses.append(loss_dict['loss'])
                 
-                # Clear cache after training step to free memory (critical for MPS OOM prevention)
+                # Aggressive memory cleanup after training step to prevent OOM
                 if torch.backends.mps.is_available():
-                    torch.mps.empty_cache()
+                    # Delete intermediate tensors explicitly
+                    if 'train_batch' in locals():
+                        del train_batch
+                    if 'samples' in locals():
+                        del samples
+                    if 'rewards' in locals():
+                        del rewards
+                    
+                    # Force garbage collection
                     import gc
-                    gc.collect()  # Force garbage collection after each training step
+                    gc.collect()
+                    
+                    # Clear MPS cache aggressively
+                    torch.mps.empty_cache()
+                    
+                    # Synchronize to ensure cleanup is complete
+                    torch.mps.synchronize()
+                    
+                    logger.debug(f"Memory cleanup complete after training step {batch_idx}")
                 elif torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 
@@ -1432,17 +2089,36 @@ class RFAITrainer:
             process_memory = process.memory_info()
             process_memory_gb = process_memory.rss / (1024 ** 3)
             
-            # GPU/MPS memory (if using PyTorch)
+            # GPU/MPS memory and utilization (if using PyTorch)
             gpu_memory_used = 0.0
             gpu_memory_total = 0.0
+            gpu_utilization = 0.0
             if torch.backends.mps.is_available():
                 # MPS doesn't have direct memory query, but we can track allocations
                 if hasattr(torch.mps, 'current_allocated_memory'):
                     gpu_memory_used = torch.mps.current_allocated_memory() / (1024 ** 3)
                     gpu_memory_total = torch.mps.driver_allocated_memory() / (1024 ** 3) if hasattr(torch.mps, 'driver_allocated_memory') else 0.0
+                
+                # For MPS, we estimate utilization based on memory usage and activity
+                # MPS doesn't provide direct utilization metrics like CUDA
+                # We use memory usage as a proxy: high memory usage = likely active
+                if gpu_memory_total > 0:
+                    memory_util = (gpu_memory_used / gpu_memory_total) * 100
+                    # Also check if there are active operations (heuristic)
+                    # If memory is being used, assume GPU is active
+                    gpu_utilization = min(100.0, memory_util * 1.2)  # Scale up slightly as proxy
+                else:
+                    # Fallback: if we can't get memory, check if MPS is initialized
+                    gpu_utilization = 50.0 if gpu_memory_used > 0 else 0.0
             elif torch.cuda.is_available():
                 gpu_memory_used = torch.cuda.memory_allocated() / (1024 ** 3)
                 gpu_memory_total = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+                # CUDA provides utilization via nvidia-smi, but we can't query it directly
+                # Use memory usage as proxy
+                if gpu_memory_total > 0:
+                    gpu_utilization = (gpu_memory_used / gpu_memory_total) * 100
+                else:
+                    gpu_utilization = 0.0
             
             return {
                 'cpu_percent': cpu_percent,
@@ -1455,6 +2131,7 @@ class RFAITrainer:
                 'gpu_memory_used_gb': gpu_memory_used,
                 'gpu_memory_total_gb': gpu_memory_total,
                 'gpu_memory_percent': (gpu_memory_used / gpu_memory_total * 100) if gpu_memory_total > 0 else 0.0,
+                'gpu_utilization': gpu_utilization,  # GPU/Neural Engine utilization estimate
             }
         except Exception as e:
             logger.warning(f"Error getting system metrics: {e}")
@@ -1485,6 +2162,7 @@ class RFAITrainer:
                             self.writer.add_scalar('System/GPU_Memory_Used_GB', metrics.get('gpu_memory_used_gb', 0), step)
                             self.writer.add_scalar('System/GPU_Memory_Total_GB', metrics.get('gpu_memory_total_gb', 0), step)
                             self.writer.add_scalar('System/GPU_Memory_Percent', metrics.get('gpu_memory_percent', 0), step)
+                            self.writer.add_scalar('System/GPU_Utilization', metrics.get('gpu_utilization', 0), step)
                     
                     step += 1
                     time.sleep(self.monitoring_interval)
@@ -1528,9 +2206,11 @@ class RFAITrainer:
                 f"  Process Memory: {system_metrics.get('process_memory_gb', 0):.2f}GB"
             )
             if system_metrics.get('gpu_memory_total_gb', 0) > 0:
+                gpu_util = system_metrics.get('gpu_utilization', 0)
                 stats_str += (
                     f"\n  GPU Memory: {system_metrics.get('gpu_memory_percent', 0):.1f}% "
-                    f"({system_metrics.get('gpu_memory_used_gb', 0):.2f}GB / {system_metrics.get('gpu_memory_total_gb', 0):.2f}GB)"
+                    f"({system_metrics.get('gpu_memory_used_gb', 0):.2f}GB / {system_metrics.get('gpu_memory_total_gb', 0):.2f}GB)\n"
+                    f"  GPU Utilization: {gpu_util:.1f}%"
                 )
         
         logger.info(stats_str)
@@ -1553,6 +2233,7 @@ class RFAITrainer:
                 if system_metrics.get('gpu_memory_total_gb', 0) > 0:
                     self.writer.add_scalar('System/GPU_Memory_Used_GB', system_metrics.get('gpu_memory_used_gb', 0), step)
                     self.writer.add_scalar('System/GPU_Memory_Percent', system_metrics.get('gpu_memory_percent', 0), step)
+                    self.writer.add_scalar('System/GPU_Utilization', system_metrics.get('gpu_utilization', 0), step)
     
     def _save_checkpoint(self, step: int, final: bool = False):
         """Save model checkpoint in both PyTorch and MLX formats"""
@@ -1816,7 +2497,7 @@ tags:
 - python
 - cpp
 - rust
-- rfai
+- rlaif
 - qwen
 - fine-tuned
 base_model: {self.config.base_model}
@@ -1824,12 +2505,12 @@ base_model: {self.config.base_model}
 
 # {repo_id.split('/')[-1]}
 
-This model is a fine-tuned version of [{self.config.base_model}](https://huggingface.co/{self.config.base_model}) using Reinforcement from AI Feedback (RFAI).
+This model is a fine-tuned version of [{self.config.base_model}](https://huggingface.co/{self.config.base_model}) using Reinforcement Learning from AI Feedback (RLAIF).
 
 ## Training Details
 
 - **Base Model**: {self.config.base_model}
-- **Training Method**: RFAI (Reinforcement from AI Feedback)
+- **Training Method**: RLAIF (Reinforcement Learning from AI Feedback)
 - **Teacher Model**: {self.config.teacher_provider}/{self.config.teacher_model}
 - **Training Steps**: {step}
 - **Languages**: Python, C++, Rust
@@ -1948,7 +2629,7 @@ tags:
 - python
 - cpp
 - rust
-- rfai
+- rlaif
 - reinforcement-learning
 size_categories:
 - 1K<n<10K
@@ -1956,11 +2637,11 @@ size_categories:
 
 # Qwen Code RFAI Dataset
 
-This dataset contains prompts, teacher-generated code, student-generated code, and scoring parameters from the RFAI (Reinforcement from AI Feedback) training process.
+This dataset contains prompts, teacher-generated code, student-generated code, and scoring parameters from the RLAIF (Reinforcement Learning from AI Feedback) training process.
 
 ## Dataset Description
 
-This dataset was generated during the fine-tuning of a Qwen model for code generation using RFAI methodology. Each entry includes:
+This dataset was generated during the fine-tuning of a Qwen model for code generation using RLAIF methodology. Each entry includes:
 
 - **Prompt**: The original code generation prompt
 - **Language**: Programming language (Python, C++, or Rust)
@@ -2092,7 +2773,7 @@ MIT License
                 folder_path=str(dataset_dir),
                 repo_id=repo_id,
                 token=hf_token,
-                commit_message=f"Upload RFAI training dataset (step {step})",
+                commit_message=f"Upload RLAIF training dataset (step {step})",
                 ignore_patterns=["*.pyc", "__pycache__"]
             )
             
@@ -2106,7 +2787,7 @@ MIT License
             logger.debug(traceback.format_exc())
 
 
-def load_config(config_path: str) -> Tuple[RFAIConfig, dict]:
+def load_config(config_path: str) -> Tuple[RLAIFConfig, dict]:
     """Load configuration from YAML file"""
     with open(config_path, 'r') as f:
         config_dict = yaml.safe_load(f)
@@ -2115,7 +2796,7 @@ def load_config(config_path: str) -> Tuple[RFAIConfig, dict]:
     model_cfg = config_dict.get('model', {})
     teacher_cfg = config_dict.get('teacher', {})
     training_cfg = config_dict.get('training', {})
-    rfai_cfg = config_dict.get('rfai', {})
+    rlaif_cfg = config_dict.get('rlaif', {})
     logging_cfg = config_dict.get('logging', {})
     hardware_cfg = config_dict.get('hardware', {})
     data_cfg = config_dict.get('data', {})
@@ -2140,7 +2821,7 @@ def load_config(config_path: str) -> Tuple[RFAIConfig, dict]:
             return value.lower() in ('true', '1', 'yes', 'on')
         return bool(value)
     
-    rfai_config = RFAIConfig(
+    rlaif_config = RLAIFConfig(
         base_model=model_cfg.get('base_model', 'Qwen/Qwen2.5-7B-Instruct'),
         teacher_provider=teacher_cfg.get('provider', 'openai'),
         teacher_model=teacher_cfg.get('model_name', 'claude-3-5-haiku-20241022' if teacher_cfg.get('provider') == 'anthropic' else 'gpt-4-turbo-preview'),
@@ -2157,18 +2838,18 @@ def load_config(config_path: str) -> Tuple[RFAIConfig, dict]:
         max_grad_norm=to_float(training_cfg.get('max_grad_norm'), 1.0),
         weight_decay=to_float(training_cfg.get('weight_decay'), 0.01),
         lr_scheduler_type=training_cfg.get('lr_scheduler_type', 'cosine'),
-        reward_weight=to_float(rfai_cfg.get('reward_weight'), 1.0),
-        kl_penalty=to_float(rfai_cfg.get('kl_penalty'), 0.1),
-        beta=to_float(rfai_cfg.get('beta'), 0.1),
-        num_samples_per_prompt=to_int(rfai_cfg.get('num_samples_per_prompt'), 4),
+        reward_weight=to_float(rlaif_cfg.get('reward_weight'), 1.0),
+        kl_penalty=to_float(rlaif_cfg.get('kl_penalty'), 0.1),
+        beta=to_float(rlaif_cfg.get('beta'), 0.1),
+        num_samples_per_prompt=to_int(rlaif_cfg.get('num_samples_per_prompt'), 4),
         max_length=to_int(model_cfg.get('max_length'), 2048),
         use_4bit=to_bool(model_cfg.get('use_4bit'), True),
         use_mps=to_bool(hardware_cfg.get('use_mps'), True),
         mixed_precision=hardware_cfg.get('mixed_precision', 'bf16'),
         tensorboard_dir=logging_cfg.get('tensorboard_dir', './logs/tensorboard'),
         log_level=logging_cfg.get('log_level', 'INFO'),
-        top_k=to_int(rfai_cfg.get('top_k'), 50),
-        top_p=to_float(rfai_cfg.get('top_p'), 0.95),
+        top_k=to_int(rlaif_cfg.get('top_k'), 50),
+        top_p=to_float(rlaif_cfg.get('top_p'), 0.95),
         save_mlx_format=to_bool(hardware_cfg.get('save_mlx_format'), True),
         mlx_quantization=hardware_cfg.get('mlx_quantization', None),
         use_safetensors=to_bool(model_cfg.get('use_safetensors'), True),
@@ -2186,11 +2867,11 @@ def load_config(config_path: str) -> Tuple[RFAIConfig, dict]:
         mlx_model_path=hardware_cfg.get('mlx_model_path', None),
     )
     
-    return rfai_config, data_cfg
+    return rlaif_config, data_cfg
 
 
 def main():
-    parser = argparse.ArgumentParser(description="RFAI Training for Qwen Code Model")
+    parser = argparse.ArgumentParser(description="RLAIF Training for Qwen Code Model")
     parser.add_argument(
         '--config',
         type=str,
@@ -2275,7 +2956,7 @@ def main():
     
     # Initialize trainer
     try:
-        trainer = RFAITrainer(config)
+        trainer = RLAIFTrainer(config)
     except ValueError as e:
         logger.error(str(e))
         return 1

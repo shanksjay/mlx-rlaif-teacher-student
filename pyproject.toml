@@ -1,7 +1,7 @@
 [project]
-name = "train-coding-asst"
+name = "mlx-rlaif-teacher-student"
 version = "0.1.0"
-description = "Add your description here"
+description = "Teacher–student fine-tuning of LLMs using Reinforcement Learning from AI Feedback (RLAIF), optimized for Apple Silicon with MLX and MPS"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []

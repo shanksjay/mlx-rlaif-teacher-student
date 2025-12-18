@@ -62,7 +62,7 @@ class ModelValidator:
     def _init_teacher(self):
         """Initialize teacher model for scoring"""
         try:
-            from train_rfai import TeacherModel
+            from train_rlaif import TeacherModel
             api_key_env = "OPENAI_API_KEY" if self.teacher_provider == "openai" else "ANTHROPIC_API_KEY"
             return TeacherModel(self.teacher_provider, self.teacher_model, api_key_env)
         except Exception as e:

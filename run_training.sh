@@ -4,7 +4,7 @@
 set -e
 
 echo "=========================================="
-echo "Qwen Code RFAI Training Setup"
+echo "Qwen Code RLAIF Training Setup"
 echo "=========================================="
 
 # Check for API key
@@ -42,7 +42,7 @@ echo "=========================================="
 echo ""
 
 # Run training
-uv run python train_rfai.py --config config.yaml
+uv run python train_rlaif.py --config config.yaml
 
 echo ""
 echo "=========================================="
