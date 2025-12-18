@@ -89,11 +89,11 @@ uv run python scripts/training/train_rlaif.py --config config.yaml
 ### Expected Output
 
 ```
-2024-01-XX XX:XX:XX - INFO - Loading base model: Qwen/Qwen2.5-Coder-3B-Instruct
-2024-01-XX XX:XX:XX - INFO - Using MPS (Metal Performance Shaders)
-2024-01-XX XX:XX:XX - INFO - Initializing teacher model: anthropic/claude-3-5-haiku-20241022
-2024-01-XX XX:XX:XX - INFO - Starting RLAIF training...
-2024-01-XX XX:XX:XX - INFO - Epoch 1/3
+2025-12-XX XX:XX:XX - INFO - Loading base model: Qwen/Qwen2.5-Coder-3B-Instruct
+2025-12-XX XX:XX:XX - INFO - Using MPS (Metal Performance Shaders)
+2025-12-XX XX:XX:XX - INFO - Initializing teacher model: anthropic/claude-3-5-haiku-20241022
+2025-12-XX XX:XX:XX - INFO - Starting RLAIF training...
+2025-12-XX XX:XX:XX - INFO - Epoch 1/3
 ...
 ```
 
@@ -702,7 +702,7 @@ Each dataset entry contains:
     "efficiency": 0.2,
     "documentation": 0.2
   },
-  "timestamp": "2024-01-15T10:30:00"
+  "timestamp": "2025-12-18T10:30:00"
 }
 ```
 
@@ -712,7 +712,7 @@ Configure in `config.yaml`:
 ```yaml
 huggingface:
   upload_datasets: true
-  dataset_repo_id: "mlx-community/qwen-code-rlaif-dataset"
+  dataset_repo_id: "mlx-community/code-rlaif-dataset"
   save_datasets_locally: true
   dataset_output_dir: "./datasets"
 ```
@@ -725,7 +725,7 @@ Export and upload datasets manually:
 ```bash
 uv run python scripts/utils/export_datasets.py \
     --dataset_dir ./datasets \
-    --repo_id mlx-community/qwen-code-rlaif-dataset \
+    --repo_id mlx-community/code-rlaif-dataset \
     --hf_token $HUGGINGFACE_TOKEN
 ```
 
@@ -735,7 +735,7 @@ uv run python scripts/utils/export_datasets.py \
 from datasets import load_dataset
 
 # Load from Hugging Face
-dataset = load_dataset("mlx-community/qwen-code-rlaif-dataset")
+dataset = load_dataset("mlx-community/code-rlaif-dataset")
 
 # Access training data
 train_data = dataset['train']
@@ -765,7 +765,7 @@ Upload your fine-tuned MLX model to the [MLX Community](https://huggingface.co/m
    ```yaml
    huggingface:
      upload_to_hub: true
-     repo_id: "mlx-community/qwen-code-rlaif"
+     repo_id: "mlx-community/code-rlaif"
      hf_token_env: "HUGGINGFACE_TOKEN"
      upload_quantized: true
      private: false

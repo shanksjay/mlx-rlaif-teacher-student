@@ -43,7 +43,7 @@ def create_dataset_card(
     val_count: int,
     eval_count: int,
     base_model: str = "Qwen/Qwen2.5-7B-Instruct",
-    repo_id: str = "mlx-community/qwen-code-rlaif-dataset"
+    repo_id: str = "mlx-community/code-rlaif-dataset"
 ) -> str:
     """Create a dataset card"""
     return f"""---
@@ -63,7 +63,7 @@ size_categories:
 - 1K<n<10K
 ---
 
-# Qwen Code RLAIF Dataset
+# Code RLAIF Dataset
 
 This dataset contains prompts, teacher-generated code, student-generated code, and scoring parameters from the RLAIF (Reinforcement Learning from AI Feedback) training process.
 
@@ -160,7 +160,7 @@ def main():
         '--repo_id',
         type=str,
         required=True,
-        help='Hugging Face dataset repository ID (e.g., mlx-community/qwen-code-rlaif-dataset)'
+        help='Hugging Face dataset repository ID (e.g., mlx-community/code-rlaif-dataset)'
     )
     parser.add_argument(
         '--hf_token',
