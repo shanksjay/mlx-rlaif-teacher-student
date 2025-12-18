@@ -1,0 +1,89 @@
+# Training Configuration for Qwen Code Fine-tuning with RFAI
+
+# Model Configuration
+model:
+  base_model: "Qwen/Qwen2.5-7B-Instruct"  # Baseline Qwen model
+  use_4bit: true  # Use 4-bit quantization for M5 MacBook
+  use_flash_attention: true
+  max_length: 2048
+  device_map: "auto"
+
+# Teacher Model Configuration
+teacher:
+  provider: "anthropic"  # Options: "openai" or "anthropic"
+  model_name: "claude-3-sonnet-20240229"  # For OpenAI: "gpt-4-turbo-preview", "gpt-3.5-turbo"
+  # For Anthropic: "claude-3-opus-20240229", "claude-3-sonnet-20240229"
+  api_key_env: "ANTHROPIC_API_KEY"  # or "OPENAI_API_KEY"
+  temperature: 0.7
+  max_tokens: 2048
+
+# Training Configuration
+training:
+  output_dir: "./checkpoints"
+  num_epochs: 3
+  batch_size: 4  # Adjust based on M5 memory
+  gradient_accumulation_steps: 8
+  learning_rate: 2e-5
+  warmup_steps: 100
+  save_steps: 500
+  eval_steps: 250
+  logging_steps: 50
+  max_grad_norm: 1.0
+  weight_decay: 0.01
+  lr_scheduler_type: "cosine"
+  save_total_limit: 3
+
+# RFAI Configuration
+rfai:
+  reward_weight: 1.0
+  kl_penalty: 0.1  # KL divergence penalty for policy gradient
+  beta: 0.1  # Temperature for reward scaling
+  top_k: 50
+  top_p: 0.95
+  num_samples_per_prompt: 4  # Number of student samples to generate per prompt
+
+# Data Configuration
+data:
+  train_file: "./data/train.jsonl"
+  eval_file: "./data/eval.jsonl"
+  languages: ["python", "cpp", "rust"]
+  max_train_samples: null  # null means use all
+  max_eval_samples: 100
+
+# Evaluation Configuration
+evaluation:
+  metrics:
+    - "code_quality"
+    - "correctness"
+    - "readability"
+    - "efficiency"
+  reward_threshold: 0.7  # Minimum reward score to consider good
+
+# Logging Configuration
+logging:
+  use_tensorboard: true
+  tensorboard_dir: "./logs/tensorboard"
+  use_wandb: false
+  wandb_project: "qwen-code-rfai"
+  log_level: "INFO"
+
+# Hardware Configuration (M5 MacBook)
+hardware:
+  use_mps: true  # Use Metal Performance Shaders for M5
+  mixed_precision: "bf16"  # bfloat16 for M5
+  dataloader_num_workers: 4
+  save_mlx_format: true  # Save model in MLX format for faster inference on Apple Silicon
+  mlx_quantization: q8_bit  # Options: "q4_bit", "q8_bit", or null for no quantization
+
+# Hugging Face Upload Configuration
+huggingface:
+  upload_to_hub: false  # Set to true to upload model to Hugging Face
+  repo_id: "mlx-community/qwen-code-rfai"  # Format: mlx-community/model-name
+  hf_token_env: "HUGGINGFACE_TOKEN"  # Environment variable with HF token
+  upload_quantized: true  # Upload quantized version (4-bit) to HF
+  private: false  # Make repository private
+  upload_datasets: true  # Upload training/validation/evaluation datasets
+  dataset_repo_id: "mlx-community/qwen-code-rfai-dataset"  # Dataset repository ID
+  save_datasets_locally: true  # Save datasets locally before upload
+  dataset_output_dir: "./datasets"  # Local directory to save datasets
+
