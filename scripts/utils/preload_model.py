@@ -11,8 +11,8 @@ Usage:
     
     # Preload and test with MLX model (5-10x faster generation)
     # Note: MLX model must be converted first with quantization
-    uv run python convert_to_mlx.py --hf-path Qwen/Qwen2.5-7B-Instruct --mlx-path ./mlx_model --quantize q8_bit
-    uv run python preload_model.py --model Qwen/Qwen2.5-7B-Instruct --mlx-path ./mlx_model --mlx-quantize q8_bit
+    uv run python scripts/utils/convert_to_mlx.py --hf-path Qwen/Qwen2.5-7B-Instruct --mlx-path ./mlx_model/q8 --quantize q8_bit
+    uv run python scripts/utils/preload_model.py --model Qwen/Qwen2.5-7B-Instruct --mlx-path ./mlx_model/q8 --mlx-quantize q8_bit
     
 Note: MLX quantization is applied during conversion, not loading. The --mlx-quantize flag
 is informational and indicates what quantization level the model should have.
@@ -331,9 +331,12 @@ def preload_model(
     if mlx_model_path:
         mlx_path_to_check = mlx_model_path
     else:
-        # Check common locations
+        # Check common locations (new consolidated structure)
         possible_paths = [
-            "./mlx_model",
+            "./mlx_model/q8",  # Q8 quantized (best balance)
+            "./mlx_model/q4",  # Q4 quantized (smallest)
+            "./mlx_model/base", # Unquantized base model
+            "./mlx_model/base", # Unquantized base model
             f"./mlx_{model_name.replace('/', '_')}",
             os.path.expanduser(f"~/.cache/mlx/{model_name.replace('/', '_')}")
         ]
@@ -392,7 +395,7 @@ def preload_model(
         # No MLX model specified, suggest converting
         logger.info("No MLX model found. Using PyTorch MPS (slower).")
         logger.info("Tip: Convert model to MLX for 5-10x faster generation:")
-        logger.info(f"  uv run python convert_to_mlx.py --hf-path {model_name} --mlx-path ./mlx_model --quantize q8_bit")
+        logger.info(f"  uv run python convert_to_mlx.py --hf-path {model_name} --mlx-path ./mlx_model/q8 --quantize q8_bit")
     
     # Optimize model for inference if on MPS (only if PyTorch model is loaded)
     if not use_mlx and model is not None:
@@ -486,19 +489,19 @@ def preload_model(
         logger.warning("   PyTorch MPS is slower than MLX on Apple Silicon.")
         logger.info("\n💡 To improve generation speed (5-10x faster):")
         logger.info("   1. Convert model to MLX format:")
-        logger.info(f"      uv run python convert_to_mlx.py --hf-path {model_name} --mlx-path ./mlx_model --quantize q8_bit")
+        logger.info(f"      uv run python convert_to_mlx.py --hf-path {model_name} --mlx-path ./mlx_model/q8 --quantize q8_bit")
         logger.info("   2. Run preload with MLX:")
-        logger.info("      uv run python preload_model.py --model Qwen/Qwen2.5-7B-Instruct --mlx-path ./mlx_model --mlx-quantize q8_bit")
+        logger.info("      uv run python preload_model.py --model Qwen/Qwen2.5-7B-Instruct --mlx-path ./mlx_model/q8 --mlx-quantize q8_bit")
         logger.info("   3. Update config.yaml:")
         logger.info("      hardware:")
         logger.info("        use_mlx_for_generation: true")
-        logger.info("        mlx_model_path: ./mlx_model")
+        logger.info("        mlx_model_path: ./mlx_model/q8")
         logger.info("        mlx_quantization: q8_bit")
         logger.info("\n   MLX leverages Apple's GPU and Neural Engine for much faster inference.")
     elif tokens_per_sec < 1.0:
         logger.warning(f"⚠️  Very slow generation ({tokens_per_sec:.2f} tokens/sec)")
         logger.info("   Consider using MLX for 5-10x speedup:")
-        logger.info(f"     uv run python convert_to_mlx.py --hf-path {model_name} --mlx-path ./mlx_model --quantize q8_bit")
+        logger.info(f"     uv run python convert_to_mlx.py --hf-path {model_name} --mlx-path ./mlx_model/q8 --quantize q8_bit")
     
     logger.info("\n✓ Model is ready for training!")
 

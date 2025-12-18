@@ -46,10 +46,10 @@ The training system uses a two-model architecture:
 uv pip install -r requirements.txt
 
 # (Optional) Preload model for faster startup
-uv run python preload_model.py --model Qwen/Qwen2.5-Coder-3B-Instruct
+uv run python scripts/utils/preload_model.py --model Qwen/Qwen2.5-Coder-3B-Instruct
 
 # Generate sample data
-uv run python data_utils.py
+uv run python scripts/utils/data_utils.py
 ```
 
 ### Run Training
@@ -65,7 +65,7 @@ uv run python data_utils.py
 uv run tensorboard --logdir ./logs/tensorboard &
 
 # Run training
-uv run python train_rlaif.py --config config.yaml
+uv run python scripts/training/train_rlaif.py --config config.yaml
 ```
 
 ### Monitor Training
@@ -210,7 +210,7 @@ export ANTHROPIC_API_KEY="your-anthropic-api-key"
 4. Prepare data:
 ```bash
 # Create sample dataset (or use your own)
-uv run python data_utils.py
+uv run python scripts/utils/data_utils.py
 ```
 
 ## Configuration
@@ -230,7 +230,7 @@ The training script is generic and works with any compatible model. By default, 
 ### Basic Training
 
 ```bash
-uv run python train_rlaif.py --config config.yaml
+uv run python scripts/training/train_rlaif.py --config config.yaml
 ```
 
 ### Custom Model
@@ -239,13 +239,13 @@ You can specify a different model using the `--model` argument. This makes the p
 
 ```bash
 # Use a different Qwen model
-uv run python train_rlaif.py --config config.yaml --model Qwen/Qwen2.5-7B-Instruct
+uv run python scripts/training/train_rlaif.py --config config.yaml --model Qwen/Qwen2.5-7B-Instruct
 
 # Use a local model path
-uv run python train_rlaif.py --config config.yaml --model ./my_local_model
+uv run python scripts/training/train_rlaif.py --config config.yaml --model ./my_local_model
 
 # Use any HuggingFace model
-uv run python train_rlaif.py --config config.yaml --model microsoft/phi-2
+uv run python scripts/training/train_rlaif.py --config config.yaml --model microsoft/phi-2
 ```
 
 **Recommended Models for M5 MacBook (32GB):**
@@ -256,7 +256,7 @@ uv run python train_rlaif.py --config config.yaml --model microsoft/phi-2
 ### Custom Data Files
 
 ```bash
-uv run python train_rlaif.py \
+uv run python scripts/training/train_rlaif.py \
     --config config.yaml \
     --train_file ./data/my_train.jsonl \
     --eval_file ./data/my_eval.jsonl
@@ -265,7 +265,7 @@ uv run python train_rlaif.py \
 ### Combined Options
 
 ```bash
-uv run python train_rlaif.py \
+uv run python scripts/training/train_rlaif.py \
     --config config.yaml \
     --model Qwen/Qwen2.5-7B-Instruct \
     --train_file ./data/my_train.jsonl \
@@ -359,7 +359,7 @@ The script is optimized for M5 MacBook:
 To avoid slow loading on every training run, preload the model once:
 
 ```bash
-uv run python preload_model.py --model Qwen/Qwen2.5-Coder-3B-Instruct
+uv run python scripts/utils/preload_model.py --model Qwen/Qwen2.5-Coder-3B-Instruct
 ```
 
 This will:
@@ -439,7 +439,7 @@ model:
 hardware:
   dataloader_num_workers: 0  # Critical for M5
   use_mlx_for_generation: true  # Enable for 5-10x faster generation
-  mlx_model_path: "./mlx_model_q8"
+  mlx_model_path: "./mlx_model/q8"
   mlx_quantization: q8_bit
 ```
 
@@ -466,14 +466,14 @@ PyTorch MPS (Metal Performance Shaders) on Apple Silicon provides GPU accelerati
 
 ```bash
 # Convert HuggingFace model to MLX
-uv run python convert_to_mlx.py \
+uv run python scripts/utils/convert_to_mlx.py \
     --hf-path Qwen/Qwen2.5-Coder-3B-Instruct \
     --mlx-path ./mlx_model
 
 # Or with quantization (smaller, faster)
-uv run python convert_to_mlx.py \
+uv run python scripts/utils/convert_to_mlx.py \
     --hf-path Qwen/Qwen2.5-Coder-3B-Instruct \
-    --mlx-path ./mlx_model \
+    --mlx-path ./mlx_model/q8 \
     --quantize q8_bit  # or q4_bit
 ```
 
@@ -484,14 +484,14 @@ Edit `config.yaml`:
 ```yaml
 hardware:
   use_mlx_for_generation: true  # Enable MLX for generation
-  mlx_model_path: "./mlx_model"  # Path to MLX model
+  mlx_model_path: "./mlx_model/q8"  # Path to MLX model (e.g., ./mlx_model/q8, ./mlx_model/q4, ./mlx_model/base)
   mlx_quantization: q8_bit  # Options: q4_bit, q8_bit, or null
 ```
 
 #### 3. Run Training
 
 ```bash
-uv run python train_rlaif.py --config config.yaml
+uv run python scripts/training/train_rlaif.py --config config.yaml
 ```
 
 The training will now use MLX for generation (5-10x faster) while keeping PyTorch for training.
@@ -569,7 +569,7 @@ print(response)
 
 Or use the utility script:
 ```bash
-uv run python load_mlx_model.py \
+uv run python scripts/utils/load_mlx_model.py \
     --model_path ./checkpoints/checkpoint-500/mlx_model \
     --prompt "Implement a binary search function" \
     --language python
@@ -590,14 +590,14 @@ If you see "MLX model not found", the code will fall back to PyTorch MPS. To fix
 
 1. Convert model to MLX:
    ```bash
-   uv run python convert_to_mlx.py --hf-path Qwen/Qwen2.5-Coder-3B-Instruct --mlx-path ./mlx_model
+   uv run python scripts/utils/convert_to_mlx.py --hf-path Qwen/Qwen2.5-Coder-3B-Instruct --mlx-path ./mlx_model
    ```
 
 2. Update config:
    ```yaml
    hardware:
      use_mlx_for_generation: true
-     mlx_model_path: "./mlx_model"
+     mlx_model_path: "./mlx_model/q8"
    ```
 
 #### Slow Generation Still
@@ -613,7 +613,7 @@ If generation is still slow even with MLX:
 After training, validate your model to compare pre-training vs post-training quality:
 
 ```bash
-uv run python validate_model.py \
+uv run python scripts/validation/validate_model.py \
     --base_model Qwen/Qwen2.5-Coder-3B-Instruct \
     --fine_tuned_path ./checkpoints/checkpoint-500 \
     --test_prompts ./data/eval.jsonl \
@@ -658,7 +658,7 @@ Create a JSONL file with your test cases:
 
 Then run:
 ```bash
-uv run python validate_model.py \
+uv run python scripts/validation/validate_model.py \
     --fine_tuned_path ./checkpoints/checkpoint-500 \
     --test_prompts ./my_test_prompts.jsonl
 ```
@@ -723,7 +723,7 @@ Datasets are automatically uploaded after training completes.
 
 Export and upload datasets manually:
 ```bash
-uv run python export_datasets.py \
+uv run python scripts/utils/export_datasets.py \
     --dataset_dir ./datasets \
     --repo_id mlx-community/qwen-code-rlaif-dataset \
     --hf_token $HUGGINGFACE_TOKEN
@@ -787,13 +787,13 @@ To profile model loading and training with call stacks and timing:
 
 ```bash
 # Profile with Apple Instruments (recommended for macOS)
-uv run python profile_with_instruments.py --method instruments --script profile_model_loading.py
+uv run python scripts/profiling/profile_with_instruments.py --method instruments --script scripts/profiling/profile_model_loading.py
 
 # Profile with py-spy (flamegraph)
-uv run python profile_with_instruments.py --method pyspy --script profile_model_loading.py
+uv run python scripts/profiling/profile_with_instruments.py --method pyspy --script scripts/profiling/profile_model_loading.py
 
 # Profile with all methods
-uv run python profile_with_instruments.py --method all --script profile_model_loading.py
+uv run python scripts/profiling/profile_with_instruments.py --method all --script scripts/profiling/profile_model_loading.py
 ```
 
 ### Available Profiling Methods
@@ -932,21 +932,29 @@ train_coding_asst/
 ├── config.yaml              # Training configuration
 ├── .gitignore               # Git ignore rules
 │
-├── train_rlaif.py            # Main training script with RLAIF implementation
-├── data_utils.py            # Dataset utilities and sample data generation
-├── validate_model.py        # Model validation script
-├── preload_model.py         # Model preloading and caching
-├── convert_to_mlx.py        # Convert PyTorch models to MLX format
-├── load_mlx_model.py        # Load and test MLX models
-├── export_datasets.py       # Export datasets to Hugging Face
-├── profile_with_instruments.py  # Profiling utilities
-├── profile_model_loading.py     # Model loading profiler
-├── visualize_training.py    # Training visualization utilities
+├── scripts/
+│   ├── training/              # Training scripts
+│   │   ├── train_rlaif.py     # Main RLAIF training script
+│   │   └── train_rfai.py      # Legacy RFAI script (deprecated)
+│   ├── validation/            # Validation scripts
+│   │   └── validate_model.py  # Model validation and comparison
+│   ├── utils/                 # Utility scripts
+│   │   ├── data_utils.py      # Dataset generation utilities
+│   │   ├── convert_to_mlx.py  # MLX model conversion
+│   │   ├── preload_model.py   # Model preloading and caching
+│   │   ├── load_mlx_model.py # MLX model loader
+│   │   └── export_datasets.py # Dataset export to Hugging Face
+│   ├── profiling/            # Performance profiling scripts
+│   │   ├── profile_model_loading.py  # Model loading profiler
+│   │   └── profile_with_instruments.py  # Apple Instruments profiler
+│   └── visualization/        # Visualization scripts
+│       └── visualize_training.py  # Training visualization utilities
 ├── run_training.sh          # Convenience script to run training
 │
-├── data/                    # Training data directory
-│   ├── train.jsonl          # Training dataset (generated)
-│   └── eval.jsonl           # Evaluation dataset (generated)
+├── mlx_model/               # Consolidated MLX model directory
+│   ├── base/                # Unquantized base model
+│   ├── q4/                   # Q4 quantized model
+│   └── q8/                   # Q8 quantized model (recommended)
 │
 ├── checkpoints/             # Model checkpoints (created during training)
 │   └── checkpoint-{step}/

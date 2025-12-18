@@ -764,9 +764,9 @@ class RLAIFTrainer:
             if mlx_path is None:
                 # Try common MLX model locations in order of preference
                 possible_paths = [
-                    "./mlx_model_q8",  # Q8 quantized (best balance)
-                    "./mlx_model_q4",  # Q4 quantized (smallest)
-                    "./mlx_model",      # Unquantized
+                    "./mlx_model/q8",  # Q8 quantized (best balance)
+                    "./mlx_model/q4",  # Q4 quantized (smallest)
+                    "./mlx_model/base", # Unquantized base model
                 ]
                 for path in possible_paths:
                     if os.path.exists(path):
@@ -778,7 +778,7 @@ class RLAIFTrainer:
                     for path in possible_paths:
                         logger.warning(f"  - {path}")
                     logger.warning("To convert model to MLX:")
-                    logger.warning(f"  uv run python convert_to_mlx.py --hf-path {self.config.base_model} --mlx-path ./mlx_model_q8 --quantize q8_bit")
+                    logger.warning(f"  uv run python scripts/utils/convert_to_mlx.py --hf-path {self.config.base_model} --mlx-path ./mlx_model/q8 --quantize q8_bit")
                     logger.warning("Falling back to PyTorch MPS for generation (slower)")
             
             # Load MLX model if path was found or specified
@@ -824,26 +824,26 @@ class RLAIFTrainer:
                     quantize_bits = 4
                 elif self.config.mlx_quantization == "q8_bit":
                     quantize_bits = 8
-            elif "q4" in model_path.lower() or "q4_bit" in model_path.lower():
+            elif "/q4" in model_path.lower() or "q4_bit" in model_path.lower():
                 quantize_bits = 4
                 logger.info("Auto-detected Q4 quantization from path name")
-            elif "q8" in model_path.lower() or "q8_bit" in model_path.lower():
+            elif "/q8" in model_path.lower() or "q8_bit" in model_path.lower():
                 quantize_bits = 8
                 logger.info("Auto-detected Q8 quantization from path name")
             
             if os.path.exists(model_path):
                 # If model path contains q4/q8, the model is already quantized
                 # Don't pass quantize parameter - just load the pre-quantized model
-                model_already_quantized = "q4" in model_path.lower() or "q8" in model_path.lower()
+                model_already_quantized = "/q4" in model_path.lower() or "/q8" in model_path.lower()
                 
                 if model_already_quantized:
                     logger.info(f"Loading pre-quantized MLX model from {model_path}...")
                     logger.info("  (Model is already quantized - no need to pass quantize parameter)")
                     self.mlx_model, self.mlx_tokenizer = load(model_path)
                     # Extract quantization level from path for logging
-                    if "q4" in model_path.lower():
+                    if "/q4" in model_path.lower():
                         quantize_bits = 4
-                    elif "q8" in model_path.lower():
+                    elif "/q8" in model_path.lower():
                         quantize_bits = 8
                     logger.info(f"✓ Loaded pre-quantized model ({quantize_bits}-bit)")
                 elif quantize_bits:
@@ -910,22 +910,18 @@ class RLAIFTrainer:
                 logger.warning(f"MLX model path specified but not found: {model_path}")
                 logger.info("Will use PyTorch for generation (slower)")
                 logger.info("Tip: Convert model to MLX format:")
-                logger.info(f"  uv run python convert_to_mlx.py --hf-path {self.config.base_model} --mlx-path {model_path}")
+                logger.info(f"  uv run python scripts/utils/convert_to_mlx.py --hf-path {self.config.base_model} --mlx-path {model_path}")
                 if self.config.mlx_quantization:
                     logger.info(f"  --quantize {self.config.mlx_quantization}")
             else:
                 # No MLX model specified or found
                 logger.info("MLX model not found. Will use PyTorch for generation (slower).")
                 logger.info("Tip: Convert model to MLX format for 5-10x faster generation:")
-                logger.info(f"  uv run python convert_to_mlx.py --hf-path {self.config.base_model} --mlx-path ./mlx_model")
-                if self.config.mlx_quantization:
-                    logger.info(f"  --quantize {self.config.mlx_quantization}")
+                logger.info(f"  uv run python scripts/utils/convert_to_mlx.py --hf-path {self.config.base_model} --mlx-path ./mlx_model/q8 --quantize q8_bit")
                 logger.info("Then update config.yaml:")
                 logger.info("  hardware:")
                 logger.info("    use_mlx_for_generation: true")
-                logger.info("    mlx_model_path: ./mlx_model")
-                if self.config.mlx_quantization:
-                    logger.info(f"    mlx_quantization: {self.config.mlx_quantization}")
+                logger.info("    mlx_model_path: ./mlx_model/q8")
         except ImportError:
             logger.warning("MLX not available. Install with: uv pip install mlx mlx-lm")
             logger.info("Using PyTorch MPS for generation (slower)")
@@ -1943,7 +1939,7 @@ class RLAIFTrainer:
                     elif tokens_per_sec < 1.0:
                         # PyTorch MPS is slow - provide actionable advice
                         logger.warning("⚠️  Slow generation. Consider using MLX for 5-10x speedup:")
-                        logger.warning(f"  1. Convert model: uv run python convert_to_mlx.py --hf-path {self.config.base_model} --mlx-path ./mlx_model --quantize q8_bit")
+                        logger.warning(f"  1. Convert model: uv run python scripts/utils/convert_to_mlx.py --hf-path {self.config.base_model} --mlx-path ./mlx_model/q8 --quantize q8_bit")
                         logger.warning("  2. Update config.yaml: hardware.use_mlx_for_generation: true")
                 
                 # Compute rewards and collect dataset entries (optimized)
