@@ -62,7 +62,8 @@ uv run python scripts/utils/data_utils.py
 #### Option 2: Manual execution
 ```bash
 # Start TensorBoard in background (optional)
-uv run tensorboard --logdir ./logs/tensorboard &
+# Suppress pkg_resources deprecation warning
+PYTHONWARNINGS=ignore::UserWarning uv run tensorboard --logdir ./logs/tensorboard &
 
 # Run training
 uv run python scripts/training/train_rlaif.py --config config.yaml
@@ -80,7 +81,8 @@ uv run python scripts/training/train_rlaif.py --config config.yaml
      GPU Utilization: 75.3%
    ```
 
-2. **TensorBoard**: Run `uv run tensorboard --logdir ./logs/tensorboard` and open http://localhost:6006
+2. **TensorBoard**: Run `PYTHONWARNINGS=ignore::UserWarning uv run tensorboard --logdir ./logs/tensorboard` and open http://localhost:6006
+   - To suppress the pkg_resources deprecation warning, use the PYTHONWARNINGS environment variable
    - View loss curves
    - Track reward progression
    - Monitor KL divergence
@@ -276,7 +278,8 @@ uv run python scripts/training/train_rlaif.py \
 
 In a separate terminal, start TensorBoard:
 ```bash
-uv run tensorboard --logdir ./logs/tensorboard
+# Suppress pkg_resources deprecation warning
+PYTHONWARNINGS=ignore::UserWarning uv run tensorboard --logdir ./logs/tensorboard
 ```
 
 Then open http://localhost:6006 in your browser.

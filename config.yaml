@@ -28,27 +28,36 @@ teacher:
 # Training Configuration
 training:
   output_dir: "./checkpoints"
-  num_epochs: 3
+  num_epochs: 7  # Increased from 3 to 7 for better convergence (5-10 range recommended)
   batch_size: 2  # Reduced from 4 to prevent MPS OOM on 32GB systems
   gradient_accumulation_steps: 32  # Increased from 16 to maintain effective batch size of 64
-  learning_rate: 2e-5
+  learning_rate: 1e-5  # Optimized: reduced from 2e-5 to 1e-5 (range: 5e-6 to 2e-5)
   warmup_steps: 100
   save_steps: 500
   eval_steps: 250
   logging_steps: 50
   max_grad_norm: 1.0
   weight_decay: 0.01
-  lr_scheduler_type: "cosine"
+  lr_scheduler_type: "cosine"  # Learning rate scheduling enabled for better convergence
   save_total_limit: 3
 
 # RLAIF Configuration
 rlaif:
   reward_weight: 1.0
-  kl_penalty: 0.1  # KL divergence penalty for policy gradient
+  kl_penalty: 0.05  # Reduced from 0.1 to allow more exploration (was too conservative)
   beta: 0.1  # Temperature for reward scaling
   top_k: 50
   top_p: 0.95
-  num_samples_per_prompt: 2  # Number of student samples to generate per prompt
+  num_samples_per_prompt: 6  # Increased from 2 to 6 for more diverse exploration (range: 4-8)
+  generation_temperature: 0.9  # Increased from 0.8 for more exploration
+  curriculum_learning: true  # Enable curriculum learning (start easy, increase difficulty)
+  reward_bonuses: true  # Enable reward bonuses for specific improvements
+  use_lora: false  # Use LoRA for efficient fine-tuning (reduces memory, faster training)
+  use_qlora: false  # Use QLoRA (4-bit + LoRA) for maximum efficiency (best for memory-constrained systems)
+  lora_r: 16  # LoRA rank (higher = more parameters, better quality but slower)
+  lora_alpha: 32  # LoRA alpha (scaling factor, typically 2x rank)
+  lora_dropout: 0.05  # LoRA dropout rate
+  # lora_target_modules: null  # Auto-detect target modules (or specify: ["q_proj", "v_proj", "k_proj", "o_proj"])
 
 # Data Configuration
 data:
