@@ -82,11 +82,11 @@ with open('datasets/train.jsonl', 'r') as f:
 
 ## Training Details
 
-- **Base Model**: Qwen/Qwen2.5-7B-Instruct
+- **Base Model**: Qwen/Qwen2.5-Coder-3B-Instruct
 - **Teacher Model**: anthropic/claude-3-5-haiku-20241022
 - **Training Steps**: 0
 - **Languages**: Python, C++, Rust
-- **Average Reward**: 2.0526
+- **Average Reward**: 0.356
 
 ## Scoring Methodology
 

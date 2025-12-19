@@ -36,13 +36,14 @@ fi
 echo ""
 echo "Starting training..."
 echo "To monitor progress, run in another terminal:"
-echo "  uv run tensorboard --logdir ./logs/tensorboard"
+echo "  PYTHONWARNINGS=ignore::UserWarning uv run tensorboard --logdir ./logs/tensorboard"
+echo "  (or: uv run tensorboard --logdir ./logs/tensorboard 2>/dev/null)"
 echo ""
 echo "=========================================="
 echo ""
 
 # Run training
-uv run python scripts/training/train_rlaif.py --config config.yaml
+uv run python "scripts/training/train_rlaif.py" --config config.yaml
 
 echo ""
 echo "=========================================="
