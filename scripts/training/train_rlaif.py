@@ -2225,7 +2225,7 @@ class RLAIFTrainer:
                     logger.info(
                         f"Batch {batch_idx} (size={batch_size_actual}) timing breakdown:\n"
                         f"  Generation: {gen_time_str} ({gen_time/batch_time*100:.1f}%), {num_tokens:,} tokens, {tokens_per_sec:.1f} tokens/sec\n"
-                        f"  Rewards: {reward_time_str} ({reward_time/batch_time*100:.1f}%), {reward_api_tokens:,} API tokens, {reward_tokens_per_sec:.1f} tokens/sec\n"
+                        f"  Scoring: {reward_time_str} ({reward_time/batch_time*100:.1f}%), {reward_api_tokens:,} API tokens, {reward_tokens_per_sec:.1f} tokens/sec\n"
                         f"  Training: {train_time_str} ({train_time/batch_time*100:.1f}%), {train_num_tokens:,} tokens, {train_tokens_per_sec:.1f} tokens/sec\n"
                         f"  Total: {batch_time:.1f}s"
                     )
@@ -2236,7 +2236,7 @@ class RLAIFTrainer:
                         if self.mlx_model is None:
                             logger.warning("  → Enable MLX for 5-10x speedup (see above)")
                     elif reward_time > batch_time * 0.5:
-                        logger.warning(f"⚠️  Reward computation is the bottleneck ({reward_time/batch_time*100:.1f}% of time)")
+                        logger.warning(f"⚠️  Scoring is the bottleneck ({reward_time/batch_time*100:.1f}% of time)")
                         logger.info("  → Consider reducing num_samples_per_prompt or increasing API parallelism")
                     elif train_time > batch_time * 0.5:
                         logger.warning(f"⚠️  Training step is the bottleneck ({train_time/batch_time*100:.1f}% of time)")
