@@ -804,12 +804,30 @@ class RLAIFTrainer:
             'backprop_tokens_per_sec': [],    # Track all backprop speeds
             'api_tokens_sent': 0,             # Total tokens sent to teacher API
             'api_tokens_by_epoch': [],        # Tokens per epoch
+            'api_calls_by_epoch': [],         # Number of API calls per epoch
+            'cache_hits_by_epoch': [],        # Number of cache hits per epoch
             'scoring_breakdown_by_epoch': [], # Scoring breakdown per epoch: [{'correctness': avg, 'code_quality': avg, 'efficiency': avg, 'documentation': avg}, ...]
             'reward_by_epoch': [],            # Average reward per epoch (for trend analysis)
             'loss_by_epoch': [],              # Average loss per epoch (for trend analysis)
             'reward_variance_by_epoch': [],   # Reward variance per epoch (lower is better)
+            'code_diversity_by_epoch': [],    # Code diversity metrics per epoch
             'training_start_time': None,      # Training start time
             'training_end_time': None,        # Training end time
+        }
+        
+        # Cache statistics
+        self.cache_stats = {
+            'api_calls': 0,      # Total API calls made
+            'cache_hits': 0,     # Total cache hits
+            'cache_misses': 0,   # Total cache misses
+        }
+        
+        # Error statistics
+        self.error_stats = {
+            'generation_errors': 0,      # Errors during student generation
+            'scoring_errors': 0,         # Errors during teacher API scoring
+            'generation_errors_by_epoch': [],  # Generation errors per epoch
+            'scoring_errors_by_epoch': [],     # Scoring errors per epoch
         }
         if config.use_mlx_for_generation:
             # Auto-detect MLX model path if not specified
@@ -984,6 +1002,49 @@ class RLAIFTrainer:
             import traceback
             logger.debug(traceback.format_exc())
     
+    def _generate_prompt_variation(self, base_prompt: str, language: str, sample_idx: int, num_samples: int) -> str:
+        """Generate a prompt variation to increase code diversity
+        
+        Args:
+            base_prompt: The original prompt
+            language: Programming language
+            sample_idx: Index of this sample (0 to num_samples-1)
+            num_samples: Total number of samples per prompt
+            
+        Returns:
+            Varied prompt string
+        """
+        import random
+        
+        # Different prompt templates for diversity
+        templates = [
+            f"Write high-quality {language} code:\n\n{{prompt}}\n\nCode:",
+            f"Implement the following in {language}:\n\n{{prompt}}\n\nSolution:",
+            f"Create {language} code for:\n\n{{prompt}}\n\nCode:",
+            f"Write efficient {language} code:\n\n{{prompt}}\n\nImplementation:",
+            f"Generate {language} code:\n\n{{prompt}}\n\nCode:",
+            f"Write clean {language} code:\n\n{{prompt}}\n\nSolution:",
+        ]
+        
+        # Use different templates for different samples
+        template_idx = sample_idx % len(templates)
+        template = templates[template_idx]
+        
+        # Add slight variations to the prompt text itself
+        prompt_variations = [
+            base_prompt,
+            base_prompt + " Make sure the code is efficient.",
+            base_prompt + " Include proper error handling.",
+            base_prompt + " Add comments for clarity.",
+            base_prompt + " Optimize for performance.",
+        ]
+        
+        # Use different prompt variation based on sample index
+        variation_idx = sample_idx % len(prompt_variations)
+        varied_prompt = prompt_variations[variation_idx]
+        
+        return template.format(prompt=varied_prompt)
+    
     def generate_student_samples(self, prompts: List[str], languages: List[str], num_samples: int = 4) -> List[Dict]:
         """Generate multiple samples from student model for each prompt (optimized for M5)"""
         # Use MLX for generation if available (much faster than PyTorch MPS)
@@ -1005,8 +1066,9 @@ class RLAIFTrainer:
         prompt_metadata = []
         
         for prompt, language in zip(prompts, languages):
-            formatted_prompt = f"Write high-quality {language} code:\n\n{prompt}\n\nCode:"
-            for _ in range(num_samples):
+            # Use prompt variations for diversity
+            for sample_idx in range(num_samples):
+                formatted_prompt = self._generate_prompt_variation(prompt, language, sample_idx, num_samples)
                 all_formatted_prompts.append(formatted_prompt)
                 prompt_metadata.append((prompt, language))
         
@@ -1025,10 +1087,19 @@ class RLAIFTrainer:
                 
                 # MLX uses sampler for temperature/top_k/top_p control
                 # Create sampler with configurable temperature for exploration
+                # Vary temperature across samples for more diversity
                 try:
                     from mlx_lm.sample import sample
+                    import random
+                    # Vary temperature slightly across samples (0.7 to 1.1) for more diversity
+                    # Higher temperature = more diverse outputs
+                    base_temp = self.config.generation_temperature
+                    temp_variation = 0.2  # ±0.2 variation
+                    sample_temp = base_temp + (random.random() - 0.5) * temp_variation
+                    sample_temp = max(0.5, min(1.2, sample_temp))  # Clamp between 0.5 and 1.2
+                    
                     # Use temperature for more exploration (higher = more diverse)
-                    sampler = lambda logits: sample(logits, temp=self.config.generation_temperature, top_k=self.config.top_k, top_p=self.config.top_p)
+                    sampler = lambda logits: sample(logits, temp=sample_temp, top_k=self.config.top_k, top_p=self.config.top_p)
                 except ImportError:
                     # Fallback if sampler not available
                     sampler = None
@@ -1203,8 +1274,9 @@ class RLAIFTrainer:
             prompt_metadata = []
             
             for prompt, language in zip(prompts, languages):
-                formatted_prompt = f"Write high-quality {language} code:\n\n{prompt}\n\nCode:"
-                for _ in range(num_samples):
+                # Use prompt variations for diversity (same as MLX)
+                for sample_idx in range(num_samples):
+                    formatted_prompt = self._generate_prompt_variation(prompt, language, sample_idx, num_samples)
                     all_formatted_prompts.append(formatted_prompt)
                     prompt_metadata.append((prompt, language))
             
@@ -1235,10 +1307,17 @@ class RLAIFTrainer:
                     # Optimized generation parameters for M5 MPS
                     # Reduced max_new_tokens to prevent OOM
                     # Use sampling for diversity in generated code
+                    # Vary temperature across samples for more diversity
+                    import random
+                    base_temp = self.config.generation_temperature
+                    temp_variation = 0.2  # ±0.2 variation
+                    sample_temp = base_temp + (random.random() - 0.5) * temp_variation
+                    sample_temp = max(0.5, min(1.2, sample_temp))  # Clamp between 0.5 and 1.2
+                    
                     generation_config = {
                         "max_new_tokens": min(128, self.config.max_length // 4),  # Reduced from 256 to save memory
                         "do_sample": True,  # Enable sampling to use temperature/top_p/top_k
-                        "temperature": self.config.generation_temperature,  # Use configurable temperature
+                        "temperature": sample_temp,  # Vary temperature for diversity
                         "top_k": self.config.top_k,
                         "top_p": self.config.top_p,
                         "pad_token_id": self.tokenizer.eos_token_id,
@@ -1246,7 +1325,7 @@ class RLAIFTrainer:
                         "use_cache": True,  # Critical for MPS performance
                         "output_scores": False,
                         "return_dict_in_generate": False,
-                        "repetition_penalty": 1.1,  # Prevent repetition
+                        "repetition_penalty": 1.1 + random.random() * 0.1,  # Vary repetition penalty (1.1 to 1.2)
                     }
                     
                     # Synchronize MPS before generation for better performance
@@ -1296,6 +1375,10 @@ class RLAIFTrainer:
         cache_key = f"{prompt}:{language}"
         if cache_key not in self.teacher_cache:
             self.teacher_cache[cache_key] = self.teacher.generate(prompt, language)
+            self.cache_stats['cache_misses'] += 1
+            self.cache_stats['api_calls'] += 1
+        else:
+            self.cache_stats['cache_hits'] += 1
         return self.teacher_cache[cache_key]
     
     def _process_sample_reward(self, sample: Dict) -> Tuple[float, Dict]:
@@ -1315,7 +1398,8 @@ class RLAIFTrainer:
                 student_score = self.teacher.score_code(
                     sample['code'],
                     sample['prompt'],
-                    sample['language']
+                    sample['language'],
+                    use_cache=True  # Use cache in score_code as well (defensive caching)
                 )
                 self.teacher_score_cache[student_code_key] = student_score
             
@@ -1327,7 +1411,8 @@ class RLAIFTrainer:
                 teacher_score = self.teacher.score_code(
                     teacher_code,
                     sample['prompt'],
-                    sample['language']
+                    sample['language'],
+                    use_cache=True  # Use cache in score_code as well (defensive caching)
                 )
                 self.teacher_score_cache[teacher_code_key] = teacher_score
             
@@ -1357,8 +1442,75 @@ class RLAIFTrainer:
             
             return reward, dataset_entry
         except Exception as e:
+            # Note: scoring_errors is incremented in compute_rewards when this exception is caught
             logger.warning(f"Error processing sample: {e}")
             return 0.5, None
+    
+    def _filter_duplicate_samples(self, samples: List[Dict]) -> List[Dict]:
+        """Filter out duplicate samples to improve diversity
+        
+        Args:
+            samples: List of generated samples
+            
+        Returns:
+            Filtered list with duplicates removed (keeping first occurrence)
+        """
+        import hashlib
+        seen_hashes = set()
+        unique_samples = []
+        
+        for sample in samples:
+            code = sample.get('code', '')
+            if not code:
+                continue
+            
+            # Normalize code (remove whitespace differences)
+            normalized = ' '.join(code.split())
+            code_hash = hashlib.md5(normalized.encode()).hexdigest()
+            
+            if code_hash not in seen_hashes:
+                seen_hashes.add(code_hash)
+                unique_samples.append(sample)
+            else:
+                logger.debug(f"Filtered duplicate sample (hash: {code_hash[:8]}...)")
+        
+        if len(unique_samples) < len(samples):
+            logger.info(f"Filtered {len(samples) - len(unique_samples)} duplicate samples (diversity: {len(unique_samples)/len(samples)*100:.1f}%)")
+        
+        return unique_samples
+    
+    def _filter_duplicate_samples(self, samples: List[Dict]) -> List[Dict]:
+        """Filter out duplicate samples to improve diversity
+        
+        Args:
+            samples: List of generated samples
+            
+        Returns:
+            Filtered list with duplicates removed (keeping first occurrence)
+        """
+        import hashlib
+        seen_hashes = set()
+        unique_samples = []
+        
+        for sample in samples:
+            code = sample.get('code', '')
+            if not code:
+                continue
+            
+            # Normalize code (remove whitespace differences)
+            normalized = ' '.join(code.split())
+            code_hash = hashlib.md5(normalized.encode()).hexdigest()
+            
+            if code_hash not in seen_hashes:
+                seen_hashes.add(code_hash)
+                unique_samples.append(sample)
+            else:
+                logger.debug(f"Filtered duplicate sample (hash: {code_hash[:8]}...)")
+        
+        if len(unique_samples) < len(samples):
+            logger.info(f"Filtered {len(samples) - len(unique_samples)} duplicate samples (diversity: {len(unique_samples)/len(samples)*100:.1f}%)")
+        
+        return unique_samples
     
     def _apply_reward_bonuses(self, base_reward: float, code: str, language: str, student_score: float) -> float:
         """Apply reward bonuses for specific improvements"""
@@ -1392,6 +1544,58 @@ class RLAIFTrainer:
         
         return base_reward * (1.0 + total_bonus)
     
+    def _calculate_code_diversity(self, codes: List[str]) -> Dict[str, float]:
+        """Calculate code diversity metrics
+        
+        Returns:
+            Dict with 'unique_count', 'total_count', 'unique_ratio', 'avg_similarity'
+        """
+        if not codes or len(codes) == 0:
+            return {
+                'unique_count': 0,
+                'total_count': 0,
+                'unique_ratio': 0.0,
+                'avg_similarity': 0.0
+            }
+        
+        # Use hash-based deduplication for fast uniqueness check
+        import hashlib
+        code_hashes = set()
+        for code in codes:
+            # Normalize code (remove whitespace differences)
+            normalized = ' '.join(code.split())
+            code_hash = hashlib.md5(normalized.encode()).hexdigest()
+            code_hashes.add(code_hash)
+        
+        unique_count = len(code_hashes)
+        total_count = len(codes)
+        unique_ratio = unique_count / total_count if total_count > 0 else 0.0
+        
+        # Calculate average similarity using simple character-level similarity
+        # (more sophisticated methods could use embeddings, but this is fast)
+        if total_count > 1:
+            similarities = []
+            for i in range(min(100, total_count)):  # Sample up to 100 codes for speed
+                code1 = codes[i]
+                for j in range(i + 1, min(i + 10, total_count)):  # Compare with next 10 codes
+                    code2 = codes[j]
+                    # Simple character-level similarity (Jaccard similarity on character sets)
+                    set1 = set(code1)
+                    set2 = set(code2)
+                    if len(set1) + len(set2) > 0:
+                        similarity = len(set1 & set2) / len(set1 | set2)
+                        similarities.append(similarity)
+            avg_similarity = np.mean(similarities) if similarities else 0.0
+        else:
+            avg_similarity = 0.0
+        
+        return {
+            'unique_count': unique_count,
+            'total_count': total_count,
+            'unique_ratio': unique_ratio,
+            'avg_similarity': avg_similarity
+        }
+    
     def compute_rewards(self, samples: List[Dict], save_to_dataset: bool = True) -> Tuple[List[float], List[Dict]]:
         """Compute rewards using teacher model with parallel processing (optimized for M5)
         
@@ -1401,6 +1605,11 @@ class RLAIFTrainer:
         - Adaptive worker count based on sample count
         - Progress tracking with tqdm
         """
+        # Early return if no samples
+        if not samples or len(samples) == 0:
+            logger.warning("compute_rewards called with empty samples list")
+            return [], []
+        
         rewards = []
         dataset_entries = []
         
@@ -1430,9 +1639,11 @@ class RLAIFTrainer:
                     if save_to_dataset and dataset_entry:
                         dataset_entries.append(dataset_entry)
                 except TimeoutError:
+                    self.error_stats['scoring_errors'] += 1
                     logger.warning("Reward computation timed out, using default reward")
                     rewards.append(0.5)  # Default reward on timeout
                 except Exception as e:
+                    self.error_stats['scoring_errors'] += 1
                     logger.warning(f"Error getting reward result: {e}")
                     rewards.append(0.5)  # Default reward on error
         
@@ -2010,11 +2221,14 @@ class RLAIFTrainer:
         # Note: ref_outputs was already deleted earlier (line 1535) to free memory immediately
         del logits, log_probs, ref_log_probs, selected_log_probs, ref_selected_log_probs, outputs
         
+        # Calculate average reward safely (handle empty list)
+        avg_reward = np.mean(rewards) if rewards and len(rewards) > 0 else 0.0
+        
         return {
             'loss': total_loss.item(),
             'policy_loss': policy_loss.item(),
             'kl_penalty': kl_penalty.item(),
-            'avg_reward': np.mean(rewards),
+            'avg_reward': avg_reward,
         }
     
     def train(self, train_dataset: CodeDataset, eval_dataset: Optional[CodeDataset] = None):
@@ -2077,16 +2291,52 @@ class RLAIFTrainer:
             
             # Track API tokens at start of epoch
             epoch_start_api_tokens = self.training_metrics['api_tokens_sent']
+            epoch_start_api_calls = self.cache_stats['api_calls']
+            epoch_start_cache_hits = self.cache_stats['cache_hits']
+            epoch_start_gen_errors = self.error_stats['generation_errors']
+            epoch_start_scoring_errors = self.error_stats['scoring_errors']
             
             epoch_rewards = []
             epoch_losses = []
+            epoch_generated_codes = []  # Track all generated code for diversity analysis
+            
+            # Track performance metrics per epoch
+            epoch_gen_times = []  # Generation times
+            epoch_reward_times = []  # Scoring times
+            epoch_train_times = []  # Training times
+            epoch_gen_tokens = []  # Tokens generated
+            epoch_train_tokens = []  # Tokens used in training
+            epoch_reward_tokens = []  # API tokens used for scoring
             
             # Batch dataset collection to reduce memory overhead
             dataset_batch = []
             dataset_batch_size = 10  # Collect 10 batches before extending main list
             
+            # Initialize variables that might be used after loop (for error handling)
+            batch_idx = -1
+            rewards = []
+            loss_dict = {'loss': 0.0, 'policy_loss': 0.0, 'kl_penalty': 0.0, 'avg_reward': 0.0}
+            
             for batch_idx, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch + 1}")):
+                
                 batch_start_time = time.time()
+                
+                # Initialize variables at start of batch to ensure they're always defined
+                samples = []  # Initialize early to avoid "referenced before assignment" errors
+                generation_error = False
+                # Always assign a new list to rewards at the start of each batch
+                # This ensures it's always defined even if we break early
+                rewards = []  # New list for this batch (always assigned)
+                dataset_entries = []
+                reward_time = 0.001
+                reward_api_tokens = 0
+                reward_tokens_per_sec = 0
+                train_time = 0.001
+                train_num_tokens = 0
+                train_tokens_per_sec = 0
+                # Don't reassign loss_dict - it's already initialized before the loop
+                # Just reset it for this batch
+                loss_dict.update({'loss': 0.0, 'policy_loss': 0.0, 'kl_penalty': 0.0, 'avg_reward': 0.0})
                 
                 # Generate student samples
                 prompts = batch['prompt']
@@ -2105,11 +2355,22 @@ class RLAIFTrainer:
                         torch.cuda.empty_cache()
                 
                 gen_start = time.time()
-                samples = self.generate_student_samples(
-                    prompts,
-                    languages,
-                    num_samples=self.config.num_samples_per_prompt
-                )
+                # samples is already initialized above
+                try:
+                    samples = self.generate_student_samples(
+                        prompts,
+                        languages,
+                        num_samples=self.config.num_samples_per_prompt
+                    )
+                    # Filter duplicates to improve diversity
+                    if len(samples) > 1:
+                        samples = self._filter_duplicate_samples(samples)
+                except Exception as e:
+                    generation_error = True
+                    self.error_stats['generation_errors'] += 1
+                    logger.error(f"Error generating samples for batch {batch_idx}: {e}")
+                    logger.warning(f"Skipping batch {batch_idx} due to generation error")
+                    samples = []  # Ensure samples is empty list on error
                 gen_time = time.time() - gen_start
                 
                 # Synchronize MPS only if needed (after generation, before training)
@@ -2127,6 +2388,11 @@ class RLAIFTrainer:
                         num_tokens += len(tokenized)
                 tokens_per_sec = num_tokens / gen_time if gen_time > 0 else 0
                 self.training_metrics['generation_tokens_per_sec'].append(tokens_per_sec)
+                
+                # Track epoch-level metrics (only if we have samples)
+                if num_tokens > 0:
+                    epoch_gen_times.append(gen_time)
+                    epoch_gen_tokens.append(num_tokens)
                 
                 # Log to TensorBoard periodically
                 if self.writer and batch_idx % 10 == 0:
@@ -2159,43 +2425,144 @@ class RLAIFTrainer:
                 # Track API tokens before reward computation
                 api_tokens_before = self.training_metrics['api_tokens_sent']
                 reward_start = time.time()
-                rewards, dataset_entries = self.compute_rewards(samples, save_to_dataset=True)
-                reward_time = max(time.time() - reward_start, 0.001)  # Ensure non-zero (min 1ms for display)
-                # Track API tokens after reward computation
-                api_tokens_after = self.training_metrics['api_tokens_sent']
-                reward_api_tokens = api_tokens_after - api_tokens_before
-                reward_tokens_per_sec = reward_api_tokens / reward_time if reward_time > 0 else 0
-                epoch_rewards.extend(rewards)
                 
-                # Batch dataset collection to reduce memory overhead
-                dataset_batch.extend(dataset_entries)
-                if len(dataset_batch) >= dataset_batch_size * len(samples):
-                    self.dataset_collection['training'].extend(dataset_batch)
-                    dataset_batch = []  # Clear batch
+                # Check if samples are empty before computing rewards
+                if not samples or len(samples) == 0:
+                    logger.warning(f"Batch {batch_idx}: No samples generated, skipping reward computation and training")
+                    # All variables already initialized above, just skip computation
+                    # rewards is already cleared above, just ensure dataset_entries is empty
+                    dataset_entries = []
+                else:
+                    try:
+                        rewards, dataset_entries = self.compute_rewards(samples, save_to_dataset=True)
+                        # Ensure rewards is a list even if compute_rewards fails
+                        if rewards is None:
+                            rewards = []
+                        if dataset_entries is None:
+                            dataset_entries = []
+                    except Exception as e:
+                        logger.error(f"Error computing rewards for batch {batch_idx}: {e}")
+                        rewards = []  # Assign empty list on error (always assigned)
+                        dataset_entries = []
+                    
+                    reward_time = max(time.time() - reward_start, 0.001)  # Ensure non-zero (min 1ms for display)
+                    # Track API tokens after reward computation
+                    api_tokens_after = self.training_metrics['api_tokens_sent']
+                    reward_api_tokens = api_tokens_after - api_tokens_before
+                    reward_tokens_per_sec = reward_api_tokens / reward_time if reward_time > 0 else 0
+                    
+                    # Track epoch-level metrics
+                    epoch_reward_times.append(reward_time)
+                    epoch_reward_tokens.append(reward_api_tokens)
+                    
+                    # Log cache hit rate for debugging
+                    if batch_idx % 5 == 0 and len(samples) > 0:
+                        # Estimate cache hits: if no API tokens were used but we have rewards, likely all cached
+                        if reward_api_tokens == 0 and len(rewards) > 0:
+                            logger.debug(f"Batch {batch_idx}: All rewards from cache (no API calls)")
+                        elif reward_api_tokens > 0:
+                            logger.debug(f"Batch {batch_idx}: {reward_api_tokens} API tokens used for scoring")
+                    
+                    epoch_rewards.extend(rewards)
+                    
+                    # Collect generated codes for diversity analysis
+                    for sample in samples:
+                        if 'code' in sample:
+                            epoch_generated_codes.append(sample['code'])
+                    
+                    # Batch dataset collection to reduce memory overhead
+                    dataset_batch.extend(dataset_entries)
+                    if len(dataset_batch) >= dataset_batch_size * len(samples):
+                        self.dataset_collection['training'].extend(dataset_batch)
+                        dataset_batch = []  # Clear batch
+                    
+                    # Training step
+                    # Only train if we have rewards and samples
+                    if rewards and len(rewards) > 0 and samples and len(samples) > 0:
+                        # Reconstruct batch from generated samples (with full sequences: prompt + generated code)
+                        # The original batch only has prompts, but we need the full sequences for training
+                        train_batch = self._create_training_batch_from_samples(samples, batch['prompt'])
+                        
+                        train_start = time.time()
+                        # Ensure rewards list is long enough
+                        rewards_for_training = rewards[:len(batch['prompt'])] if len(rewards) >= len(batch['prompt']) else rewards + [0.0] * (len(batch['prompt']) - len(rewards))
+                        loss_dict = self.train_step(train_batch, rewards_for_training)
+                        train_time = max(time.time() - train_start, 0.001)  # Ensure non-zero (min 1ms for display)
+                        epoch_losses.append(loss_dict['loss'])
+                        
+                        # Calculate training tokens/sec (tokens processed during forward+backward pass)
+                        # This is the number of tokens in the input sequence
+                        train_num_tokens = train_batch['input_ids'].numel() if 'input_ids' in train_batch else 0
+                        train_tokens_per_sec = train_num_tokens / train_time if train_time > 0 else 0
+                        
+                        # Track epoch-level metrics
+                        epoch_train_times.append(train_time)
+                        epoch_train_tokens.append(train_num_tokens)
+                    else:
+                        # No rewards or samples, skip training but set defaults
+                        train_time = 0.001
+                        train_num_tokens = 0
+                        train_tokens_per_sec = 0
+                        loss_dict = {'loss': 0.0, 'policy_loss': 0.0, 'kl_penalty': 0.0, 'avg_reward': 0.0}
                 
-                # Training step
-                # Reconstruct batch from generated samples (with full sequences: prompt + generated code)
-                # The original batch only has prompts, but we need the full sequences for training
-                train_batch = self._create_training_batch_from_samples(samples, batch['prompt'])
+                batch_time = time.time() - batch_start_time
                 
-                train_start = time.time()
-                loss_dict = self.train_step(train_batch, rewards[:len(batch['prompt'])])
-                train_time = max(time.time() - train_start, 0.001)  # Ensure non-zero (min 1ms for display)
-                epoch_losses.append(loss_dict['loss'])
-                
-                # Calculate training tokens/sec (tokens processed during forward+backward pass)
-                # This is the number of tokens in the input sequence
-                train_num_tokens = train_batch['input_ids'].numel() if 'input_ids' in train_batch else 0
-                train_tokens_per_sec = train_num_tokens / train_time if train_time > 0 else 0
+                # Log timing info periodically with more detail
+                if batch_idx % 5 == 0:
+                    batch_size_actual = len(batch['prompt'])
+                    # Use higher precision for small times to avoid showing 0.0s
+                    gen_time_str = f"{gen_time:.3f}s" if gen_time < 1.0 else f"{gen_time:.1f}s"
+                    reward_time_str = f"{reward_time:.3f}s" if reward_time < 1.0 else f"{reward_time:.1f}s"
+                    train_time_str = f"{train_time:.3f}s" if train_time < 1.0 else f"{train_time:.1f}s"
+                    
+                    # Add cache status to scoring line if applicable
+                    scoring_line = f"  Scoring: {reward_time_str} ({reward_time/batch_time*100:.1f}%), {reward_api_tokens:,} API tokens, {reward_tokens_per_sec:.1f} tokens/sec"
+                    # Check if samples exists (it should always exist at this point)
+                    samples_len = len(samples) if 'samples' in locals() and samples is not None else 0
+                    if reward_api_tokens == 0 and samples_len > 0:
+                        scoring_line += " (all cached)"
+                    elif samples_len == 0:
+                        scoring_line += " (no samples)"
+                    
+                    # Add error information
+                    error_info = ""
+                    if generation_error:
+                        error_info += f"  ⚠️  Generation errors: 1 (this batch)\n"
+                    # Calculate current epoch scoring errors for display
+                    current_epoch_scoring_errors = self.error_stats['scoring_errors'] - epoch_start_scoring_errors
+                    if current_epoch_scoring_errors > 0:
+                        error_info += f"  ⚠️  Scoring errors (epoch so far): {current_epoch_scoring_errors}\n"
+                    
+                    logger.info(
+                        f"Batch {batch_idx} (size={batch_size_actual}) timing breakdown:\n"
+                        f"  Generation: {gen_time_str} ({gen_time/batch_time*100:.1f}%), {num_tokens:,} tokens, {tokens_per_sec:.1f} tokens/sec\n"
+                        f"{scoring_line}\n"
+                        f"  Training: {train_time_str} ({train_time/batch_time*100:.1f}%), {train_num_tokens:,} tokens, {train_tokens_per_sec:.1f} tokens/sec\n"
+                        f"  Total: {batch_time:.1f}s"
+                        + (f"\n{error_info.rstrip()}" if error_info else "")
+                    )
+                    
+                    # Identify bottleneck
+                    if gen_time > batch_time * 0.5:
+                        logger.warning(f"⚠️  Generation is the bottleneck ({gen_time/batch_time*100:.1f}% of time)")
+                        if self.mlx_model is None:
+                            logger.warning("  → Enable MLX for 5-10x speedup (see above)")
+                    elif reward_time > batch_time * 0.5:
+                        logger.warning(f"⚠️  Scoring is the bottleneck ({reward_time/batch_time*100:.1f}% of time)")
+                        logger.info("  → Consider reducing num_samples_per_prompt or increasing API parallelism")
+                    elif train_time > batch_time * 0.5:
+                        logger.warning(f"⚠️  Training step is the bottleneck ({train_time/batch_time*100:.1f}% of time)")
+                        logger.info("  → Consider reducing batch_size or max_length")
                 
                 # Aggressive memory cleanup after training step to prevent OOM
+                # Do this AFTER all logging is complete to avoid referencing deleted variables
                 if torch.backends.mps.is_available():
                     # Delete intermediate tensors explicitly
-                    if 'train_batch' in locals():
+                    if 'train_batch' in locals() and train_batch is not None:
                         del train_batch
-                    if 'samples' in locals():
+                    if 'samples' in locals() and samples is not None:
                         del samples
-                    if 'rewards' in locals():
+                    if 'rewards' in locals() and rewards is not None:
                         del rewards
                     
                     # Force garbage collection
@@ -2211,43 +2578,16 @@ class RLAIFTrainer:
                     logger.debug(f"Memory cleanup complete after training step {batch_idx}")
                 elif torch.cuda.is_available():
                     torch.cuda.empty_cache()
-                
-                batch_time = time.time() - batch_start_time
-                
-                # Log timing info periodically with more detail
-                if batch_idx % 5 == 0:
-                    batch_size_actual = len(batch['prompt'])
-                    # Use higher precision for small times to avoid showing 0.0s
-                    gen_time_str = f"{gen_time:.3f}s" if gen_time < 1.0 else f"{gen_time:.1f}s"
-                    reward_time_str = f"{reward_time:.3f}s" if reward_time < 1.0 else f"{reward_time:.1f}s"
-                    train_time_str = f"{train_time:.3f}s" if train_time < 1.0 else f"{train_time:.1f}s"
-                    
-                    logger.info(
-                        f"Batch {batch_idx} (size={batch_size_actual}) timing breakdown:\n"
-                        f"  Generation: {gen_time_str} ({gen_time/batch_time*100:.1f}%), {num_tokens:,} tokens, {tokens_per_sec:.1f} tokens/sec\n"
-                        f"  Scoring: {reward_time_str} ({reward_time/batch_time*100:.1f}%), {reward_api_tokens:,} API tokens, {reward_tokens_per_sec:.1f} tokens/sec\n"
-                        f"  Training: {train_time_str} ({train_time/batch_time*100:.1f}%), {train_num_tokens:,} tokens, {train_tokens_per_sec:.1f} tokens/sec\n"
-                        f"  Total: {batch_time:.1f}s"
-                    )
-                    
-                    # Identify bottleneck
-                    if gen_time > batch_time * 0.5:
-                        logger.warning(f"⚠️  Generation is the bottleneck ({gen_time/batch_time*100:.1f}% of time)")
-                        if self.mlx_model is None:
-                            logger.warning("  → Enable MLX for 5-10x speedup (see above)")
-                    elif reward_time > batch_time * 0.5:
-                        logger.warning(f"⚠️  Scoring is the bottleneck ({reward_time/batch_time*100:.1f}% of time)")
-                        logger.info("  → Consider reducing num_samples_per_prompt or increasing API parallelism")
-                    elif train_time > batch_time * 0.5:
-                        logger.warning(f"⚠️  Training step is the bottleneck ({train_time/batch_time*100:.1f}% of time)")
-                        logger.info("  → Consider reducing batch_size or max_length")
             
             # Flush remaining dataset entries at end of epoch
             if dataset_batch:
                 self.dataset_collection['training'].extend(dataset_batch)
                 dataset_batch = []
-                
-                # Update optimizer
+            
+            # Update optimizer and stats (only if we processed at least one batch)
+            # batch_idx is initialized to -1, so >= 0 means we processed at least one batch
+            if batch_idx >= 0:
+                # Update optimizer if needed (only if we processed batches)
                 if (batch_idx + 1) % self.config.gradient_accumulation_steps == 0:
                     torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(),
@@ -2259,16 +2599,21 @@ class RLAIFTrainer:
                     global_step += 1
                 
                 # Update stats
-                self.stats['step'] = global_step
-                self.stats['total_reward'] += np.mean(rewards) if rewards else 0.0
-                self.stats['total_loss'] += loss_dict['loss']
-                self.stats['num_samples'] += len(rewards) if rewards else 0
-                self.stats['avg_reward'] = self.stats['total_reward'] / max(1, self.stats['step'])
-                self.stats['avg_loss'] = self.stats['total_loss'] / max(1, self.stats['step'])
+                # Note: rewards is always assigned at the start of each batch iteration (line 2351)
+                # loss_dict is initialized before the loop (line 2336) and updated during training
+                if 'rewards' in locals() and rewards and len(rewards) > 0:
+                    self.stats['step'] = global_step
+                    self.stats['total_reward'] += np.mean(rewards)
+                    self.stats['num_samples'] += len(rewards)
+                if 'loss_dict' in locals() and loss_dict and loss_dict.get('loss', 0.0) > 0:
+                    self.stats['total_loss'] += loss_dict.get('loss', 0.0)
+                self.stats['avg_reward'] = self.stats['total_reward'] / max(1, self.stats.get('step', 1))
+                self.stats['avg_loss'] = self.stats['total_loss'] / max(1, self.stats.get('step', 1))
                 
-                # Logging
+                # Logging (check if variables exist before using)
                 if global_step % self.config.logging_steps == 0:
-                    self._log_stats(global_step, loss_dict, rewards)
+                    if 'loss_dict' in locals() and 'rewards' in locals() and loss_dict and rewards:
+                        self._log_stats(global_step, loss_dict, rewards)
                 
                 # Save checkpoint
                 if global_step % self.config.save_steps == 0:
@@ -2296,6 +2641,22 @@ class RLAIFTrainer:
             # Track API tokens for this epoch
             epoch_tokens = self.training_metrics['api_tokens_sent'] - epoch_start_api_tokens
             self.training_metrics['api_tokens_by_epoch'].append(epoch_tokens)
+            
+            # Track cache statistics for this epoch
+            epoch_api_calls = self.cache_stats['api_calls'] - epoch_start_api_calls
+            epoch_cache_hits = self.cache_stats['cache_hits'] - epoch_start_cache_hits
+            self.training_metrics['api_calls_by_epoch'].append(epoch_api_calls)
+            self.training_metrics['cache_hits_by_epoch'].append(epoch_cache_hits)
+            
+            # Track error statistics for this epoch
+            epoch_gen_errors = self.error_stats['generation_errors'] - epoch_start_gen_errors
+            epoch_scoring_errors = self.error_stats['scoring_errors'] - epoch_start_scoring_errors
+            self.error_stats['generation_errors_by_epoch'].append(epoch_gen_errors)
+            self.error_stats['scoring_errors_by_epoch'].append(epoch_scoring_errors)
+            
+            # Calculate code diversity metrics
+            code_diversity = self._calculate_code_diversity(epoch_generated_codes)
+            self.training_metrics['code_diversity_by_epoch'].append(code_diversity)
             
             # Calculate scoring breakdown for this epoch from dataset entries
             # Extract scoring breakdown from dataset entries collected this epoch
@@ -2328,12 +2689,41 @@ class RLAIFTrainer:
             }
             self.training_metrics['scoring_breakdown_by_epoch'].append(epoch_scoring_breakdown_avg)
             
+            # Calculate cache hit rate
+            total_scoring_ops = epoch_api_calls + epoch_cache_hits
+            cache_hit_rate = (epoch_cache_hits / total_scoring_ops * 100) if total_scoring_ops > 0 else 0.0
+            
+            # Calculate average performance metrics
+            # Average tokens/sec = total tokens / total time
+            total_gen_time = sum(epoch_gen_times) if epoch_gen_times else 0.0
+            total_reward_time = sum(epoch_reward_times) if epoch_reward_times else 0.0
+            total_train_time = sum(epoch_train_times) if epoch_train_times else 0.0
+            
+            total_gen_tokens = sum(epoch_gen_tokens) if epoch_gen_tokens else 0
+            total_train_tokens = sum(epoch_train_tokens) if epoch_train_tokens else 0
+            total_reward_tokens = sum(epoch_reward_tokens) if epoch_reward_tokens else 0
+            
+            avg_gen_tokens_per_sec = total_gen_tokens / total_gen_time if total_gen_time > 0 else 0.0
+            avg_reward_tokens_per_sec = total_reward_tokens / total_reward_time if total_reward_time > 0 else 0.0
+            avg_train_tokens_per_sec = total_train_tokens / total_train_time if total_train_time > 0 else 0.0
+            
+            # Calculate average latencies
+            avg_gen_latency = np.mean(epoch_gen_times) if epoch_gen_times else 0.0
+            avg_reward_latency = np.mean(epoch_reward_times) if epoch_reward_times else 0.0
+            avg_train_latency = np.mean(epoch_train_times) if epoch_train_times else 0.0
+            
             logger.info(
                 f"Epoch {epoch + 1} Summary:\n"
                 f"  Average Reward: {avg_epoch_reward:.4f}\n"
                 f"  Average Loss: {avg_epoch_loss:.4f}\n"
                 f"  Total Samples: {len(epoch_rewards)}\n"
-                f"  API Tokens Used: {epoch_tokens:,}"
+                f"  API Usage: {epoch_tokens:,} tokens ({epoch_api_calls:,} calls, {epoch_cache_hits:,} cache hits, {cache_hit_rate:.1f}% hit rate)\n"
+                f"  Code Diversity: {code_diversity['unique_ratio']:.1%} unique ({code_diversity['unique_count']}/{code_diversity['total_count']}), avg similarity: {code_diversity['avg_similarity']:.3f}\n"
+                f"  Errors: Generation: {epoch_gen_errors}, Scoring: {epoch_scoring_errors}\n"
+                f"  Performance:\n"
+                f"    Generation: {avg_gen_tokens_per_sec:.1f} tokens/sec (avg latency: {avg_gen_latency:.3f}s, total tokens: {total_gen_tokens:,})\n"
+                f"    Scoring: {avg_reward_tokens_per_sec:.1f} tokens/sec (avg latency: {avg_reward_latency:.3f}s, total tokens: {total_reward_tokens:,})\n"
+                f"    Training: {avg_train_tokens_per_sec:.1f} tokens/sec (avg latency: {avg_train_latency:.3f}s, total tokens: {total_train_tokens:,})"
             )
             
             if self.writer:
@@ -2342,7 +2732,14 @@ class RLAIFTrainer:
                 self.writer.add_scalar('Epoch/AvgLoss', avg_epoch_loss, epoch)
                 self.writer.add_scalar('Epoch/RewardVariance', reward_variance, epoch)
                 self.writer.add_scalar('Epoch/APITokens', epoch_tokens, epoch)
+                self.writer.add_scalar('Epoch/APICalls', epoch_api_calls, epoch)
+                self.writer.add_scalar('Epoch/CacheHits', epoch_cache_hits, epoch)
+                self.writer.add_scalar('Epoch/CacheHitRate', cache_hit_rate, epoch)
                 self.writer.add_scalar('Epoch/NumSamples', len(epoch_rewards), epoch)
+                self.writer.add_scalar('Epoch/CodeDiversity_UniqueRatio', code_diversity['unique_ratio'], epoch)
+                self.writer.add_scalar('Epoch/CodeDiversity_AvgSimilarity', code_diversity['avg_similarity'], epoch)
+                self.writer.add_scalar('Epoch/GenerationErrors', epoch_gen_errors, epoch)
+                self.writer.add_scalar('Epoch/ScoringErrors', epoch_scoring_errors, epoch)
                 
                 # Trend metrics
                 if len(self.training_metrics['reward_by_epoch']) > 1:
