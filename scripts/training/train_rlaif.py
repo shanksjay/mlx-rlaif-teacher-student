@@ -1317,7 +1317,7 @@ class RLAIFTrainer:
                     generation_config = {
                         "max_new_tokens": min(128, self.config.max_length // 4),  # Reduced from 256 to save memory
                         "do_sample": True,  # Enable sampling to use temperature/top_p/top_k
-                        "temperature": sample_temp,  # Vary temperature for diversity
+                        "temperature": self.config.generation_temperature,  # Use configurable temperature
                         "top_k": self.config.top_k,
                         "top_p": self.config.top_p,
                         "pad_token_id": self.tokenizer.eos_token_id,
@@ -2425,25 +2425,44 @@ class RLAIFTrainer:
                 # Track API tokens before reward computation
                 api_tokens_before = self.training_metrics['api_tokens_sent']
                 reward_start = time.time()
+                rewards, dataset_entries = self.compute_rewards(samples, save_to_dataset=True)
+                reward_time = max(time.time() - reward_start, 0.001)  # Ensure non-zero (min 1ms for display)
+                # Track API tokens after reward computation
+                api_tokens_after = self.training_metrics['api_tokens_sent']
+                reward_api_tokens = api_tokens_after - api_tokens_before
+                reward_tokens_per_sec = reward_api_tokens / reward_time if reward_time > 0 else 0
+                epoch_rewards.extend(rewards)
                 
-                # Check if samples are empty before computing rewards
-                if not samples or len(samples) == 0:
-                    logger.warning(f"Batch {batch_idx}: No samples generated, skipping reward computation and training")
-                    # All variables already initialized above, just skip computation
-                    # rewards is already cleared above, just ensure dataset_entries is empty
-                    dataset_entries = []
-                else:
-                    try:
-                        rewards, dataset_entries = self.compute_rewards(samples, save_to_dataset=True)
-                        # Ensure rewards is a list even if compute_rewards fails
-                        if rewards is None:
-                            rewards = []
-                        if dataset_entries is None:
-                            dataset_entries = []
-                    except Exception as e:
-                        logger.error(f"Error computing rewards for batch {batch_idx}: {e}")
-                        rewards = []  # Assign empty list on error (always assigned)
-                        dataset_entries = []
+                # Batch dataset collection to reduce memory overhead
+                dataset_batch.extend(dataset_entries)
+                if len(dataset_batch) >= dataset_batch_size * len(samples):
+                    self.dataset_collection['training'].extend(dataset_batch)
+                    dataset_batch = []  # Clear batch
+                
+                # Training step
+                # Reconstruct batch from generated samples (with full sequences: prompt + generated code)
+                # The original batch only has prompts, but we need the full sequences for training
+                train_batch = self._create_training_batch_from_samples(samples, batch['prompt'])
+                
+                train_start = time.time()
+                loss_dict = self.train_step(train_batch, rewards[:len(batch['prompt'])])
+                train_time = max(time.time() - train_start, 0.001)  # Ensure non-zero (min 1ms for display)
+                epoch_losses.append(loss_dict['loss'])
+                
+                # Calculate training tokens/sec (tokens processed during forward+backward pass)
+                # This is the number of tokens in the input sequence
+                train_num_tokens = train_batch['input_ids'].numel() if 'input_ids' in train_batch else 0
+                train_tokens_per_sec = train_num_tokens / train_time if train_time > 0 else 0
+                
+                # Aggressive memory cleanup after training step to prevent OOM
+                if torch.backends.mps.is_available():
+                    # Delete intermediate tensors explicitly
+                    if 'train_batch' in locals():
+                        del train_batch
+                    if 'samples' in locals():
+                        del samples
+                    if 'rewards' in locals():
+                        del rewards
                     
                     reward_time = max(time.time() - reward_start, 0.001)  # Ensure non-zero (min 1ms for display)
                     # Track API tokens after reward computation
