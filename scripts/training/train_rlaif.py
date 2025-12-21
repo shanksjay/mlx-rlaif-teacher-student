@@ -758,6 +758,10 @@ class RLAIFTrainer:
             else:
                 self.model = self._apply_lora(config)
         
+        # Apply LoRA/QLoRA if enabled
+        if config.use_lora or config.use_qlora:
+            self.model = self._apply_lora(config)
+        
         # Validate model was loaded correctly - check for NaN/Inf in weights
         logger.info("Validating model weights for corruption...")
         corrupted_params = []
@@ -2745,7 +2749,10 @@ class RLAIFTrainer:
                     epoch_gen_samples_raw.append(before_n if 'before_n' in locals() else len(samples_all))
                     epoch_gen_samples_kept.append(after_n if 'after_n' in locals() else len(samples))
                 
-                # TensorBoard batch-level time series are handled later using a monotonic batch counter (`self._batch_step`).
+                # Log to TensorBoard periodically
+                if self.writer and batch_idx % 10 == 0:
+                    self.writer.add_scalar('Performance/Generation_TokensPerSec', tokens_per_sec, global_step)
+                    self.writer.add_scalar('Performance/Generation_Time', gen_time, global_step)
                 
                 # Log generation performance (similar to preload_model.py)
                 if batch_idx % 5 == 0:
