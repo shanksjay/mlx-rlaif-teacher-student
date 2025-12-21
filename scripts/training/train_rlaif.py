@@ -124,6 +124,10 @@ class RLAIFConfig:
     low_cpu_mem_usage: bool = True
     use_mlx_for_generation: bool = True  # Use MLX for faster generation (requires MLX model) - enabled by default
     mlx_model_path: Optional[str] = None  # Path to MLX model for generation
+    # CUDA/Unsloth (optional): enables Unsloth optimized model loading/training/generation on NVIDIA GPUs
+    use_unsloth: bool = False
+    unsloth_dtype: str = "bf16"  # "bf16" or "fp16"
+    unsloth_max_seq_length: Optional[int] = None  # If None, falls back to max_length
 
 
 class CodeDataset(Dataset):
@@ -348,7 +352,8 @@ IMPORTANT: Respond with ONLY a single float between 0.0 and 1.0 (e.g., 0.75). Do
             warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*deprecated.*")
             
             try:
-                api_tokens_used = 0
+                api_input_tokens = 0
+                api_output_tokens = 0
                 if self.provider == "openai":
                     response = self.client.chat.completions.create(
                         model=self.model_name,
@@ -357,11 +362,15 @@ IMPORTANT: Respond with ONLY a single float between 0.0 and 1.0 (e.g., 0.75). Do
                         max_tokens=50
                     )
                     score_text = response.choices[0].message.content.strip()
-                    # Track API token usage
-                    if hasattr(response, 'usage') and hasattr(response.usage, 'prompt_tokens'):
-                        api_tokens_used = response.usage.prompt_tokens
+                    # Track API token usage (input and output separately)
+                    if hasattr(response, 'usage'):
+                        if hasattr(response.usage, 'prompt_tokens'):
+                            api_input_tokens = response.usage.prompt_tokens
+                        if hasattr(response.usage, 'completion_tokens'):
+                            api_output_tokens = response.usage.completion_tokens
                         if hasattr(self, '_trainer_ref') and self._trainer_ref:
-                            self._trainer_ref.training_metrics['api_tokens_sent'] += api_tokens_used
+                            self._trainer_ref.training_metrics['api_tokens_sent'] += api_input_tokens
+                            self._trainer_ref.training_metrics['api_tokens_received'] += api_output_tokens
                 else:  # anthropic
                     response = self.client.messages.create(
                         model=self.model_name,
@@ -370,11 +379,15 @@ IMPORTANT: Respond with ONLY a single float between 0.0 and 1.0 (e.g., 0.75). Do
                         messages=[{"role": "user", "content": scoring_prompt}]
                     )
                     score_text = response.content[0].text.strip()
-                    # Track API token usage
-                    if hasattr(response, 'usage') and hasattr(response.usage, 'input_tokens'):
-                        api_tokens_used = response.usage.input_tokens
+                    # Track API token usage (input and output separately)
+                    if hasattr(response, 'usage'):
+                        if hasattr(response.usage, 'input_tokens'):
+                            api_input_tokens = response.usage.input_tokens
+                        if hasattr(response.usage, 'output_tokens'):
+                            api_output_tokens = response.usage.output_tokens
                         if hasattr(self, '_trainer_ref') and self._trainer_ref:
-                            self._trainer_ref.training_metrics['api_tokens_sent'] += api_tokens_used
+                            self._trainer_ref.training_metrics['api_tokens_sent'] += api_input_tokens
+                            self._trainer_ref.training_metrics['api_tokens_received'] += api_output_tokens
                 
                 # Extract float from response (handle cases where score is embedded in text)
                 import re
@@ -425,141 +438,212 @@ class RLAIFTrainer:
     def __init__(self, config: RLAIFConfig):
         self.config = config
         self.device = self._setup_device()
+        self._unsloth_enabled = False
+        self._unsloth_flm = None  # set to unsloth.FastLanguageModel when available
         
         # Load model and tokenizer
         logger.info(f"Loading base model: {config.base_model}")
-        
-        # Load tokenizer first (fast)
-        logger.info("Loading tokenizer...")
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            config.base_model,
-            use_fast=True,  # Use fast tokenizer
-            trust_remote_code=True
-        )
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-        
-        # Optimize model loading (matching preload_model.py for speed)
-        logger.info("Loading model weights (this may take a few minutes)...")
+
+        # Pre-init monitoring vars so later analysis code doesn't crash in Unsloth mode
         load_start = time.time()
-        
-        # Monitor memory before loading
-        try:
-            import psutil
-            process = psutil.Process()
-            mem_before = process.memory_info().rss / (1024 ** 3)
-            logger.info(f"Memory before loading: {mem_before:.2f} GB")
-        except:
-            process = None
-            mem_before = 0
-        
-        # Use safetensors for faster loading (same as preload_model.py)
-        model_kwargs = {
-            "device_map": "auto",
-            "dtype": torch.bfloat16 if config.use_mps else torch.float32,  # Use dtype instead of torch_dtype
-            "trust_remote_code": True,
-            "low_cpu_mem_usage": config.low_cpu_mem_usage,  # Optimize memory usage during loading
-        }
-        
-        # Prefer safetensors format for faster loading
-        if config.use_safetensors:
-            try:
-                from safetensors.torch import load_file
-                model_kwargs["use_safetensors"] = True
-                logger.info("Using safetensors format for faster loading")
-            except ImportError:
-                logger.info("Using standard format (safetensors not available)")
-        
-        # Setup quantization for M5 MacBook
-        # WARNING: 4-bit quantization with bfloat16 on MPS can cause NaN logits
-        # BitsAndBytes quantization may not be fully compatible with MPS
-        if config.use_4bit:
-            if config.use_mps and torch.backends.mps.is_available():
-                logger.warning("⚠️  4-bit quantization on MPS may cause NaN logits!")
-                logger.warning("  BitsAndBytes quantization has known issues with MPS backend.")
-                logger.warning("  Consider using float32 instead of bfloat16, or disable quantization.")
-                logger.warning("  If you see NaN logits, set model.use_4bit: false in config.yaml")
-            
-            logger.info("Using 4-bit quantization...")
-            # Use float32 compute dtype on MPS to avoid numerical instability
-            compute_dtype = torch.float32 if (config.use_mps and torch.backends.mps.is_available()) else torch.bfloat16
-            if compute_dtype == torch.float32:
-                logger.info("  Using float32 compute dtype on MPS for stability (slower but more stable)")
-            
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=compute_dtype,  # Use float32 on MPS for stability
-                bnb_4bit_use_double_quant=True,
-            )
-            model_kwargs["quantization_config"] = bnb_config
-            model_kwargs["dtype"] = compute_dtype  # Match compute dtype
-        
-        # Simplified monitoring (matching preload_model.py for less overhead)
-        monitoring = True
+        process = None
+        mem_before = 0.0
         memory_samples = []
-        shard_start = time.time()
-        
-        def monitor_loading():
-            """Monitor memory during loading (simplified for speed)"""
-            while monitoring:
-                elapsed = time.time() - shard_start
+        load_time = 0.0
+        shard_time = 0.0
+
+        # Optional: Unsloth (CUDA-only) for NVIDIA benchmarking
+        if config.use_unsloth:
+            if self.device.type != "cuda":
+                # Avoid accidental "slow CPU run" when user copied an NVIDIA config onto a Mac.
+                # Auto-disable Unsloth and continue with standard loading; provide an actionable hint.
+                logger.info("Unsloth requested but CUDA is not available -> disabling Unsloth and continuing with standard Transformers loading.")
+                if torch.backends.mps.is_available() and getattr(config, "use_mps", False) is False:
+                    logger.info("Tip: you're on Apple Silicon; set `hardware.use_mps: true` (and optionally `hardware.use_mlx_for_generation: true`).")
+                config.use_unsloth = False
+            else:
                 try:
-                    if process:
-                        process_mem = process.memory_info().rss / (1024 ** 3)
-                        system_mem = psutil.virtual_memory().used / (1024 ** 3)
-                        # Store both process and system memory
-                        memory_samples.append((elapsed, process_mem, system_mem))
-                except:
-                    pass
-                time.sleep(0.5)  # Sample every 0.5 seconds (less frequent = less overhead)
+                    from unsloth import FastLanguageModel  # type: ignore
+                    self._unsloth_flm = FastLanguageModel
+                    max_seq_len = config.unsloth_max_seq_length or config.max_length
+                    dtype_str = (config.unsloth_dtype or "bf16").lower()
+                    dtype = torch.bfloat16 if dtype_str in ("bf16", "bfloat16") else torch.float16
+
+                    logger.info("Loading model via Unsloth (CUDA)...")
+                    # Unsloth returns a HF-compatible model/tokenizer, but much faster on NVIDIA.
+                    self.model, self.tokenizer = FastLanguageModel.from_pretrained(
+                        model_name=config.base_model,
+                        max_seq_length=max_seq_len,
+                        dtype=dtype,
+                        load_in_4bit=bool(config.use_4bit),
+                    )
+                    if self.tokenizer.pad_token is None:
+                        self.tokenizer.pad_token = self.tokenizer.eos_token
+                    self._unsloth_enabled = True
+                    load_time = time.time() - load_start
+                    logger.info(f"✓ Unsloth load complete in {load_time:.1f}s (dtype={dtype_str}, 4bit={bool(config.use_4bit)})")
+                except Exception as e:
+                    logger.warning(f"Failed to load Unsloth. Falling back to standard Transformers loading. Error: {e}")
+                    self._unsloth_enabled = False
+                    self._unsloth_flm = None
         
-        monitor_thread = threading.Thread(target=monitor_loading, daemon=True)
-        monitor_thread.start()
-        
-        # Clear cache before loading
-        if torch.backends.mps.is_available():
-            torch.mps.empty_cache()
-        elif torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        
-        # Load model (same pattern as preload_model.py)
-        try:
-            self.model = AutoModelForCausalLM.from_pretrained(
+        if not self._unsloth_enabled:
+            # Load tokenizer first (fast)
+            logger.info("Loading tokenizer...")
+            self.tokenizer = AutoTokenizer.from_pretrained(
                 config.base_model,
-                **model_kwargs
+                use_fast=True,  # Use fast tokenizer
+                trust_remote_code=True
             )
-        except Exception as e:
-            logger.warning(f"Error with optimized loading: {e}. Trying standard loading...")
-            # Fallback to standard loading
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            
+            # Optimize model loading (matching preload_model.py for speed)
+            logger.info("Loading model weights (this may take a few minutes)...")
+            load_start = time.time()
+            
+            # Monitor memory before loading
+            try:
+                import psutil
+                process = psutil.Process()
+                mem_before = process.memory_info().rss / (1024 ** 3)
+                logger.info(f"Memory before loading: {mem_before:.2f} GB")
+            except:
+                process = None
+                mem_before = 0.0
+            
+            # Use safetensors for faster loading (same as preload_model.py)
+            model_kwargs = {
+                "device_map": "auto",
+                "dtype": torch.bfloat16 if config.use_mps else torch.float32,  # Use dtype instead of torch_dtype
+                "trust_remote_code": True,
+                "low_cpu_mem_usage": config.low_cpu_mem_usage,  # Optimize memory usage during loading
+            }
+            
+            # Prefer safetensors format for faster loading
+            if config.use_safetensors:
+                try:
+                    from safetensors.torch import load_file
+                    model_kwargs["use_safetensors"] = True
+                    logger.info("Using safetensors format for faster loading")
+                except ImportError:
+                    logger.info("Using standard format (safetensors not available)")
+            
+            # Setup quantization for M5 MacBook
+            # WARNING: 4-bit quantization with bfloat16 on MPS can cause NaN logits
+            # BitsAndBytes quantization may not be fully compatible with MPS
             if config.use_4bit:
-                # Use float32 compute dtype on MPS for stability
+                if config.use_mps and torch.backends.mps.is_available():
+                    logger.warning("⚠️  4-bit quantization on MPS may cause NaN logits!")
+                    logger.warning("  BitsAndBytes quantization has known issues with MPS backend.")
+                    logger.warning("  Consider using float32 instead of bfloat16, or disable quantization.")
+                    logger.warning("  If you see NaN logits, set model.use_4bit: false in config.yaml")
+                
+                logger.info("Using 4-bit quantization...")
+                # Use float32 compute dtype on MPS to avoid numerical instability
                 compute_dtype = torch.float32 if (config.use_mps and torch.backends.mps.is_available()) else torch.bfloat16
-                # Update bnb_config with correct compute dtype
+                if compute_dtype == torch.float32:
+                    logger.info("  Using float32 compute dtype on MPS for stability (slower but more stable)")
+                
                 bnb_config = BitsAndBytesConfig(
                     load_in_4bit=True,
                     bnb_4bit_quant_type="nf4",
-                    bnb_4bit_compute_dtype=compute_dtype,
+                    bnb_4bit_compute_dtype=compute_dtype,  # Use float32 on MPS for stability
                     bnb_4bit_use_double_quant=True,
                 )
+                model_kwargs["quantization_config"] = bnb_config
+                model_kwargs["dtype"] = compute_dtype  # Match compute dtype
+            
+            # Simplified monitoring (matching preload_model.py for less overhead)
+            monitoring = True
+            memory_samples = []
+            shard_start = time.time()
+            
+            def monitor_loading():
+                """Monitor memory during loading (simplified for speed)"""
+                while monitoring:
+                    elapsed = time.time() - shard_start
+                    try:
+                        if process:
+                            process_mem = process.memory_info().rss / (1024 ** 3)
+                            system_mem = psutil.virtual_memory().used / (1024 ** 3)
+                            # Store both process and system memory
+                            memory_samples.append((elapsed, process_mem, system_mem))
+                    except:
+                        pass
+                    time.sleep(0.5)  # Sample every 0.5 seconds (less frequent = less overhead)
+            
+            monitor_thread = threading.Thread(target=monitor_loading, daemon=True)
+            monitor_thread.start()
+            
+            # Clear cache before loading
+            if torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+            elif torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            # Load model (same pattern as preload_model.py)
+            try:
                 self.model = AutoModelForCausalLM.from_pretrained(
                     config.base_model,
-                    quantization_config=bnb_config,
-                    device_map="auto",
-                    dtype=compute_dtype,  # Match compute dtype
+                    **model_kwargs
                 )
+            except Exception as e:
+                logger.warning(f"Error with optimized loading: {e}. Trying standard loading...")
+                # Fallback to standard loading
+                if config.use_4bit:
+                    # Use float32 compute dtype on MPS for stability
+                    compute_dtype = torch.float32 if (config.use_mps and torch.backends.mps.is_available()) else torch.bfloat16
+                    # Update bnb_config with correct compute dtype
+                    bnb_config = BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_quant_type="nf4",
+                        bnb_4bit_compute_dtype=compute_dtype,
+                        bnb_4bit_use_double_quant=True,
+                    )
+                    self.model = AutoModelForCausalLM.from_pretrained(
+                        config.base_model,
+                        quantization_config=bnb_config,
+                        device_map="auto",
+                        dtype=compute_dtype,  # Match compute dtype
+                    )
+                else:
+                    self.model = AutoModelForCausalLM.from_pretrained(
+                        config.base_model,
+                        device_map="auto",
+                        dtype=torch.bfloat16 if config.use_mps else torch.float32,  # Use dtype instead of torch_dtype
+                    )
+            
+            monitoring = False
+            monitor_thread.join(timeout=2)
+            
+            load_time = time.time() - load_start
+            shard_time = time.time() - shard_start
+        
+        # Apply LoRA/QLoRA if enabled
+        if config.use_lora or config.use_qlora:
+            # Prefer Unsloth-native LoRA when available (CUDA-only). Fallback to PEFT otherwise.
+            if self._unsloth_enabled and self._unsloth_flm is not None:
+                try:
+                    logger.info("Applying LoRA via Unsloth...")
+                    target_modules = config.lora_target_modules
+                    if target_modules is None:
+                        # Reasonable default for many decoder-only models (can be overridden in config)
+                        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+                    self.model = self._unsloth_flm.get_peft_model(
+                        self.model,
+                        r=int(config.lora_r),
+                        target_modules=target_modules,
+                        lora_alpha=int(config.lora_alpha),
+                        lora_dropout=float(config.lora_dropout),
+                        bias="none",
+                        use_gradient_checkpointing="unsloth",
+                    )
+                except Exception as e:
+                    logger.warning(f"Unsloth LoRA setup failed; falling back to PEFT. Error: {e}")
+                    self.model = self._apply_lora(config)
             else:
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    config.base_model,
-                    device_map="auto",
-                    dtype=torch.bfloat16 if config.use_mps else torch.float32,  # Use dtype instead of torch_dtype
-                )
-        
-        monitoring = False
-        monitor_thread.join(timeout=2)
-        
-        load_time = time.time() - load_start
-        shard_time = time.time() - shard_start
+                self.model = self._apply_lora(config)
         
         # Apply LoRA/QLoRA if enabled
         if config.use_lora or config.use_qlora:
@@ -777,6 +861,12 @@ class RLAIFTrainer:
         self.executor = ThreadPoolExecutor(max_workers=min(4, os.cpu_count() or 4))  # Concurrent API calls (reduced for M5)
         self.use_batch_generation = True  # Batch student generation
         self.generation_warmup_done = False  # Track if generation has been warmed up
+
+        # Cross-epoch diversity tracking (in-memory):
+        # - `_epoch_code_hashes` resets at the start of each epoch
+        # - `_global_code_hashes` accumulates across epochs in this run
+        self._epoch_code_hashes = set()
+        self._global_code_hashes = set()
         
         # MPS memory management: Set high watermark ratio to allow more memory usage
         # This helps prevent OOM errors on systems with unified memory
@@ -802,8 +892,10 @@ class RLAIFTrainer:
         self.training_metrics = {
             'generation_tokens_per_sec': [],  # Track all generation speeds
             'backprop_tokens_per_sec': [],    # Track all backprop speeds
-            'api_tokens_sent': 0,             # Total tokens sent to teacher API
-            'api_tokens_by_epoch': [],        # Tokens per epoch
+            'api_tokens_sent': 0,             # Total tokens sent to teacher API (input tokens)
+            'api_tokens_received': 0,         # Total tokens received from teacher API (output tokens)
+            'api_tokens_by_epoch': [],        # Tokens per epoch (input tokens)
+            'api_output_tokens_by_epoch': [], # Output tokens per epoch
             'api_calls_by_epoch': [],         # Number of API calls per epoch
             'cache_hits_by_epoch': [],        # Number of cache hits per epoch
             'scoring_breakdown_by_epoch': [], # Scoring breakdown per epoch: [{'correctness': avg, 'code_quality': avg, 'efficiency': avg, 'documentation': avg}, ...]
@@ -829,14 +921,17 @@ class RLAIFTrainer:
             'generation_errors_by_epoch': [],  # Generation errors per epoch
             'scoring_errors_by_epoch': [],     # Scoring errors per epoch
         }
-        if config.use_mlx_for_generation:
+        if config.use_unsloth and config.use_mlx_for_generation:
+            logger.info("Unsloth enabled; skipping MLX generation (MLX is Apple Silicon only).")
+
+        if config.use_mlx_for_generation and not config.use_unsloth:
             # Auto-detect MLX model path if not specified
             mlx_path = config.mlx_model_path
             if mlx_path is None:
                 # Try common MLX model locations in order of preference
                 possible_paths = [
+                    "./mlx_model/q4",  # Q4 quantized (fastest + smallest; best throughput)
                     "./mlx_model/q8",  # Q8 quantized (best balance)
-                    "./mlx_model/q4",  # Q4 quantized (smallest)
                     "./mlx_model/base", # Unquantized base model
                 ]
                 for path in possible_paths:
@@ -864,7 +959,18 @@ class RLAIFTrainer:
             logger.info(f"    mlx_model_path: {config.mlx_model_path}")
     
     def _setup_device(self):
-        """Setup device for M5 MacBook"""
+        """Setup device for training/generation.
+        
+        Notes:
+        - Apple Silicon: prefers MPS when enabled and available.
+        - NVIDIA: if `use_unsloth` is enabled, we strongly prefer CUDA.
+        """
+        # If user explicitly wants Unsloth, we must be on CUDA.
+        if getattr(self.config, "use_unsloth", False) and torch.cuda.is_available():
+            device = torch.device("cuda")
+            logger.info("Using CUDA (Unsloth enabled)")
+            return device
+
         if self.config.use_mps and torch.backends.mps.is_available():
             device = torch.device("mps")
             logger.info("Using MPS (Metal Performance Shaders)")
@@ -936,7 +1042,27 @@ class RLAIFTrainer:
                 if quantize_bits:
                     logger.info(f"  Using {quantize_bits}-bit quantization for faster inference")
                 else:
-                    logger.info("  Using full precision (consider converting to quantized format for better performance)")
+                    logger.info("  Using full precision (this is MUCH slower). For best throughput, use q4/q8:")
+                    logger.info(f"    uv run python scripts/utils/convert_to_mlx.py --hf-path {self.config.base_model} --mlx-path ./mlx_model/q4 --quantize q4_bit")
+
+                # Warm up MLX generation to pay compilation/Metal setup once (not inside epoch timing).
+                # This is a major source of “Batch 0 took minutes” behavior.
+                try:
+                    from mlx_lm import generate as mlx_generate
+                    warmup_prompt = "Write high-quality python code:\n\nReturn 1+1.\n\nCode:"
+                    warmup_start = time.time()
+                    _ = mlx_generate(
+                        self.mlx_model,
+                        self.mlx_tokenizer,
+                        prompt=warmup_prompt,
+                        max_tokens=4,
+                        sampler=None,
+                    )
+                    warmup_time = time.time() - warmup_start
+                    logger.info(f"✓ MLX warmup complete (took {warmup_time:.2f}s). Subsequent batches should be faster.")
+                    self.generation_warmup_done = True
+                except Exception as e:
+                    logger.debug(f"MLX warmup failed (non-critical): {e}")
                 
                 # Verify tokenizer compatibility between MLX and PyTorch
                 # This is CRITICAL: if tokenizers produce different token IDs, we'll get NaN logits
@@ -1002,7 +1128,7 @@ class RLAIFTrainer:
             import traceback
             logger.debug(traceback.format_exc())
     
-    def _generate_prompt_variation(self, base_prompt: str, language: str, sample_idx: int, num_samples: int) -> str:
+    def _generate_prompt_variation(self, base_prompt: str, language: str, sample_idx: int, num_samples: int, epoch: int = 0, nonce: int = 0) -> str:
         """Generate a prompt variation to increase code diversity
         
         Args:
@@ -1015,8 +1141,14 @@ class RLAIFTrainer:
             Varied prompt string
         """
         import random
-        
-        # Different prompt templates for diversity
+        import hashlib
+
+        # Deterministic per-epoch/per-sample randomness so each epoch naturally gets different prompt variants
+        seed_material = f"{epoch}:{nonce}:{sample_idx}:{num_samples}:{language}:{base_prompt}".encode("utf-8")
+        seed = int(hashlib.md5(seed_material).hexdigest()[:8], 16)
+        rng = random.Random(seed)
+
+        # Different prompt templates for diversity (expanded for more variety)
         templates = [
             f"Write high-quality {language} code:\n\n{{prompt}}\n\nCode:",
             f"Implement the following in {language}:\n\n{{prompt}}\n\nSolution:",
@@ -1024,37 +1156,76 @@ class RLAIFTrainer:
             f"Write efficient {language} code:\n\n{{prompt}}\n\nImplementation:",
             f"Generate {language} code:\n\n{{prompt}}\n\nCode:",
             f"Write clean {language} code:\n\n{{prompt}}\n\nSolution:",
+            f"Develop a {language} solution:\n\n{{prompt}}\n\nCode:",
+            f"Build {language} code:\n\n{{prompt}}\n\nImplementation:",
+            f"Write well-structured {language} code:\n\n{{prompt}}\n\nCode:",
+            f"Create optimized {language} code:\n\n{{prompt}}\n\nSolution:",
         ]
         
-        # Use different templates for different samples
-        template_idx = sample_idx % len(templates)
+        # Use different templates for different samples (deterministic randomization)
+        template_idx = (sample_idx + rng.randint(0, len(templates) - 1)) % len(templates)
         template = templates[template_idx]
         
-        # Add slight variations to the prompt text itself
+        # Add more diverse variations to the prompt text itself
         prompt_variations = [
             base_prompt,
             base_prompt + " Make sure the code is efficient.",
             base_prompt + " Include proper error handling.",
             base_prompt + " Add comments for clarity.",
             base_prompt + " Optimize for performance.",
+            base_prompt + " Use best practices.",
+            base_prompt + " Make it readable and maintainable.",
+            base_prompt + " Consider edge cases.",
+            base_prompt + " Write production-ready code.",
+            base_prompt + " Focus on code quality.",
         ]
         
-        # Use different prompt variation based on sample index
-        variation_idx = sample_idx % len(prompt_variations)
+        # Epoch-level style directives to force diversity even if decoding is low-entropy
+        style_directives = [
+            "Prefer an iterative approach (avoid recursion if possible).",
+            "Prefer a recursive approach if it makes the solution clearer.",
+            "Prefer a minimal, concise solution (but still correct).",
+            "Prefer a well-documented solution with clear comments.",
+            "Prefer a solution optimized for performance (avoid unnecessary allocations).",
+            "Prefer a solution optimized for readability and maintainability.",
+            "Prefer using standard library utilities idiomatically.",
+            "Prefer explicit error handling and clear failure modes.",
+            "Prefer functional style where appropriate.",
+            "Prefer an alternative algorithmic approach if possible (not the most obvious one).",
+        ]
+        style_idx = (epoch + sample_idx + nonce) % len(style_directives)
+
+        # Use different prompt variation based on sample index (deterministic randomization)
+        variation_idx = (sample_idx + rng.randint(0, len(prompt_variations) - 1)) % len(prompt_variations)
         varied_prompt = prompt_variations[variation_idx]
-        
-        return template.format(prompt=varied_prompt)
+
+        # Add an epoch “salt” so the same prompt yields different completions across epochs.
+        epoch_salt = (
+            f"\n\n[Epoch Variation: {epoch + 1} | nonce={nonce}]\n"
+            f"- {style_directives[style_idx]}\n"
+            f"- IMPORTANT: Try to produce a meaningfully different solution than previous epochs "
+            f"(different structure/approach), while staying correct.\n"
+        )
+
+        return template.format(prompt=varied_prompt + epoch_salt)
     
-    def generate_student_samples(self, prompts: List[str], languages: List[str], num_samples: int = 4) -> List[Dict]:
+    def generate_student_samples(self, prompts: List[str], languages: List[str], num_samples: int = 4, epoch: int = 0) -> List[Dict]:
         """Generate multiple samples from student model for each prompt (optimized for M5)"""
+        # Unsloth toggle (CUDA-only): switch model to inference-optimized mode before generation
+        if self._unsloth_enabled and self._unsloth_flm is not None:
+            try:
+                self._unsloth_flm.for_inference(self.model)
+            except Exception:
+                pass
+
         # Use MLX for generation if available (much faster than PyTorch MPS)
         if self.mlx_model is not None and self.mlx_tokenizer is not None:
-            return self._generate_with_mlx(prompts, languages, num_samples)
+            return self._generate_with_mlx(prompts, languages, num_samples, epoch=epoch)
         
         # Fall back to PyTorch MPS
-        return self._generate_with_pytorch(prompts, languages, num_samples)
+        return self._generate_with_pytorch(prompts, languages, num_samples, epoch=epoch)
     
-    def _generate_with_mlx(self, prompts: List[str], languages: List[str], num_samples: int) -> List[Dict]:
+    def _generate_with_mlx(self, prompts: List[str], languages: List[str], num_samples: int, epoch: int = 0) -> List[Dict]:
         """Generate using MLX (5-10x faster than PyTorch MPS on Apple Silicon)
         
         Similar to preload_model.py, uses pre-compiled MLX model for fast generation.
@@ -1063,207 +1234,178 @@ class RLAIFTrainer:
         
         samples = []
         all_formatted_prompts = []
-        prompt_metadata = []
+        # Keep sample_idx so we can force sampling on samples > 0 per prompt (improves uniqueness)
+        prompt_metadata = []  # (prompt, language, sample_idx)
         
         for prompt, language in zip(prompts, languages):
             # Use prompt variations for diversity
             for sample_idx in range(num_samples):
-                formatted_prompt = self._generate_prompt_variation(prompt, language, sample_idx, num_samples)
+                # IMPORTANT: use a per-sample nonce so prompts differ materially across samples.
+                # This significantly reduces identical completions even when using greedy decoding.
+                formatted_prompt = self._generate_prompt_variation(prompt, language, sample_idx, num_samples, epoch=epoch, nonce=sample_idx)
                 all_formatted_prompts.append(formatted_prompt)
-                prompt_metadata.append((prompt, language))
+                prompt_metadata.append((prompt, language, sample_idx))
         
         # MLX generation is much faster - can process sequentially or in small batches
         # Similar to preload_model.py, use minimal parameters for fastest generation
         logger.debug(f"Generating {len(all_formatted_prompts)} samples with MLX (5-10x faster than PyTorch MPS)...")
         
-        for formatted_prompt, (prompt, language) in zip(all_formatted_prompts, prompt_metadata):
+        import hashlib
+
+        # Import sampler once (avoid per-sample import overhead)
+        try:
+            from mlx_lm.sample import sample as mlx_sample
+        except Exception:
+            mlx_sample = None
+
+        # Track duplicates within this generation call to avoid wasting samples.
+        seen_hashes_in_call = set()
+
+        for formatted_prompt, (prompt, language, sample_idx) in zip(all_formatted_prompts, prompt_metadata):
             try:
                 # MLX generate is optimized for Apple Silicon
                 # Use minimal parameters for fastest generation (same as preload_model.py)
                 # MLX automatically optimizes for Apple Silicon
-                # Optimize generation: reduce max_tokens for faster generation
-                # 64 tokens is typically enough for code snippets and much faster
-                max_gen_tokens = min(64, self.config.max_length // 8)  # Reduced from 128 to 64 for speed
+                # Throughput note:
+                # Generation TPS is measured over *generated* tokens only, but MLX still pays a prefill cost
+                # for the prompt. Too-small max_tokens makes TPS look artificially low. Use a larger cap to
+                # amortize prompt prefill (still safe because training truncates to max_length anyway).
+                max_gen_tokens = min(128, self.config.max_length // 4)
                 
-                # MLX uses sampler for temperature/top_k/top_p control
-                # Create sampler with configurable temperature for exploration
-                # Vary temperature across samples for more diversity
-                try:
-                    from mlx_lm.sample import sample
-                    import random
-                    # Vary temperature slightly across samples (0.7 to 1.1) for more diversity
-                    # Higher temperature = more diverse outputs
-                    base_temp = self.config.generation_temperature
-                    temp_variation = 0.2  # ±0.2 variation
-                    sample_temp = base_temp + (random.random() - 0.5) * temp_variation
-                    sample_temp = max(0.5, min(1.2, sample_temp))  # Clamp between 0.5 and 1.2
-                    
-                    # Use temperature for more exploration (higher = more diverse)
-                    sampler = lambda logits: sample(logits, temp=sample_temp, top_k=self.config.top_k, top_p=self.config.top_p)
-                except ImportError:
-                    # Fallback if sampler not available
+                # MLX performance note:
+                # Passing a Python `sampler` callback is invoked once per token and can significantly reduce
+                # throughput. For maximum tokens/sec, prefer greedy decoding (sampler=None).
+                #
+                # Strategy:
+                # - Attempt 0: greedy (fast)
+                # - Retry attempts (only if needed for cross-epoch novelty): enable sampling to diversify
+                base_temp = self.config.generation_temperature
+                base_top_k = self.config.top_k
+                base_top_p = self.config.top_p
+                
+                # Cross-epoch novelty:
+                # Retry a couple times with different prompt nonce if we reproduce code from a previous epoch.
+                # IMPORTANT for throughput: retries multiply compute but we only count final tokens.
+                # Keep retries minimal; only do cross-epoch retry (epoch > 0) and only when we collide
+                # with previously-seen (global) code.
+                # If we always run greedy for every sample, duplicates are common and we waste generation time.
+                # Force sampling for samples beyond the first sample per prompt to improve uniqueness.
+                # We want unique samples WITHOUT slowing down the common case.
+                # Strategy:
+                # - Attempt 0: greedy for ALL samples (fast, maximizes tokens/sec)
+                # - If we detect a duplicate hash (call/epoch/global): retry with higher-entropy sampling + new nonce
+                max_novelty_attempts = 3 if epoch > 0 else 2
+                generated_text = ""
+                generated_code = ""
+                code_hash = ""
+                used_prompt = formatted_prompt
+                for attempt in range(max_novelty_attempts):
                     sampler = None
-                
-                generated_text = mlx_generate(
-                    self.mlx_model,
-                    self.mlx_tokenizer,
-                    prompt=formatted_prompt,
-                    max_tokens=max_gen_tokens,  # Reduced for faster generation
-                    sampler=sampler if sampler else None,  # Use sampler for temperature control
-                )
-                
-                # Extract only the generated part (remove prompt)
-                if generated_text.startswith(formatted_prompt):
-                    generated_code = generated_text[len(formatted_prompt):].strip()
-                else:
-                    generated_code = generated_text.strip()
-                
-                # CRITICAL: Verify tokenizer compatibility for the actual generated code
-                # MLX and PyTorch tokenizers MUST produce the same token IDs for the same text
-                # If they don't match, we'll get invalid token IDs and NaN logits
-                try:
-                    # Test tokenization of generated code with both tokenizers
-                    mlx_gen_tokens = self.mlx_tokenizer.encode(generated_code, add_special_tokens=False)
-                    pytorch_gen_tokens = self.tokenizer.encode(generated_code, add_special_tokens=False)
-                    
-                    if mlx_gen_tokens != pytorch_gen_tokens:
-                        logger.warning(f"⚠️  Tokenizer mismatch for generated code!")
-                        logger.warning(f"  MLX tokens ({len(mlx_gen_tokens)}): {mlx_gen_tokens[:20]}...")
-                        logger.warning(f"  PyTorch tokens ({len(pytorch_gen_tokens)}): {pytorch_gen_tokens[:20]}...")
-                        logger.warning(f"  This mismatch will cause NaN logits!")
-                        logger.warning(f"  SOLUTION: Use PyTorch tokenizer to re-tokenize the generated code")
-                        
-                        # Re-tokenize with PyTorch tokenizer to ensure consistency
-                        # Decode MLX tokens and re-encode with PyTorch tokenizer
-                        try:
-                            # Decode what MLX tokenizer produced
-                            mlx_decoded = self.mlx_tokenizer.decode(mlx_gen_tokens, skip_special_tokens=True)
-                            # Re-encode with PyTorch tokenizer
-                            pytorch_reencoded = self.tokenizer.encode(mlx_decoded, add_special_tokens=False)
-                            # Use the PyTorch-tokenized version
-                            generated_code = self.tokenizer.decode(pytorch_reencoded, skip_special_tokens=True)
-                            logger.debug("Fixed tokenizer mismatch by re-tokenizing with PyTorch tokenizer")
-                        except Exception as e:
-                            logger.error(f"Failed to fix tokenizer mismatch: {e}")
-                            logger.error("This will likely cause NaN logits. Consider disabling MLX generation.")
-                    else:
-                        logger.debug(f"✓ Tokenizer compatibility verified for generated code ({len(mlx_gen_tokens)} tokens)")
-                except Exception as e:
-                    logger.warning(f"Could not verify tokenizer compatibility for generated code: {e}")
-                
-                # For training, we need the FULL sequence (prompt + generated code)
-                # IMPORTANT: Use PyTorch tokenizer (self.tokenizer) consistently for training
-                # MLX tokenizer was used for generation, but we need PyTorch tokenizer for training
-                # The generated_code is plain text, so tokenizing with PyTorch tokenizer should work
-                # However, if there are special tokens or formatting differences, we may get mismatches
-                
-                # CRITICAL: Ensure the generated_code doesn't contain special tokens that MLX added
-                # MLX might add special tokens that PyTorch tokenizer interprets differently
-                # Clean the generated code to remove any potential MLX-specific formatting
-                generated_code_clean = generated_code.strip()
-                
-                # Reconstruct the full sequence with clean generated code
-                full_sequence = formatted_prompt + generated_code_clean
-                
-                # Debug: Log if sequence is suspiciously long (may indicate tokenization issues)
-                if len(full_sequence) > self.config.max_length * 4:  # Rough estimate: 4 chars per token
-                    logger.debug(f"Full sequence is long ({len(full_sequence)} chars), will be truncated to {self.config.max_length} tokens")
-                
-                # Verify tokenization produces valid token IDs
-                # Tokenize a test to ensure tokenizer is working correctly
-                try:
-                    test_tokenized = self.tokenizer("test", return_tensors="pt")
-                    if torch.isnan(test_tokenized['input_ids']).any():
-                        logger.error("Tokenizer itself is producing NaN! This is a critical issue.")
-                except Exception as e:
-                    logger.warning(f"Tokenizer test failed: {e}")
-                
-                # Tokenize with PyTorch tokenizer (must match the model's tokenizer)
-                tokenized = self.tokenizer(
-                    full_sequence,
-                    return_tensors="pt",
-                    truncation=True,
-                    max_length=self.config.max_length,
-                    padding='max_length',  # Pad to max_length for batching
-                    return_attention_mask=True,
-                )
-                
-                # Validate tokenization
-                input_ids_tensor = tokenized['input_ids'].squeeze()
-                if input_ids_tensor.numel() == 0:
-                    logger.warning(f"Empty tokenization for prompt, using fallback")
-                    tokenized = self.tokenizer(
-                        formatted_prompt,
-                        return_tensors="pt",
-                        truncation=True,
-                        max_length=self.config.max_length,
-                        padding='max_length',
-                        return_attention_mask=True,
+                    # Enable sampling ONLY on retries (duplicates detected). This avoids a Python callback per token
+                    # on the common (unique) path and significantly improves overall throughput.
+                    if attempt > 0 and mlx_sample is not None and base_temp and base_temp > 0:
+                        import random
+                        # Retry attempts should explore more to avoid duplicates.
+                        # Use a higher base temperature and wider variation on retries.
+                        temp_base = max(base_temp, 1.0)
+                        if attempt > 0:
+                            temp_base = max(temp_base, 1.25)
+                        temp_variation = 0.6 if attempt > 0 else 0.4
+                        sample_temp = temp_base + (random.random() - 0.5) * temp_variation
+                        sample_temp = max(0.8, min(1.7, sample_temp))
+
+                        # Also widen nucleus/top-k slightly on retries to increase diversity.
+                        top_k = max(base_top_k, 50)
+                        top_p = max(base_top_p, 0.95)
+                        if attempt > 0:
+                            top_k = max(top_k, 80)
+                            top_p = max(top_p, 0.98)
+
+                        sampler = lambda logits: mlx_sample(logits, temp=sample_temp, top_k=top_k, top_p=top_p)
+
+                    # Attempt 0 uses the pre-built per-sample prompt (unique nonce already baked in).
+                    # On retries, change the prompt nonce so the model sees a different “context salt”.
+                    attempt_prompt = formatted_prompt if attempt == 0 else self._generate_prompt_variation(
+                        prompt,
+                        language,
+                        sample_idx=sample_idx,
+                        num_samples=num_samples,
+                        epoch=epoch,
+                        nonce=(sample_idx * 10 + attempt),
                     )
-                    input_ids_tensor = tokenized['input_ids'].squeeze()
+                    used_prompt = attempt_prompt
+                    gen_call_start = time.time()
+                    generated_text = mlx_generate(
+                        self.mlx_model,
+                        self.mlx_tokenizer,
+                        prompt=attempt_prompt,
+                        max_tokens=max_gen_tokens,  # Reduced for faster generation
+                        sampler=sampler if sampler else None,  # Use sampler for temperature control
+                    )
+                    gen_call_seconds = time.time() - gen_call_start
+                    
+                    # Extract only the generated part (remove prompt)
+                    if generated_text.startswith(attempt_prompt):
+                        generated_code = generated_text[len(attempt_prompt):].strip()
+                    else:
+                        generated_code = generated_text.strip()
+                    
+                    normalized = ' '.join(generated_code.split())
+                    code_hash = hashlib.md5(normalized.encode()).hexdigest()
+                    # Retry only if we collided with something we've already seen:
+                    # - within this generation call (most common)
+                    # - earlier in the epoch
+                    # - in previous epochs (global)
+                    is_unique = (
+                        (code_hash not in seen_hashes_in_call)
+                        and (code_hash not in self._epoch_code_hashes)
+                        and (code_hash not in self._global_code_hashes)
+                    )
+                    if is_unique:
+                        break
                 
-                # Validate token IDs are in valid range
-                # Get vocab_size from model config (more reliable than len(tokenizer))
-                vocab_size = getattr(self.model.config, 'vocab_size', len(self.tokenizer))
-                if vocab_size == 0 or vocab_size is None:
-                    vocab_size = len(self.tokenizer)
+                if code_hash:
+                    self._epoch_code_hashes.add(code_hash)
+                    seen_hashes_in_call.add(code_hash)
                 
-                # Check for invalid token IDs
-                invalid_mask = (input_ids_tensor < 0) | (input_ids_tensor >= vocab_size)
-                if invalid_mask.any():
-                    invalid_count = invalid_mask.sum().item()
-                    logger.error(f"Invalid token IDs detected in MLX generation sample: {invalid_count} tokens out of range [0, {vocab_size})")
-                    logger.error(f"Token ID range: min={input_ids_tensor.min().item()}, max={input_ids_tensor.max().item()}, vocab_size={vocab_size}")
-                    # Replace invalid IDs with pad token
-                    pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
-                    if pad_token_id is None:
-                        pad_token_id = 0  # Fallback to 0
-                    input_ids_tensor = torch.where(invalid_mask,
-                                                  torch.tensor(pad_token_id, dtype=input_ids_tensor.dtype),
-                                                  input_ids_tensor)
-                    tokenized['input_ids'] = input_ids_tensor.unsqueeze(0) if len(input_ids_tensor.shape) == 1 else input_ids_tensor
-                
-                # Additional validation: check for NaN/Inf in token IDs (shouldn't happen, but check anyway)
-                if torch.isnan(input_ids_tensor.float()).any() or torch.isinf(input_ids_tensor.float()).any():
-                    logger.error("NaN/Inf detected in tokenized input_ids! This is unexpected.")
-                    pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
-                    if pad_token_id is None:
-                        pad_token_id = 0
-                    input_ids_tensor = torch.where(torch.isnan(input_ids_tensor.float()) | torch.isinf(input_ids_tensor.float()),
-                                                  torch.tensor(pad_token_id, dtype=input_ids_tensor.dtype),
-                                                  input_ids_tensor)
-                    tokenized['input_ids'] = input_ids_tensor.unsqueeze(0) if len(input_ids_tensor.shape) == 1 else input_ids_tensor
-                
+                # Optional micro-profiling (debug-only): log prompt vs output token sizes and per-sample time.
+                # This helps identify whether we're prefill-bound (long prompts) or decode-bound.
+                # NOTE: We avoid logging every sample at INFO to reduce overhead.
+                if logger.isEnabledFor(logging.DEBUG):
+                    try:
+                        # Approximate tokens using the PyTorch tokenizer (available and fast)
+                        prompt_tok = len(self.tokenizer.encode(used_prompt, add_special_tokens=False))
+                        out_tok = len(self.tokenizer.encode(generated_code, add_special_tokens=False))
+                        logger.debug(f"MLX gen sample: prompt_tokens={prompt_tok}, output_tokens={out_tok}, max_gen_tokens={max_gen_tokens}")
+                    except Exception:
+                        pass
+
                 samples.append({
                     'prompt': prompt,
                     'language': language,
                     'code': generated_code,
-                    'input_ids': tokenized['input_ids'].squeeze(),
-                    'attention_mask': tokenized['attention_mask'].squeeze(),
+                    # Keep the exact prompt used (may differ due to novelty retry) so training can tokenize later.
+                    # This drastically reduces overhead during generation (we only tokenize selected samples for training).
+                    'full_prompt': used_prompt,
+                    # Per-sample timing / token stats (helps compute avg-per-sample tok/s)
+                    'gen_seconds': float(gen_call_seconds) if 'gen_call_seconds' in locals() else 0.0,
+                    'output_tokens': int(len(self.tokenizer.encode(generated_code, add_special_tokens=False))) if generated_code else 0,
+                    'code_hash': code_hash,
                 })
             except Exception as e:
                 logger.warning(f"MLX generation failed for prompt: {e}")
                 # Fall back to empty code
                 formatted_prompt = f"Write high-quality {language} code:\n\n{prompt}\n\nCode:"
-                tokenized_fallback = self.tokenizer(
-                    formatted_prompt,
-                    return_tensors="pt",
-                    truncation=True,
-                    max_length=self.config.max_length,
-                    padding='max_length',
-                    return_attention_mask=True,
-                )
                 samples.append({
                     'prompt': prompt,
                     'language': language,
                     'code': '',
-                    'input_ids': tokenized_fallback['input_ids'].squeeze(),
-                    'attention_mask': tokenized_fallback['attention_mask'].squeeze(),
+                    'full_prompt': formatted_prompt,
                 })
         
         return samples
     
-    def _generate_with_pytorch(self, prompts: List[str], languages: List[str], num_samples: int) -> List[Dict]:
+    def _generate_with_pytorch(self, prompts: List[str], languages: List[str], num_samples: int, epoch: int = 0) -> List[Dict]:
         """Generate using PyTorch MPS (fallback if MLX not available)"""
         self.model.eval()
         samples = []
@@ -1276,7 +1418,7 @@ class RLAIFTrainer:
             for prompt, language in zip(prompts, languages):
                 # Use prompt variations for diversity (same as MLX)
                 for sample_idx in range(num_samples):
-                    formatted_prompt = self._generate_prompt_variation(prompt, language, sample_idx, num_samples)
+                    formatted_prompt = self._generate_prompt_variation(prompt, language, sample_idx, num_samples, epoch=epoch, nonce=sample_idx)
                     all_formatted_prompts.append(formatted_prompt)
                     prompt_metadata.append((prompt, language))
             
@@ -1307,17 +1449,17 @@ class RLAIFTrainer:
                     # Optimized generation parameters for M5 MPS
                     # Reduced max_new_tokens to prevent OOM
                     # Use sampling for diversity in generated code
-                    # Vary temperature across samples for more diversity
+                    # Vary temperature significantly across samples for more diversity
                     import random
                     base_temp = self.config.generation_temperature
-                    temp_variation = 0.2  # ±0.2 variation
+                    temp_variation = 0.4  # Increased from ±0.2 to ±0.4 for more diversity
                     sample_temp = base_temp + (random.random() - 0.5) * temp_variation
-                    sample_temp = max(0.5, min(1.2, sample_temp))  # Clamp between 0.5 and 1.2
+                    sample_temp = max(0.7, min(1.3, sample_temp))  # Clamp between 0.7 and 1.3 (wider range)
                     
                     generation_config = {
                         "max_new_tokens": min(128, self.config.max_length // 4),  # Reduced from 256 to save memory
                         "do_sample": True,  # Enable sampling to use temperature/top_p/top_k
-                        "temperature": self.config.generation_temperature,  # Use configurable temperature
+                        "temperature": sample_temp,  # Vary temperature for diversity
                         "top_k": self.config.top_k,
                         "top_p": self.config.top_p,
                         "pad_token_id": self.tokenizer.eos_token_id,
@@ -1325,7 +1467,7 @@ class RLAIFTrainer:
                         "use_cache": True,  # Critical for MPS performance
                         "output_scores": False,
                         "return_dict_in_generate": False,
-                        "repetition_penalty": 1.1 + random.random() * 0.1,  # Vary repetition penalty (1.1 to 1.2)
+                        "repetition_penalty": 1.1 + random.random() * 0.2,  # Vary repetition penalty (1.1 to 1.3) for more diversity
                     }
                     
                     # Synchronize MPS before generation for better performance
@@ -1349,23 +1491,12 @@ class RLAIFTrainer:
                                 skip_special_tokens=True
                             )
                             
-                            # For PyTorch generation, we need the full sequence (prompt + generated code)
-                            full_sequence = all_formatted_prompts[i * batch_size + j] + generated_text
-                            tokenized_full = self.tokenizer(
-                                full_sequence,
-                                return_tensors="pt",
-                                truncation=True,
-                                max_length=self.config.max_length,
-                                padding='max_length',
-                                return_attention_mask=True,
-                            )
-                            
                             samples.append({
                                 'prompt': prompt,
                                 'language': language,
                                 'code': generated_text,
-                                'input_ids': tokenized_full['input_ids'].squeeze(),
-                                'attention_mask': tokenized_full['attention_mask'].squeeze(),
+                                # Keep prompt used; tokenize later only for selected samples.
+                                'full_prompt': all_formatted_prompts[i * batch_size + j],
                             })
         
         return samples
@@ -1403,8 +1534,9 @@ class RLAIFTrainer:
                 )
                 self.teacher_score_cache[student_code_key] = student_score
             
-            # Score teacher code (baseline) - cache this too
-            teacher_code_key = f"{teacher_code}:{sample['prompt']}:{sample['language']}"
+            # Score teacher code (baseline) - cache this with a special prefix to distinguish from student scores
+            # Teacher code doesn't change, so it's safe to cache across epochs
+            teacher_code_key = f"TEACHER_CODE:{teacher_code}:{sample['prompt']}:{sample['language']}"
             if teacher_code_key in self.teacher_score_cache:
                 teacher_score = self.teacher_score_cache[teacher_code_key]
             else:
@@ -1465,41 +1597,11 @@ class RLAIFTrainer:
                 continue
             
             # Normalize code (remove whitespace differences)
-            normalized = ' '.join(code.split())
-            code_hash = hashlib.md5(normalized.encode()).hexdigest()
-            
-            if code_hash not in seen_hashes:
-                seen_hashes.add(code_hash)
-                unique_samples.append(sample)
-            else:
-                logger.debug(f"Filtered duplicate sample (hash: {code_hash[:8]}...)")
-        
-        if len(unique_samples) < len(samples):
-            logger.info(f"Filtered {len(samples) - len(unique_samples)} duplicate samples (diversity: {len(unique_samples)/len(samples)*100:.1f}%)")
-        
-        return unique_samples
-    
-    def _filter_duplicate_samples(self, samples: List[Dict]) -> List[Dict]:
-        """Filter out duplicate samples to improve diversity
-        
-        Args:
-            samples: List of generated samples
-            
-        Returns:
-            Filtered list with duplicates removed (keeping first occurrence)
-        """
-        import hashlib
-        seen_hashes = set()
-        unique_samples = []
-        
-        for sample in samples:
-            code = sample.get('code', '')
-            if not code:
-                continue
-            
-            # Normalize code (remove whitespace differences)
-            normalized = ' '.join(code.split())
-            code_hash = hashlib.md5(normalized.encode()).hexdigest()
+            code_hash = sample.get('code_hash')
+            if not code_hash:
+                normalized = ' '.join(code.split())
+                code_hash = hashlib.md5(normalized.encode()).hexdigest()
+                sample['code_hash'] = code_hash
             
             if code_hash not in seen_hashes:
                 seen_hashes.add(code_hash)
@@ -1571,19 +1673,24 @@ class RLAIFTrainer:
         total_count = len(codes)
         unique_ratio = unique_count / total_count if total_count > 0 else 0.0
         
-        # Calculate average similarity using simple character-level similarity
-        # (more sophisticated methods could use embeddings, but this is fast)
+        # Calculate average similarity using improved token-based similarity
+        # This is more accurate than character-level for code
         if total_count > 1:
             similarities = []
-            for i in range(min(100, total_count)):  # Sample up to 100 codes for speed
+            # Sample more pairs for better accuracy
+            sample_size = min(200, total_count)  # Increased from 100 to 200
+            for i in range(sample_size):
                 code1 = codes[i]
-                for j in range(i + 1, min(i + 10, total_count)):  # Compare with next 10 codes
+                # Compare with more codes (increased from 10 to 20)
+                for j in range(i + 1, min(i + 20, total_count)):
                     code2 = codes[j]
-                    # Simple character-level similarity (Jaccard similarity on character sets)
-                    set1 = set(code1)
-                    set2 = set(code2)
-                    if len(set1) + len(set2) > 0:
-                        similarity = len(set1 & set2) / len(set1 | set2)
+                    # Use token-based similarity (more accurate for code)
+                    # Split into tokens (words/identifiers) for better comparison
+                    tokens1 = set(code1.split())
+                    tokens2 = set(code2.split())
+                    if len(tokens1) + len(tokens2) > 0:
+                        # Jaccard similarity on tokens
+                        similarity = len(tokens1 & tokens2) / len(tokens1 | tokens2)
                         similarities.append(similarity)
             avg_similarity = np.mean(similarities) if similarities else 0.0
         else:
@@ -1762,28 +1869,43 @@ class RLAIFTrainer:
         This ensures we use the full sequences (prompt + generated code) for training,
         not just the original prompts from the DataLoader.
         """
-        # Group samples by original prompt (each prompt has num_samples_per_prompt samples)
-        num_samples_per_prompt = len(samples) // len(original_prompts)
+        # Group samples by original prompt string.
+        # NOTE: We no longer assume a fixed number of samples per prompt because we may skip duplicates.
+        samples_by_prompt: Dict[str, List[int]] = {}
+        for idx, s in enumerate(samples):
+            p = s.get('prompt')
+            if p is None:
+                continue
+            samples_by_prompt.setdefault(p, []).append(idx)
         
         # Collect input_ids and attention_masks from samples
         batch_input_ids = []
         batch_attention_masks = []
         
         for i, prompt in enumerate(original_prompts):
-            # Get the first sample for each prompt (or average if multiple)
-            # For now, use the first sample per prompt
-            sample_idx = i * num_samples_per_prompt
-            if sample_idx < len(samples):
-                sample = samples[sample_idx]
+            # Pick a sample for this prompt.
+            # If rewards are available, prefer the highest-reward sample for a stronger learning signal.
+            idxs = samples_by_prompt.get(prompt, [])
+            sample = None
+            if idxs:
+                best_idx = idxs[0]
+                if hasattr(self, "_latest_batch_rewards") and self._latest_batch_rewards is not None:
+                    try:
+                        best_idx = max(idxs, key=lambda j: float(self._latest_batch_rewards[j]) if j < len(self._latest_batch_rewards) else -1.0)
+                    except Exception:
+                        best_idx = idxs[0]
+                sample = samples[best_idx]
+            if sample is not None:
                 if 'input_ids' in sample and 'attention_mask' in sample:
                     batch_input_ids.append(sample['input_ids'])
                     batch_attention_masks.append(sample['attention_mask'])
                 else:
-                    # Fallback: tokenize the prompt (shouldn't happen if generation worked)
-                    logger.warning(f"Sample missing input_ids/attention_mask, using fallback tokenization")
-                    formatted_prompt = f"Write high-quality {sample.get('language', 'python')} code:\n\n{prompt}\n\nCode:"
+                    # Fast path: tokenize only the selected sample (prompt + generated code).
+                    # We avoid tokenizing *all* generated samples during generation to keep MLX throughput high.
+                    full_prompt = sample.get('full_prompt') or f"Write high-quality {sample.get('language', 'python')} code:\n\n{prompt}\n\nCode:"
+                    full_sequence = (full_prompt + (sample.get('code', '') or '')).strip()
                     tokenized = self.tokenizer(
-                        formatted_prompt,
+                        full_sequence,
                         return_tensors="pt",
                         truncation=True,
                         max_length=self.config.max_length,
@@ -1863,6 +1985,13 @@ class RLAIFTrainer:
     
     def train_step(self, batch: Dict, rewards: List[float]) -> Dict[str, float]:
         """Perform one training step with RLAIF (optimized for M5)"""
+        # Unsloth toggle (CUDA-only): switch model to training-optimized mode before forward/backward
+        if self._unsloth_enabled and self._unsloth_flm is not None:
+            try:
+                self._unsloth_flm.for_training(self.model)
+            except Exception:
+                pass
+
         self.model.train()
         
         # Initialize variables to avoid "referenced before assignment" errors
@@ -2204,8 +2333,11 @@ class RLAIFTrainer:
             total_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
         
         # Backward pass with timing
+        # Scale loss by 1/gradient_accumulation_steps for proper gradient accumulation
+        # This ensures gradients are averaged across accumulation steps
+        scaled_loss = total_loss / self.config.gradient_accumulation_steps
         backprop_start = time.time()
-        total_loss.backward()
+        scaled_loss.backward()  # Accumulate gradients (don't zero grad here)
         backprop_time = time.time() - backprop_start
         
         # Calculate backprop tokens/sec (tokens processed during backward pass)
@@ -2225,7 +2357,7 @@ class RLAIFTrainer:
         avg_reward = np.mean(rewards) if rewards and len(rewards) > 0 else 0.0
         
         return {
-            'loss': total_loss.item(),
+            'loss': total_loss.item(),  # Return unscaled loss for logging
             'policy_loss': policy_loss.item(),
             'kl_penalty': kl_penalty.item(),
             'avg_reward': avg_reward,
@@ -2286,8 +2418,34 @@ class RLAIFTrainer:
         global_step = 0
         
         for epoch in range(self.config.num_epochs):
+            epoch_start_time = time.time()  # Track epoch start time
             logger.info(f"Epoch {epoch + 1}/{self.config.num_epochs}")
             self.stats['epoch'] = epoch + 1
+
+            # Reset per-epoch diversity tracking; keep global hashes across epochs
+            self._epoch_code_hashes = set()
+
+            # Track gradient accumulation micro-steps (must be global within the epoch)
+            # Otherwise we may never hit `gradient_accumulation_steps` on small datasets.
+            micro_step_in_epoch = 0
+            
+            # CRITICAL: Clear student score cache at the start of each epoch
+            # This ensures the model gets fresh feedback even if it generates similar code
+            # The model should improve, so we need to re-score to see the improvement
+            # Keep teacher code cache (that's fine to cache across epochs)
+            student_cache_size_before = len(self.teacher_score_cache)
+            # Remove only student code scores (keep teacher code scores)
+            keys_to_remove = [k for k in self.teacher_score_cache.keys() if not k.startswith("TEACHER_CODE:")]
+            for key in keys_to_remove:
+                del self.teacher_score_cache[key]
+            logger.info(f"Cleared {len(keys_to_remove)} student score cache entries at start of epoch {epoch + 1} (kept teacher code cache)")
+            
+            # Track API tokens at start of epoch
+            epoch_start_api_tokens = self.training_metrics['api_tokens_sent']
+            epoch_start_api_calls = self.cache_stats['api_calls']
+            epoch_start_cache_hits = self.cache_stats['cache_hits']
+            epoch_start_gen_errors = self.error_stats['generation_errors']
+            epoch_start_scoring_errors = self.error_stats['scoring_errors']
             
             # Track API tokens at start of epoch
             epoch_start_api_tokens = self.training_metrics['api_tokens_sent']
@@ -2304,9 +2462,15 @@ class RLAIFTrainer:
             epoch_gen_times = []  # Generation times
             epoch_reward_times = []  # Scoring times
             epoch_train_times = []  # Training times
-            epoch_gen_tokens = []  # Tokens generated
-            epoch_train_tokens = []  # Tokens used in training
-            epoch_reward_tokens = []  # API tokens used for scoring
+            epoch_gen_tokens = []  # Tokens generated (output tokens from student model) AFTER dedup filtering (kept)
+            epoch_gen_tokens_raw = []  # Tokens generated BEFORE dedup filtering (all sampled; true MLX throughput)
+            epoch_gen_samples_raw = []  # Number of samples generated (raw, before dedup)
+            epoch_gen_samples_kept = []  # Number of samples kept (after dedup)
+            epoch_gen_sample_tps_raw = []  # Per-sample tokens/sec (raw samples)
+            epoch_gen_sample_tps_kept = []  # Per-sample tokens/sec (kept samples)
+            epoch_train_tokens = []  # Tokens used in training (input sequence tokens)
+            epoch_reward_tokens = []  # API input tokens used for scoring
+            epoch_reward_output_tokens = []  # API output tokens received from scoring
             
             # Batch dataset collection to reduce memory overhead
             dataset_batch = []
@@ -2357,19 +2521,54 @@ class RLAIFTrainer:
                 gen_start = time.time()
                 # samples is already initialized above
                 try:
-                    samples = self.generate_student_samples(
+                    samples_all = self.generate_student_samples(
                         prompts,
                         languages,
-                        num_samples=self.config.num_samples_per_prompt
+                        num_samples=self.config.num_samples_per_prompt,
+                        epoch=epoch
                     )
-                    # Filter duplicates to improve diversity
+                    # Compute raw generation throughput BEFORE dedup filtering.
+                    # This reflects actual MLX decode speed (what you expect: ~7-9 tok/s on q4).
+                    # Prefer already-computed token counts from generation (avoid extra tokenizer passes)
+                    raw_num_tokens = sum(int(s.get('output_tokens', 0) or 0) for s in samples_all)
+                    if raw_num_tokens == 0:
+                        # Fallback for PyTorch samples that don't have output_tokens
+                        for s in samples_all:
+                            code = s.get('code', '')
+                            if code:
+                                raw_num_tokens += len(self.tokenizer.encode(code, add_special_tokens=False))
+                    raw_tokens_per_sec = raw_num_tokens / max(gen_time := (time.time() - gen_start), 1e-6)
+
+                    samples = samples_all
+                    # Filter duplicates to improve diversity (this affects *kept* tokens/sec)
                     if len(samples) > 1:
+                        before_n = len(samples)
                         samples = self._filter_duplicate_samples(samples)
+                        after_n = len(samples)
+                    else:
+                        before_n = after_n = len(samples)
+
+                    # Track per-sample TPS if available (MLX path provides gen_seconds/output_tokens)
+                    def _collect_sample_tps(sample_list):
+                        vals = []
+                        for ss in sample_list or []:
+                            ot = ss.get('output_tokens', 0) or 0
+                            ts = ss.get('gen_seconds', 0.0) or 0.0
+                            if ot > 0 and ts > 0:
+                                vals.append(ot / ts)
+                        return vals
+
+                    epoch_gen_sample_tps_raw.extend(_collect_sample_tps(samples_all))
+                    epoch_gen_sample_tps_kept.extend(_collect_sample_tps(samples))
                 except Exception as e:
                     generation_error = True
                     self.error_stats['generation_errors'] += 1
                     logger.error(f"Error generating samples for batch {batch_idx}: {e}")
                     logger.warning(f"Skipping batch {batch_idx} due to generation error")
+                    samples_all = []
+                    raw_num_tokens = 0
+                    raw_tokens_per_sec = 0.0
+                    before_n = after_n = 0
                     samples = []  # Ensure samples is empty list on error
                 gen_time = time.time() - gen_start
                 
@@ -2377,22 +2576,28 @@ class RLAIFTrainer:
                 if torch.backends.mps.is_available() and batch_idx % 5 == 0:
                     torch.mps.synchronize()  # Sync periodically, not every batch
                 
-                # Track generation performance
-                # Count tokens more accurately using tokenizer
-                num_tokens = 0
-                for s in samples:
-                    code = s.get('code', '')
-                    if code:
-                        # Use tokenizer to count tokens accurately
-                        tokenized = self.tokenizer.encode(code, add_special_tokens=False)
-                        num_tokens += len(tokenized)
+                # Track generation performance:
+                # - raw_*: all generated samples (actual MLX throughput)
+                # - kept_*: after dedup filtering (effective training throughput)
+                num_tokens = sum(int(s.get('output_tokens', 0) or 0) for s in samples)
+                if num_tokens == 0:
+                    for s in samples:
+                        code = s.get('code', '')
+                        if code:
+                            num_tokens += len(self.tokenizer.encode(code, add_special_tokens=False))
                 tokens_per_sec = num_tokens / gen_time if gen_time > 0 else 0
                 self.training_metrics['generation_tokens_per_sec'].append(tokens_per_sec)
                 
-                # Track epoch-level metrics (only if we have samples)
-                if num_tokens > 0:
+                # Track epoch-level metrics
+                # - gen_time reflects *all* sampled generation compute
+                # - raw tokens reflect all sampled outputs
+                # - kept tokens reflect post-dedup outputs
+                if raw_num_tokens > 0:
                     epoch_gen_times.append(gen_time)
+                    epoch_gen_tokens_raw.append(raw_num_tokens)
                     epoch_gen_tokens.append(num_tokens)
+                    epoch_gen_samples_raw.append(before_n if 'before_n' in locals() else len(samples_all))
+                    epoch_gen_samples_kept.append(after_n if 'after_n' in locals() else len(samples))
                 
                 # Log to TensorBoard periodically
                 if self.writer and batch_idx % 10 == 0:
@@ -2403,7 +2608,12 @@ class RLAIFTrainer:
                 if batch_idx % 5 == 0:
                     batch_size_actual = len(batch['prompt'])
                     gen_time_str = f"{gen_time:.3f}s" if gen_time < 1.0 else f"{gen_time:.1f}s"
-                    logger.info(f"Batch {batch_idx} (size={batch_size_actual}) - Generation: {gen_time_str}, {num_tokens:,} tokens, {tokens_per_sec:.1f} tokens/sec")
+                    logger.info(
+                        f"Batch {batch_idx} (size={batch_size_actual}) - Generation: {gen_time_str}, "
+                        f"raw={raw_num_tokens:,} tokens ({raw_tokens_per_sec:.1f} tok/s), "
+                        f"kept={num_tokens:,} tokens ({tokens_per_sec:.1f} tok/s), "
+                        f"samples {before_n}→{after_n}"
+                    )
                     
                     if self.mlx_model is not None:
                         # MLX generation
@@ -2422,57 +2632,42 @@ class RLAIFTrainer:
                         logger.warning("  2. Update config.yaml: hardware.use_mlx_for_generation: true")
                 
                 # Compute rewards and collect dataset entries (optimized)
-                # Track API tokens before reward computation
-                api_tokens_before = self.training_metrics['api_tokens_sent']
+                # Track API tokens before reward computation (both input and output)
+                api_input_tokens_before = self.training_metrics['api_tokens_sent']
+                api_output_tokens_before = self.training_metrics['api_tokens_received']
                 reward_start = time.time()
-                rewards, dataset_entries = self.compute_rewards(samples, save_to_dataset=True)
-                reward_time = max(time.time() - reward_start, 0.001)  # Ensure non-zero (min 1ms for display)
-                # Track API tokens after reward computation
-                api_tokens_after = self.training_metrics['api_tokens_sent']
-                reward_api_tokens = api_tokens_after - api_tokens_before
-                reward_tokens_per_sec = reward_api_tokens / reward_time if reward_time > 0 else 0
-                epoch_rewards.extend(rewards)
                 
-                # Batch dataset collection to reduce memory overhead
-                dataset_batch.extend(dataset_entries)
-                if len(dataset_batch) >= dataset_batch_size * len(samples):
-                    self.dataset_collection['training'].extend(dataset_batch)
-                    dataset_batch = []  # Clear batch
-                
-                # Training step
-                # Reconstruct batch from generated samples (with full sequences: prompt + generated code)
-                # The original batch only has prompts, but we need the full sequences for training
-                train_batch = self._create_training_batch_from_samples(samples, batch['prompt'])
-                
-                train_start = time.time()
-                loss_dict = self.train_step(train_batch, rewards[:len(batch['prompt'])])
-                train_time = max(time.time() - train_start, 0.001)  # Ensure non-zero (min 1ms for display)
-                epoch_losses.append(loss_dict['loss'])
-                
-                # Calculate training tokens/sec (tokens processed during forward+backward pass)
-                # This is the number of tokens in the input sequence
-                train_num_tokens = train_batch['input_ids'].numel() if 'input_ids' in train_batch else 0
-                train_tokens_per_sec = train_num_tokens / train_time if train_time > 0 else 0
-                
-                # Aggressive memory cleanup after training step to prevent OOM
-                if torch.backends.mps.is_available():
-                    # Delete intermediate tensors explicitly
-                    if 'train_batch' in locals():
-                        del train_batch
-                    if 'samples' in locals():
-                        del samples
-                    if 'rewards' in locals():
-                        del rewards
+                # Check if samples are empty before computing rewards
+                if not samples or len(samples) == 0:
+                    logger.warning(f"Batch {batch_idx}: No samples generated, skipping reward computation and training")
+                    # All variables already initialized above, just skip computation
+                    # rewards is already cleared above, just ensure dataset_entries is empty
+                    dataset_entries = []
+                else:
+                    try:
+                        rewards, dataset_entries = self.compute_rewards(samples, save_to_dataset=True)
+                        # Ensure rewards is a list even if compute_rewards fails
+                        if rewards is None:
+                            rewards = []
+                        if dataset_entries is None:
+                            dataset_entries = []
+                    except Exception as e:
+                        logger.error(f"Error computing rewards for batch {batch_idx}: {e}")
+                        rewards = []  # Assign empty list on error (always assigned)
+                        dataset_entries = []
                     
                     reward_time = max(time.time() - reward_start, 0.001)  # Ensure non-zero (min 1ms for display)
-                    # Track API tokens after reward computation
-                    api_tokens_after = self.training_metrics['api_tokens_sent']
-                    reward_api_tokens = api_tokens_after - api_tokens_before
-                    reward_tokens_per_sec = reward_api_tokens / reward_time if reward_time > 0 else 0
+                    # Track API tokens after reward computation (both input and output)
+                    api_input_tokens_after = self.training_metrics['api_tokens_sent']
+                    api_output_tokens_after = self.training_metrics['api_tokens_received']
+                    reward_api_input_tokens = api_input_tokens_after - api_input_tokens_before
+                    reward_api_output_tokens = api_output_tokens_after - api_output_tokens_before
+                    reward_tokens_per_sec = (reward_api_input_tokens + reward_api_output_tokens) / reward_time if reward_time > 0 else 0
                     
                     # Track epoch-level metrics
                     epoch_reward_times.append(reward_time)
-                    epoch_reward_tokens.append(reward_api_tokens)
+                    epoch_reward_tokens.append(reward_api_input_tokens)
+                    epoch_reward_output_tokens.append(reward_api_output_tokens)
                     
                     # Log cache hit rate for debugging
                     if batch_idx % 5 == 0 and len(samples) > 0:
@@ -2498,12 +2693,16 @@ class RLAIFTrainer:
                     # Training step
                     # Only train if we have rewards and samples
                     if rewards and len(rewards) > 0 and samples and len(samples) > 0:
+                        # Store rewards so `_create_training_batch_from_samples` can pick the best sample per prompt.
+                        # (We keep it ephemeral to avoid threading complexity.)
+                        self._latest_batch_rewards = rewards
+
                         # Reconstruct batch from generated samples (with full sequences: prompt + generated code)
                         # The original batch only has prompts, but we need the full sequences for training
                         train_batch = self._create_training_batch_from_samples(samples, batch['prompt'])
                         
                         train_start = time.time()
-                        # Ensure rewards list is long enough
+                        # Ensure rewards list is long enough (train_batch uses one sample per prompt)
                         rewards_for_training = rewards[:len(batch['prompt'])] if len(rewards) >= len(batch['prompt']) else rewards + [0.0] * (len(batch['prompt']) - len(rewards))
                         loss_dict = self.train_step(train_batch, rewards_for_training)
                         train_time = max(time.time() - train_start, 0.001)  # Ensure non-zero (min 1ms for display)
@@ -2517,6 +2716,27 @@ class RLAIFTrainer:
                         # Track epoch-level metrics
                         epoch_train_times.append(train_time)
                         epoch_train_tokens.append(train_num_tokens)
+
+                        # ---- Optimizer stepping / gradient accumulation (CRITICAL) ----
+                        micro_step_in_epoch += 1
+                        if micro_step_in_epoch % self.config.gradient_accumulation_steps == 0:
+                            has_gradients = any(p.grad is not None for p in self.model.parameters() if p.requires_grad)
+                            if not has_gradients:
+                                logger.warning(f"⚠️  No gradients found at micro_step {micro_step_in_epoch}! Model may not be learning.")
+
+                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+                            optimizer.step()
+                            scheduler.step()
+                            optimizer.zero_grad(set_to_none=True)
+                            global_step += 1
+
+                            if global_step % 10 == 0:
+                                current_lr = scheduler.get_last_lr()[0] if hasattr(scheduler, 'get_last_lr') else self.config.learning_rate
+                                logger.debug(
+                                    f"Optimizer step {global_step}: LR={current_lr:.2e}, "
+                                    f"grad_accum={self.config.gradient_accumulation_steps}, "
+                                    f"micro_step_in_epoch={micro_step_in_epoch}"
+                                )
                     else:
                         # No rewards or samples, skip training but set defaults
                         train_time = 0.001
@@ -2533,6 +2753,27 @@ class RLAIFTrainer:
                     gen_time_str = f"{gen_time:.3f}s" if gen_time < 1.0 else f"{gen_time:.1f}s"
                     reward_time_str = f"{reward_time:.3f}s" if reward_time < 1.0 else f"{reward_time:.1f}s"
                     train_time_str = f"{train_time:.3f}s" if train_time < 1.0 else f"{train_time:.1f}s"
+
+                    # Generation: report raw vs kept, avg tokens/sample, and per-sample vs overall tok/s
+                    raw_samples = before_n if 'before_n' in locals() else (len(samples_all) if 'samples_all' in locals() else 0)
+                    kept_samples = after_n if 'after_n' in locals() else (len(samples) if 'samples' in locals() else 0)
+                    avg_tok_per_sample_raw = (raw_num_tokens / raw_samples) if raw_samples > 0 else 0.0
+                    avg_tok_per_sample_kept = (num_tokens / kept_samples) if kept_samples > 0 else 0.0
+
+                    # Per-sample tok/s (average of per-sample tok/s) if available; otherwise fallback to overall tok/s
+                    def _avg_sample_tps(sample_list):
+                        vals = []
+                        for s in (sample_list or []):
+                            ot = s.get('output_tokens', 0) or 0
+                            ts = s.get('gen_seconds', 0.0) or 0.0
+                            if ot > 0 and ts > 0:
+                                vals.append(ot / ts)
+                        return float(np.mean(vals)) if vals else None
+
+                    raw_sample_tps = _avg_sample_tps(samples_all if 'samples_all' in locals() else [])
+                    kept_sample_tps = _avg_sample_tps(samples if 'samples' in locals() else [])
+                    raw_sample_tps_str = f"{raw_sample_tps:.1f}" if raw_sample_tps is not None else "n/a"
+                    kept_sample_tps_str = f"{kept_sample_tps:.1f}" if kept_sample_tps is not None else "n/a"
                     
                     # Add cache status to scoring line if applicable
                     scoring_line = f"  Scoring: {reward_time_str} ({reward_time/batch_time*100:.1f}%), {reward_api_tokens:,} API tokens, {reward_tokens_per_sec:.1f} tokens/sec"
@@ -2554,7 +2795,9 @@ class RLAIFTrainer:
                     
                     logger.info(
                         f"Batch {batch_idx} (size={batch_size_actual}) timing breakdown:\n"
-                        f"  Generation: {gen_time_str} ({gen_time/batch_time*100:.1f}%), {num_tokens:,} tokens, {tokens_per_sec:.1f} tokens/sec\n"
+                        f"  Generation: {gen_time_str} ({gen_time/batch_time*100:.1f}%)\n"
+                        f"    samples: raw={raw_samples} kept={kept_samples} | avg tok/sample: raw={avg_tok_per_sample_raw:.1f} kept={avg_tok_per_sample_kept:.1f}\n"
+                        f"    tok/s: raw overall={raw_tokens_per_sec:.1f} avg-per-sample={raw_sample_tps_str} | kept overall={tokens_per_sec:.1f} avg-per-sample={kept_sample_tps_str}\n"
                         f"{scoring_line}\n"
                         f"  Training: {train_time_str} ({train_time/batch_time*100:.1f}%), {train_num_tokens:,} tokens, {train_tokens_per_sec:.1f} tokens/sec\n"
                         f"  Total: {batch_time:.1f}s"
@@ -2602,20 +2845,20 @@ class RLAIFTrainer:
             if dataset_batch:
                 self.dataset_collection['training'].extend(dataset_batch)
                 dataset_batch = []
-            
-            # Update optimizer and stats (only if we processed at least one batch)
-            # batch_idx is initialized to -1, so >= 0 means we processed at least one batch
-            if batch_idx >= 0:
-                # Update optimizer if needed (only if we processed batches)
-                if (batch_idx + 1) % self.config.gradient_accumulation_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(),
-                        self.config.max_grad_norm
-                    )
+
+            # If we have leftover accumulated gradients at epoch end, flush them so we still learn on small datasets.
+            if micro_step_in_epoch > 0 and (micro_step_in_epoch % self.config.gradient_accumulation_steps) != 0:
+                has_gradients = any(p.grad is not None for p in self.model.parameters() if p.requires_grad)
+                if has_gradients:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
                     optimizer.step()
                     scheduler.step()
-                    optimizer.zero_grad()
+                    optimizer.zero_grad(set_to_none=True)
                     global_step += 1
+                    logger.debug(
+                        f"Flushed leftover grads at epoch end: micro_step_in_epoch={micro_step_in_epoch}, "
+                        f"grad_accum={self.config.gradient_accumulation_steps}"
+                    )
                 
                 # Update stats
                 # Note: rewards is always assigned at the start of each batch iteration (line 2351)
@@ -2657,9 +2900,17 @@ class RLAIFTrainer:
                 reward_trend = avg_epoch_reward - self.training_metrics['reward_by_epoch'][-2]
                 loss_trend = self.training_metrics['loss_by_epoch'][-2] - avg_epoch_loss  # Loss should decrease
             
-            # Track API tokens for this epoch
-            epoch_tokens = self.training_metrics['api_tokens_sent'] - epoch_start_api_tokens
-            self.training_metrics['api_tokens_by_epoch'].append(epoch_tokens)
+            # Track API tokens for this epoch (input and output separately)
+            epoch_input_tokens = self.training_metrics['api_tokens_sent'] - epoch_start_api_tokens
+            if epoch == 0:
+                epoch_output_tokens = self.training_metrics['api_tokens_received']
+            else:
+                # Calculate output tokens for this epoch from cumulative
+                prev_output_tokens = sum(self.training_metrics['api_output_tokens_by_epoch']) if self.training_metrics['api_output_tokens_by_epoch'] else 0
+                epoch_output_tokens = self.training_metrics['api_tokens_received'] - prev_output_tokens
+            
+            self.training_metrics['api_tokens_by_epoch'].append(epoch_input_tokens)
+            self.training_metrics['api_output_tokens_by_epoch'].append(epoch_output_tokens)
             
             # Track cache statistics for this epoch
             epoch_api_calls = self.cache_stats['api_calls'] - epoch_start_api_calls
@@ -2719,10 +2970,33 @@ class RLAIFTrainer:
             total_train_time = sum(epoch_train_times) if epoch_train_times else 0.0
             
             total_gen_tokens = sum(epoch_gen_tokens) if epoch_gen_tokens else 0
+            total_gen_tokens_raw = sum(epoch_gen_tokens_raw) if epoch_gen_tokens_raw else 0
+            total_gen_samples_raw = sum(epoch_gen_samples_raw) if epoch_gen_samples_raw else 0
+            total_gen_samples_kept = sum(epoch_gen_samples_kept) if epoch_gen_samples_kept else 0
             total_train_tokens = sum(epoch_train_tokens) if epoch_train_tokens else 0
-            total_reward_tokens = sum(epoch_reward_tokens) if epoch_reward_tokens else 0
+            total_reward_input_tokens = sum(epoch_reward_tokens) if epoch_reward_tokens else 0
+            total_reward_output_tokens = sum(epoch_reward_output_tokens) if epoch_reward_output_tokens else 0
             
+            # Calculate average token size generated (output tokens per sample)
+            num_samples = len(epoch_rewards) if epoch_rewards else 1
+            avg_tokens_per_sample = total_gen_tokens / num_samples if num_samples > 0 else 0.0
+            avg_tokens_per_sample_raw = total_gen_tokens_raw / num_samples if num_samples > 0 else 0.0
+
+            # Average tokens/sample measured over actual generated samples (raw/kept)
+            avg_tok_per_gen_sample_raw = (total_gen_tokens_raw / total_gen_samples_raw) if total_gen_samples_raw > 0 else 0.0
+            avg_tok_per_gen_sample_kept = (total_gen_tokens / total_gen_samples_kept) if total_gen_samples_kept > 0 else 0.0
+
+            # Avg-per-sample tok/s across the epoch (raw vs kept)
+            avg_gen_sample_tps_raw = float(np.mean(epoch_gen_sample_tps_raw)) if epoch_gen_sample_tps_raw else 0.0
+            avg_gen_sample_tps_kept = float(np.mean(epoch_gen_sample_tps_kept)) if epoch_gen_sample_tps_kept else 0.0
+            
+            # Generation throughput:
+            # - raw: all sampled tokens / gen_time  (true MLX throughput)
+            # - kept: post-dedup tokens / gen_time  (effective training yield)
+            avg_gen_tokens_per_sec_raw = total_gen_tokens_raw / total_gen_time if total_gen_time > 0 else 0.0
             avg_gen_tokens_per_sec = total_gen_tokens / total_gen_time if total_gen_time > 0 else 0.0
+            # For scoring, calculate tokens/sec using total tokens (input + output)
+            total_reward_tokens = total_reward_input_tokens + total_reward_output_tokens
             avg_reward_tokens_per_sec = total_reward_tokens / total_reward_time if total_reward_time > 0 else 0.0
             avg_train_tokens_per_sec = total_train_tokens / total_train_time if total_train_time > 0 else 0.0
             
@@ -2731,45 +3005,84 @@ class RLAIFTrainer:
             avg_reward_latency = np.mean(epoch_reward_times) if epoch_reward_times else 0.0
             avg_train_latency = np.mean(epoch_train_times) if epoch_train_times else 0.0
             
+            # Calculate total epoch time
+            epoch_total_time = time.time() - epoch_start_time
+            epoch_total_time_minutes = epoch_total_time / 60.0
+            epoch_total_time_str = f"{epoch_total_time_minutes:.1f} min" if epoch_total_time_minutes >= 1.0 else f"{epoch_total_time:.1f} sec"
+            
+            # Calculate trainable parameter count
+            trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            total_params = sum(p.numel() for p in self.model.parameters())
+            trainable_percentage = (trainable_params / total_params * 100) if total_params > 0 else 0.0
+            
+            # Format parameter counts
+            if trainable_params >= 1e9:
+                trainable_str = f"{trainable_params / 1e9:.2f}B"
+            elif trainable_params >= 1e6:
+                trainable_str = f"{trainable_params / 1e6:.2f}M"
+            elif trainable_params >= 1e3:
+                trainable_str = f"{trainable_params / 1e3:.2f}K"
+            else:
+                trainable_str = f"{trainable_params:,}"
+            
             logger.info(
                 f"Epoch {epoch + 1} Summary:\n"
+                f"  Total Time: {epoch_total_time_str} ({epoch_total_time:.1f}s)\n"
                 f"  Average Reward: {avg_epoch_reward:.4f}\n"
                 f"  Average Loss: {avg_epoch_loss:.4f}\n"
                 f"  Total Samples: {len(epoch_rewards)}\n"
-                f"  API Usage: {epoch_tokens:,} tokens ({epoch_api_calls:,} calls, {epoch_cache_hits:,} cache hits, {cache_hit_rate:.1f}% hit rate)\n"
+                f"  Trainable Parameters: {trainable_str} ({trainable_percentage:.2f}% of {total_params:,} total)\n"
+                f"  API Usage: {epoch_input_tokens:,} input tokens, {epoch_output_tokens:,} output tokens ({epoch_api_calls:,} calls, {epoch_cache_hits:,} cache hits, {cache_hit_rate:.1f}% hit rate)\n"
                 f"  Code Diversity: {code_diversity['unique_ratio']:.1%} unique ({code_diversity['unique_count']}/{code_diversity['total_count']}), avg similarity: {code_diversity['avg_similarity']:.3f}\n"
                 f"  Errors: Generation: {epoch_gen_errors}, Scoring: {epoch_scoring_errors}\n"
                 f"  Performance:\n"
-                f"    Generation: {avg_gen_tokens_per_sec:.1f} tokens/sec (avg latency: {avg_gen_latency:.3f}s, total tokens: {total_gen_tokens:,})\n"
-                f"    Scoring: {avg_reward_tokens_per_sec:.1f} tokens/sec (avg latency: {avg_reward_latency:.3f}s, total tokens: {total_reward_tokens:,})\n"
-                f"    Training: {avg_train_tokens_per_sec:.1f} tokens/sec (avg latency: {avg_train_latency:.3f}s, total tokens: {total_train_tokens:,})"
+                f"    Generation: raw {avg_gen_tokens_per_sec_raw:.1f} tok/s ({total_gen_tokens_raw:,} tokens) | "
+                f"kept {avg_gen_tokens_per_sec:.1f} tok/s ({total_gen_tokens:,} tokens)\n"
+                f"      samples: raw={total_gen_samples_raw} kept={total_gen_samples_kept} | "
+                f"avg tok/sample: raw={avg_tok_per_gen_sample_raw:.1f} kept={avg_tok_per_gen_sample_kept:.1f}\n"
+                f"      avg-per-sample tok/s: raw={avg_gen_sample_tps_raw:.1f} kept={avg_gen_sample_tps_kept:.1f} | "
+                f"(avg batch latency: {avg_gen_latency:.3f}s)\n"
+                f"    Scoring: {avg_reward_tokens_per_sec:.1f} tokens/sec (avg latency: {avg_reward_latency:.3f}s, input: {total_reward_input_tokens:,}, output: {total_reward_output_tokens:,})\n"
+                f"    Training: {avg_train_tokens_per_sec:.1f} tokens/sec (avg latency: {avg_train_latency:.3f}s, total input sequence tokens: {total_train_tokens:,})"
             )
+
+            # After reporting this epoch, roll epoch hashes into global hashes so the next epoch
+            # treats repeats as “seen before” and triggers novelty retries during generation.
+            if hasattr(self, "_epoch_code_hashes") and hasattr(self, "_global_code_hashes"):
+                self._global_code_hashes.update(self._epoch_code_hashes)
             
             if self.writer:
                 # Core epoch metrics
-                self.writer.add_scalar('Epoch/AvgReward', avg_epoch_reward, epoch)
-                self.writer.add_scalar('Epoch/AvgLoss', avg_epoch_loss, epoch)
-                self.writer.add_scalar('Epoch/RewardVariance', reward_variance, epoch)
-                self.writer.add_scalar('Epoch/APITokens', epoch_tokens, epoch)
-                self.writer.add_scalar('Epoch/APICalls', epoch_api_calls, epoch)
-                self.writer.add_scalar('Epoch/CacheHits', epoch_cache_hits, epoch)
-                self.writer.add_scalar('Epoch/CacheHitRate', cache_hit_rate, epoch)
-                self.writer.add_scalar('Epoch/NumSamples', len(epoch_rewards), epoch)
-                self.writer.add_scalar('Epoch/CodeDiversity_UniqueRatio', code_diversity['unique_ratio'], epoch)
-                self.writer.add_scalar('Epoch/CodeDiversity_AvgSimilarity', code_diversity['avg_similarity'], epoch)
-                self.writer.add_scalar('Epoch/GenerationErrors', epoch_gen_errors, epoch)
-                self.writer.add_scalar('Epoch/ScoringErrors', epoch_scoring_errors, epoch)
+                self.writer.add_scalar('AvgReward/Epoch', avg_epoch_reward, epoch)
+                self.writer.add_scalar('AvgLoss/Epoch', avg_epoch_loss, epoch)
+                self.writer.add_scalar('RewardVariance/Epoch', reward_variance, epoch)
+                # API tokens: track input (sent) and output (received) separately
+                self.writer.add_scalar('APITokens/Epoch', epoch_input_tokens, epoch)
+                self.writer.add_scalar('APIOutputTokens/Epoch', epoch_output_tokens, epoch)
+                self.writer.add_scalar('APICalls/Epoch', epoch_api_calls, epoch)
+                self.writer.add_scalar('CacheHits/Epoch', epoch_cache_hits, epoch)
+                self.writer.add_scalar('CacheHitRate/Epoch', cache_hit_rate, epoch)
+                self.writer.add_scalar('NumSamples/Epoch', len(epoch_rewards), epoch)
+                self.writer.add_scalar('CodeDiversity_UniqueRatio/Epoch', code_diversity['unique_ratio'], epoch)
+                self.writer.add_scalar('CodeDiversity_AvgSimilarity/Epoch', code_diversity['avg_similarity'], epoch)
+                self.writer.add_scalar('GenerationErrors/Epoch', epoch_gen_errors, epoch)
+                self.writer.add_scalar('ScoringErrors/Epoch', epoch_scoring_errors, epoch)
+                # Generation tokens: raw vs kept (post-dedup)
+                self.writer.add_scalar('GenerationTokens_Raw/Epoch', total_gen_tokens_raw, epoch)
+                self.writer.add_scalar('GenerationTokens_Kept/Epoch', total_gen_tokens, epoch)
+                self.writer.add_scalar('GenerationTokensPerSec_Raw/Epoch', avg_gen_tokens_per_sec_raw, epoch)
+                self.writer.add_scalar('GenerationTokensPerSec_Kept/Epoch', avg_gen_tokens_per_sec, epoch)
                 
                 # Trend metrics
                 if len(self.training_metrics['reward_by_epoch']) > 1:
-                    self.writer.add_scalar('Epoch/RewardTrend', reward_trend, epoch)
-                    self.writer.add_scalar('Epoch/LossTrend', loss_trend, epoch)
+                    self.writer.add_scalar('RewardTrend/Epoch', reward_trend, epoch)
+                    self.writer.add_scalar('LossTrend/Epoch', loss_trend, epoch)
                 
                 # Scoring breakdown by criterion
-                self.writer.add_scalar('Scoring/Correctness', epoch_scoring_breakdown_avg['correctness'], epoch)
-                self.writer.add_scalar('Scoring/CodeQuality', epoch_scoring_breakdown_avg['code_quality'], epoch)
-                self.writer.add_scalar('Scoring/Efficiency', epoch_scoring_breakdown_avg['efficiency'], epoch)
-                self.writer.add_scalar('Scoring/Documentation', epoch_scoring_breakdown_avg['documentation'], epoch)
+                self.writer.add_scalar('Scoring_Correctness/Epoch', epoch_scoring_breakdown_avg['correctness'], epoch)
+                self.writer.add_scalar('Scoring_CodeQuality/Epoch', epoch_scoring_breakdown_avg['code_quality'], epoch)
+                self.writer.add_scalar('Scoring_Efficiency/Epoch', epoch_scoring_breakdown_avg['efficiency'], epoch)
+                self.writer.add_scalar('Scoring_Documentation/Epoch', epoch_scoring_breakdown_avg['documentation'], epoch)
                 
                 # Performance metrics (average for this epoch)
                 gen_speeds = self.training_metrics['generation_tokens_per_sec']
@@ -2783,14 +3096,14 @@ class RLAIFTrainer:
                     # For now, we'll log the overall average and update it each epoch
                     avg_gen_speed = np.mean(gen_speeds)
                     p99_gen_speed = np.percentile(gen_speeds, 99) if len(gen_speeds) > 0 else 0
-                    self.writer.add_scalar('Performance/Generation_AvgTokensPerSec', avg_gen_speed, epoch)
-                    self.writer.add_scalar('Performance/Generation_P99TokensPerSec', p99_gen_speed, epoch)
+                    self.writer.add_scalar('Generation_AvgTokensPerSec/Epoch', avg_gen_speed, epoch)
+                    self.writer.add_scalar('Generation_P99TokensPerSec/Epoch', p99_gen_speed, epoch)
                 
                 if backprop_speeds:
                     avg_backprop_speed = np.mean(backprop_speeds)
                     p99_backprop_speed = np.percentile(backprop_speeds, 99) if len(backprop_speeds) > 0 else 0
-                    self.writer.add_scalar('Performance/Backprop_AvgTokensPerSec', avg_backprop_speed, epoch)
-                    self.writer.add_scalar('Performance/Backprop_P99TokensPerSec', p99_backprop_speed, epoch)
+                    self.writer.add_scalar('Backprop_AvgTokensPerSec/Epoch', avg_backprop_speed, epoch)
+                    self.writer.add_scalar('Backprop_P99TokensPerSec/Epoch', p99_backprop_speed, epoch)
         
         # Record training end time
         self.training_metrics['training_end_time'] = time.time()
@@ -3759,6 +4072,9 @@ def load_config(config_path: str) -> Tuple[RLAIFConfig, dict]:
         dataset_output_dir=config_dict.get('huggingface', {}).get('dataset_output_dir', './datasets'),
         use_mlx_for_generation=to_bool(hardware_cfg.get('use_mlx_for_generation'), True),  # Default to True for better performance
         mlx_model_path=hardware_cfg.get('mlx_model_path', None),
+        use_unsloth=to_bool(hardware_cfg.get('use_unsloth'), False),
+        unsloth_dtype=hardware_cfg.get('unsloth_dtype', 'bf16'),
+        unsloth_max_seq_length=to_int(hardware_cfg.get('unsloth_max_seq_length'), None),
     )
     
     return rlaif_config, data_cfg
@@ -3804,6 +4120,11 @@ Examples:
         type=str,
         help='Path to evaluation data file (overrides config)'
     )
+    parser.add_argument(
+        '--debug',
+        action='store_true',
+        help='Enable DEBUG logging (including HTTP request logs)'
+    )
     
     args = parser.parse_args()
     
@@ -3814,17 +4135,13 @@ Examples:
     if args.model:
         config.base_model = args.model
         logger.info(f"Using model from command line: {config.base_model}")
+
+    # Enable debug logging if requested
+    if args.debug:
+        config.log_level = "DEBUG"
     
     # Setup logging level
     logging.getLogger().setLevel(getattr(logging, config.log_level))
-    
-    # Suppress httpx HTTP request logs unless in DEBUG mode
-    # httpx logs every HTTP request at INFO level, which is too verbose for training
-    httpx_logger = logging.getLogger("httpx")
-    if config.log_level.upper() == "DEBUG":
-        httpx_logger.setLevel(logging.INFO)  # Show HTTP requests in DEBUG mode
-    else:
-        httpx_logger.setLevel(logging.WARNING)  # Suppress HTTP requests in INFO/WARNING mode
     
     # Suppress httpx HTTP request logs unless in DEBUG mode
     # httpx logs every HTTP request at INFO level, which is too verbose for training
