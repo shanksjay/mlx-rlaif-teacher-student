@@ -1,0 +1,11 @@
+#
+# Optional dependencies for NVIDIA/CUDA runs (Unsloth).
+#
+# Keep this separate from `requirements.txt` so Apple Silicon (macOS/MPS/MLX)
+# installs stay clean and don't fail on CUDA-only wheels.
+#
+# Usage (on the NVIDIA box):
+#   uv pip install -r requirements.txt -r requirements-cuda.txt
+#
+unsloth
+

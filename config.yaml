@@ -96,6 +96,12 @@ hardware:
   mlx_model_path: null  # Path to MLX model (e.g., "./mlx_model/q8", "./mlx_model/q4", "./mlx_model/base")
                          # If null, will auto-detect from: ./mlx_model/q8, ./mlx_model/q4, ./mlx_model/base
 
+  # NVIDIA / CUDA Configuration (for comparison runs on a Linux/Windows box w/ NVIDIA GPU)
+  # Unsloth only works on CUDA. On Apple Silicon it will be ignored automatically.
+  use_unsloth: false  # Enable Unsloth-optimized loading/training/generation on CUDA
+  unsloth_dtype: "bf16"  # "bf16" (recommended on newer GPUs) or "fp16"
+  unsloth_max_seq_length: null  # If null, uses model.max_length
+
 # Hugging Face Upload Configuration
 huggingface:
   upload_to_hub: false  # Set to true to upload model to Hugging Face
