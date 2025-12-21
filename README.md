@@ -112,7 +112,7 @@ uv run python scripts/training/train_rlaif.py --config config.yaml
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                    RLAIF Training Pipeline                       │
+│                    RLAIF Training Pipeline                      │
 └─────────────────────────────────────────────────────────────────┘
 
 1. Data Preparation
@@ -225,6 +225,30 @@ Edit `config.yaml` to customize training:
 - **Training**: Batch size, learning rate, epochs, etc.
 - **RLAIF**: Reward weights, KL penalty, sampling parameters
 - **Hardware**: MPS settings for M5 MacBook, MLX configuration
+- **Logging**: TensorBoard + **offline JSONL summaries** (`logging.save_json_summaries`, `logging.json_summaries_dir`)
+
+### Checkpoints (epoch/batch tagging + baseline gain)
+
+By default, checkpoints are saved using `training.save_steps`, but if you use **large gradient accumulation**, `global_step` may advance slowly. This repo adds **epoch/batch-based checkpointing** so you always get more frequent checkpoints.
+
+Config keys:
+
+- `training.save_every_epochs`: save at end of each epoch (recommended: `1`)
+- `training.save_every_batches`: save every N batches (set `0` to disable)
+- `training.save_total_limit`: keep only the most recent N checkpoints (best-effort)
+- `logging.baseline_eval_batches`: compute a pre-training baseline reward on the first N batches (set `0` to disable)
+
+Checkpoint folder names include context to avoid overwriting `checkpoint-0`, e.g.:
+
+- `checkpoint-e2-end-gs1`
+- `checkpoint-e2-b10-gs1`
+- `checkpoint-gs500-e3-b12`
+- `checkpoint-final-gs7`
+
+Each checkpoint directory includes:
+
+- `training_stats.json`: rolling trainer stats
+- `checkpoint_summary.json`: epoch/batch/global_step + **baseline_reward** + **reward_gain_from_baseline** (when available)
 
 ## Usage
 
@@ -284,6 +308,11 @@ PYTHONWARNINGS=ignore::UserWarning uv run tensorboard --logdir ./logs/tensorboar
 ```
 
 Then open http://localhost:6006 in your browser.
+
+For offline analysis (batch-by-batch and epoch-by-epoch), enable JSON summaries in `config.yaml` and read:
+
+- `./logs/json_summaries/batches.jsonl`
+- `./logs/json_summaries/epochs.jsonl`
 
 ## Data Format
 
@@ -385,6 +414,31 @@ System metrics are logged:
    - Navigate to `http://localhost:6006`
    - Select metrics from the left sidebar
    - Use the time range selector to focus on specific epochs
+
+### Offline JSON summaries (batch + epoch)
+
+If you want to analyze results offline (or diff runs across machines), enable:
+
+- `logging.save_json_summaries: true`
+- `logging.json_summaries_dir: ./logs/json_summaries`
+
+This will write:
+
+- `./logs/json_summaries/batches.jsonl`
+- `./logs/json_summaries/epochs.jsonl`
+
+View as a time series (and optionally export CSV):
+
+```bash
+# Last 20 batches
+uv run python scripts/visualization/view_json_summaries.py --dir ./logs/json_summaries --type batch --tail 20
+
+# All epochs
+uv run python scripts/visualization/view_json_summaries.py --dir ./logs/json_summaries --type epoch --tail 0
+
+# Export batches to CSV
+uv run python scripts/visualization/view_json_summaries.py --dir ./logs/json_summaries --type batch --csv-out ./logs/json_summaries/batches.csv
+```
 
 ### Key Metrics to Monitor
 

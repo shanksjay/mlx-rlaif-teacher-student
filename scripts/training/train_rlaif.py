@@ -85,6 +85,8 @@ class RLAIFConfig:
     save_steps: int
     eval_steps: int
     logging_steps: int
+    save_every_epochs: int = 1
+    save_every_batches: int = 0
     max_grad_norm: float
     weight_decay: float
     lr_scheduler_type: str
@@ -98,6 +100,10 @@ class RLAIFConfig:
     mixed_precision: str
     tensorboard_dir: str
     log_level: str
+    save_json_summaries: bool = True
+    json_summaries_dir: str = "./logs/json_summaries"
+    baseline_eval_batches: int = 1
+    tensorboard_batch_interval: int = 1
     top_k: int = 50
     top_p: float = 0.95
     generation_temperature: float = 0.8  # Temperature for generation (higher = more exploration)
@@ -309,6 +315,14 @@ class TeacherModel:
                     return response.content[0].text.strip()
             
             except Exception as e:
+                # Count teacher API failures as scoring/generation errors in trainer stats.
+                # (These errors were previously swallowed, which made epoch summaries misleading.)
+                try:
+                    if hasattr(self, '_trainer_ref') and self._trainer_ref:
+                        self._trainer_ref.error_stats['teacher_generate_errors'] += 1
+                        self._trainer_ref.error_stats['scoring_errors'] += 1
+                except Exception:
+                    pass
                 error_str = str(e)
                 if "404" in error_str or "not_found" in error_str.lower():
                     logger.error(f"Error: Model '{self.model_name}' not found. This may be due to:")
@@ -423,6 +437,14 @@ IMPORTANT: Respond with ONLY a single float between 0.0 and 1.0 (e.g., 0.75). Do
                     return 0.5
             
             except Exception as e:
+                # Count teacher scoring API failures so epoch summary reflects reality.
+                # We still return a default score so training can continue, but we must record the failure.
+                try:
+                    if hasattr(self, '_trainer_ref') and self._trainer_ref:
+                        self._trainer_ref.error_stats['teacher_scoring_errors'] += 1
+                        self._trainer_ref.error_stats['scoring_errors'] += 1
+                except Exception:
+                    pass
                 error_str = str(e)
                 if "404" in error_str or "not_found" in error_str.lower():
                     logger.error(f"Error: Model '{self.model_name}' not found when scoring code.")
@@ -435,11 +457,102 @@ IMPORTANT: Respond with ONLY a single float between 0.0 and 1.0 (e.g., 0.75). Do
 class RLAIFTrainer:
     """RLAIF Trainer implementing teacher-student training"""
     
+    def _init_json_summaries(self):
+        """Initialize JSONL summary files for offline analysis."""
+        try:
+            if not getattr(self.config, "save_json_summaries", True):
+                return
+            out_dir = getattr(self.config, "json_summaries_dir", "./logs/json_summaries") or "./logs/json_summaries"
+            os.makedirs(out_dir, exist_ok=True)
+            self._json_summaries_dir = out_dir
+            self._batch_jsonl_path = os.path.join(out_dir, "batches.jsonl")
+            self._epoch_jsonl_path = os.path.join(out_dir, "epochs.jsonl")
+            logger.info(f"JSON summaries enabled -> {out_dir}")
+        except Exception as e:
+            logger.warning(f"Failed to initialize JSON summaries: {e}")
+            self._json_summaries_dir = None
+            self._batch_jsonl_path = None
+            self._epoch_jsonl_path = None
+
+    def _append_jsonl(self, path: Optional[str], payload: Dict):
+        """Append a single JSON record to a JSONL file."""
+        if not path:
+            return
+        try:
+            payload = dict(payload)
+            payload.setdefault("ts_unix", time.time())
+            payload.setdefault("ts_iso", datetime.utcnow().isoformat() + "Z")
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception as e:
+            logger.debug(f"Failed to write JSONL to {path}: {e}")
+
+    def _log_batch_json(self, payload: Dict):
+        if getattr(self.config, "save_json_summaries", True):
+            self._append_jsonl(self._batch_jsonl_path, payload)
+
+    def _log_epoch_json(self, payload: Dict):
+        if getattr(self.config, "save_json_summaries", True):
+            self._append_jsonl(self._epoch_jsonl_path, payload)
+
+    def _compute_baseline_reward(self, train_loader: DataLoader) -> float:
+        """Compute a pre-training baseline reward (no weight updates).
+        
+        Uses the first N batches (config.logging.baseline_eval_batches) to estimate baseline quality.
+        """
+        n_batches = int(getattr(self.config, "baseline_eval_batches", 0) or 0)
+        if n_batches <= 0:
+            return 0.0
+
+        logger.info(f"Computing baseline reward on first {n_batches} batch(es) (no training updates)...")
+        all_rewards: List[float] = []
+
+        # Snapshot caches to avoid polluting training caches too much
+        old_cache = dict(self.teacher_score_cache) if hasattr(self, "teacher_score_cache") else {}
+        try:
+            it = iter(train_loader)
+            for bi in range(n_batches):
+                try:
+                    batch = next(it)
+                except StopIteration:
+                    break
+                prompts = batch.get("prompt")
+                languages = batch.get("language")
+                if not prompts or not languages:
+                    continue
+                try:
+                    samples = self.generate_student_samples(prompts, languages, num_samples=self.config.num_samples_per_prompt, epoch=0)
+                    if samples:
+                        rewards, _ = self.compute_rewards(samples, save_to_dataset=False)
+                        if rewards:
+                            all_rewards.extend([float(r) for r in rewards])
+                except Exception as e:
+                    logger.warning(f"Baseline batch {bi} failed: {e}")
+                    continue
+        finally:
+            # Restore cache and let epoch logic manage fresh scoring
+            try:
+                self.teacher_score_cache = old_cache
+            except Exception:
+                pass
+
+        baseline = float(np.mean(all_rewards)) if all_rewards else 0.0
+        logger.info(f"Baseline reward: {baseline:.4f} (computed from {len(all_rewards)} samples)")
+        return baseline
+    
     def __init__(self, config: RLAIFConfig):
         self.config = config
         self.device = self._setup_device()
         self._unsloth_enabled = False
         self._unsloth_flm = None  # set to unsloth.FastLanguageModel when available
+        self._json_summaries_dir = None
+        self._batch_jsonl_path = None
+        self._epoch_jsonl_path = None
+        self._init_json_summaries()
+        self.baseline_reward = None
+        self._prev_batch_avg_reward = None
+        self._reward_ema = None  # exponential moving average of batch avg reward
+        self._batch_step = 0  # monotonic batch counter for continuous TensorBoard time series
         
         # Load model and tokenizer
         logger.info(f"Loading base model: {config.base_model}")
@@ -909,17 +1022,30 @@ class RLAIFTrainer:
         
         # Cache statistics
         self.cache_stats = {
-            'api_calls': 0,      # Total API calls made
-            'cache_hits': 0,     # Total cache hits
-            'cache_misses': 0,   # Total cache misses
+            # Teacher reference generation (teacher.generate) caching
+            'teacher_gen_calls': 0,
+            'teacher_gen_cache_hits': 0,
+            # Teacher scoring (teacher.score_code) caching (trainer-level)
+            'teacher_score_calls': 0,
+            'teacher_score_cache_hits': 0,
+            # Back-compat / aggregated counters (legacy)
+            'api_calls': 0,      # historically used for teacher generation calls
+            'cache_hits': 0,     # historically used for teacher generation cache hits
+            'cache_misses': 0,   # historically used for teacher generation cache misses
         }
         
         # Error statistics
         self.error_stats = {
             'generation_errors': 0,      # Errors during student generation
-            'scoring_errors': 0,         # Errors during teacher API scoring
+            # Back-compat aggregate: total teacher API failures (generate + score) and any reward-thread scoring failures
+            'scoring_errors': 0,
+            # Split counters (requested)
+            'teacher_generate_errors': 0,
+            'teacher_scoring_errors': 0,
             'generation_errors_by_epoch': [],  # Generation errors per epoch
             'scoring_errors_by_epoch': [],     # Scoring errors per epoch
+            'teacher_generate_errors_by_epoch': [],
+            'teacher_scoring_errors_by_epoch': [],
         }
         if config.use_unsloth and config.use_mlx_for_generation:
             logger.info("Unsloth enabled; skipping MLX generation (MLX is Apple Silicon only).")
@@ -1506,9 +1632,12 @@ class RLAIFTrainer:
         cache_key = f"{prompt}:{language}"
         if cache_key not in self.teacher_cache:
             self.teacher_cache[cache_key] = self.teacher.generate(prompt, language)
+            # teacher reference generation call
+            self.cache_stats['teacher_gen_calls'] += 1
+            self.cache_stats['api_calls'] += 1  # legacy
             self.cache_stats['cache_misses'] += 1
-            self.cache_stats['api_calls'] += 1
         else:
+            self.cache_stats['teacher_gen_cache_hits'] += 1
             self.cache_stats['cache_hits'] += 1
         return self.teacher_cache[cache_key]
     
@@ -1525,7 +1654,9 @@ class RLAIFTrainer:
             student_code_key = f"{sample['code']}:{sample['prompt']}:{sample['language']}"
             if student_code_key in self.teacher_score_cache:
                 student_score = self.teacher_score_cache[student_code_key]
+                self.cache_stats['teacher_score_cache_hits'] += 1
             else:
+                self.cache_stats['teacher_score_calls'] += 1
                 student_score = self.teacher.score_code(
                     sample['code'],
                     sample['prompt'],
@@ -1539,7 +1670,9 @@ class RLAIFTrainer:
             teacher_code_key = f"TEACHER_CODE:{teacher_code}:{sample['prompt']}:{sample['language']}"
             if teacher_code_key in self.teacher_score_cache:
                 teacher_score = self.teacher_score_cache[teacher_code_key]
+                self.cache_stats['teacher_score_cache_hits'] += 1
             else:
+                self.cache_stats['teacher_score_calls'] += 1
                 teacher_score = self.teacher.score_code(
                     teacher_code,
                     sample['prompt'],
@@ -1746,10 +1879,12 @@ class RLAIFTrainer:
                     if save_to_dataset and dataset_entry:
                         dataset_entries.append(dataset_entry)
                 except TimeoutError:
+                    self.error_stats['teacher_scoring_errors'] += 1
                     self.error_stats['scoring_errors'] += 1
                     logger.warning("Reward computation timed out, using default reward")
                     rewards.append(0.5)  # Default reward on timeout
                 except Exception as e:
+                    self.error_stats['teacher_scoring_errors'] += 1
                     self.error_stats['scoring_errors'] += 1
                     logger.warning(f"Error getting reward result: {e}")
                     rewards.append(0.5)  # Default reward on error
@@ -2388,6 +2523,22 @@ class RLAIFTrainer:
             prefetch_factor=2 if num_workers > 0 else None,  # Prefetch for faster data loading
             drop_last=False  # Keep all batches
         )
+
+        # Compute baseline reward once (pre-training) for "gain vs baseline" checkpoint tagging
+        if self.baseline_reward is None and int(getattr(self.config, "baseline_eval_batches", 0) or 0) > 0:
+            try:
+                self.baseline_reward = self._compute_baseline_reward(train_loader)
+                # Persist baseline to output dir for offline reference
+                try:
+                    out_dir = Path(self.config.output_dir)
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    with open(out_dir / "baseline_reward.json", "w", encoding="utf-8") as f:
+                        json.dump({"baseline_reward": float(self.baseline_reward), "ts_iso": datetime.utcnow().isoformat() + "Z"}, f, indent=2)
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.warning(f"Failed to compute baseline reward: {e}")
+                self.baseline_reward = 0.0
         
         # Log training configuration
         logger.info(f"Training configuration:")
@@ -2442,19 +2593,18 @@ class RLAIFTrainer:
             
             # Track API tokens at start of epoch
             epoch_start_api_tokens = self.training_metrics['api_tokens_sent']
-            epoch_start_api_calls = self.cache_stats['api_calls']
-            epoch_start_cache_hits = self.cache_stats['cache_hits']
+            # Track teacher call/caching stats at start of epoch
+            epoch_start_teacher_gen_calls = self.cache_stats.get('teacher_gen_calls', 0)
+            epoch_start_teacher_gen_cache_hits = self.cache_stats.get('teacher_gen_cache_hits', 0)
+            epoch_start_teacher_score_calls = self.cache_stats.get('teacher_score_calls', 0)
+            epoch_start_teacher_score_cache_hits = self.cache_stats.get('teacher_score_cache_hits', 0)
             epoch_start_gen_errors = self.error_stats['generation_errors']
             epoch_start_scoring_errors = self.error_stats['scoring_errors']
-            
-            # Track API tokens at start of epoch
-            epoch_start_api_tokens = self.training_metrics['api_tokens_sent']
-            epoch_start_api_calls = self.cache_stats['api_calls']
-            epoch_start_cache_hits = self.cache_stats['cache_hits']
-            epoch_start_gen_errors = self.error_stats['generation_errors']
-            epoch_start_scoring_errors = self.error_stats['scoring_errors']
+            epoch_start_teacher_generate_errors = self.error_stats.get('teacher_generate_errors', 0)
+            epoch_start_teacher_scoring_errors = self.error_stats.get('teacher_scoring_errors', 0)
             
             epoch_rewards = []
+            epoch_best_reward_per_prompt = []  # per-batch: avg(max reward per prompt)
             epoch_losses = []
             epoch_generated_codes = []  # Track all generated code for diversity analysis
             
@@ -2635,6 +2785,11 @@ class RLAIFTrainer:
                 # Track API tokens before reward computation (both input and output)
                 api_input_tokens_before = self.training_metrics['api_tokens_sent']
                 api_output_tokens_before = self.training_metrics['api_tokens_received']
+                # Track teacher call deltas for this batch
+                teacher_gen_calls_before = int(self.cache_stats.get("teacher_gen_calls", 0))
+                teacher_gen_hits_before = int(self.cache_stats.get("teacher_gen_cache_hits", 0))
+                teacher_score_calls_before = int(self.cache_stats.get("teacher_score_calls", 0))
+                teacher_score_hits_before = int(self.cache_stats.get("teacher_score_cache_hits", 0))
                 reward_start = time.time()
                 
                 # Check if samples are empty before computing rewards
@@ -2663,6 +2818,12 @@ class RLAIFTrainer:
                     reward_api_input_tokens = api_input_tokens_after - api_input_tokens_before
                     reward_api_output_tokens = api_output_tokens_after - api_output_tokens_before
                     reward_tokens_per_sec = (reward_api_input_tokens + reward_api_output_tokens) / reward_time if reward_time > 0 else 0
+
+                    # Teacher call deltas for this batch
+                    teacher_gen_calls_batch = int(self.cache_stats.get("teacher_gen_calls", 0)) - teacher_gen_calls_before
+                    teacher_gen_hits_batch = int(self.cache_stats.get("teacher_gen_cache_hits", 0)) - teacher_gen_hits_before
+                    teacher_score_calls_batch = int(self.cache_stats.get("teacher_score_calls", 0)) - teacher_score_calls_before
+                    teacher_score_hits_batch = int(self.cache_stats.get("teacher_score_cache_hits", 0)) - teacher_score_hits_before
                     
                     # Track epoch-level metrics
                     epoch_reward_times.append(reward_time)
@@ -2678,6 +2839,22 @@ class RLAIFTrainer:
                             logger.debug(f"Batch {batch_idx}: {reward_api_tokens} API tokens used for scoring")
                     
                     epoch_rewards.extend(rewards)
+
+                    # Best-of-N per prompt (robust metric when you increase num_samples_per_prompt):
+                    # mean reward can drop as you add more exploratory samples, even if the best sample improves.
+                    try:
+                        best_by_prompt: Dict[str, float] = {}
+                        for s, r in zip(samples, rewards):
+                            p = s.get("prompt")
+                            if p is None:
+                                continue
+                            rr = float(r)
+                            if p not in best_by_prompt or rr > best_by_prompt[p]:
+                                best_by_prompt[p] = rr
+                        if best_by_prompt:
+                            epoch_best_reward_per_prompt.append(float(np.mean(list(best_by_prompt.values()))))
+                    except Exception:
+                        pass
                     
                     # Collect generated codes for diversity analysis
                     for sample in samples:
@@ -2730,6 +2907,57 @@ class RLAIFTrainer:
                             optimizer.zero_grad(set_to_none=True)
                             global_step += 1
 
+                            # Stats/logging/checkpointing should happen on optimizer steps (not only at epoch flush).
+                            if rewards and len(rewards) > 0:
+                                self.stats['step'] = global_step
+                                self.stats['total_reward'] += float(np.mean(rewards))
+                                self.stats['num_samples'] += int(len(rewards))
+                            if loss_dict and loss_dict.get('loss', 0.0) > 0:
+                                self.stats['total_loss'] += float(loss_dict.get('loss', 0.0))
+                            self.stats['avg_reward'] = self.stats['total_reward'] / max(1, self.stats.get('step', 1))
+                            self.stats['avg_loss'] = self.stats['total_loss'] / max(1, self.stats.get('step', 1))
+
+                            if global_step % self.config.logging_steps == 0:
+                                if loss_dict and rewards:
+                                    self._log_stats(global_step, loss_dict, rewards)
+
+                            # Standard step-based checkpoint (but make the dir name unique)
+                            if global_step % self.config.save_steps == 0:
+                                ckpt_name = f"checkpoint-gs{global_step}-e{epoch+1}-b{batch_idx}"
+                                self._save_checkpoint(
+                                    global_step,
+                                    checkpoint_name=ckpt_name,
+                                    summary={
+                                        "kind": "checkpoint",
+                                        "reason": "save_steps",
+                                        "epoch": int(epoch + 1),
+                                        "batch_idx": int(batch_idx),
+                                        "global_step": int(global_step),
+                                        "avg_reward": float(np.mean(epoch_rewards)) if epoch_rewards else float(np.mean(rewards)) if rewards else 0.0,
+                                        "avg_loss": float(np.mean(epoch_losses)) if epoch_losses else float(loss_dict.get("loss", 0.0)),
+                                    },
+                                )
+
+                    # Optional: batch-based checkpointing for long epochs (captures batch context)
+                    if int(getattr(self.config, "save_every_batches", 0) or 0) > 0:
+                        n = int(self.config.save_every_batches)
+                        if batch_idx > 0 and (batch_idx % n) == 0:
+                            avg_so_far = float(np.mean(epoch_rewards)) if epoch_rewards else 0.0
+                            ckpt_name = f"checkpoint-e{epoch+1}-b{batch_idx}-gs{global_step}"
+                            self._save_checkpoint(
+                                global_step,
+                                checkpoint_name=ckpt_name,
+                                summary={
+                                    "kind": "checkpoint",
+                                    "reason": "save_every_batches",
+                                    "epoch": int(epoch + 1),
+                                    "batch_idx": int(batch_idx),
+                                    "global_step": int(global_step),
+                                    "avg_reward": avg_so_far,
+                                    "avg_loss": float(np.mean(epoch_losses)) if epoch_losses else 0.0,
+                                },
+                            )
+
                             if global_step % 10 == 0:
                                 current_lr = scheduler.get_last_lr()[0] if hasattr(scheduler, 'get_last_lr') else self.config.learning_rate
                                 logger.debug(
@@ -2777,6 +3005,12 @@ class RLAIFTrainer:
                     
                     # Add cache status to scoring line if applicable
                     scoring_line = f"  Scoring: {reward_time_str} ({reward_time/batch_time*100:.1f}%), {reward_api_tokens:,} API tokens, {reward_tokens_per_sec:.1f} tokens/sec"
+                    # Split teacher call stats (generation vs scoring) for this batch if available
+                    if 'teacher_gen_calls_batch' in locals():
+                        scoring_line += (
+                            f" | TeacherGenCalls {int(teacher_gen_calls_batch)} (hits {int(teacher_gen_hits_batch)})"
+                            f" | TeacherScoreCalls {int(teacher_score_calls_batch)} (hits {int(teacher_score_hits_batch)})"
+                        )
                     # Check if samples exists (it should always exist at this point)
                     samples_len = len(samples) if 'samples' in locals() and samples is not None else 0
                     if reward_api_tokens == 0 and samples_len > 0:
@@ -2815,6 +3049,230 @@ class RLAIFTrainer:
                     elif train_time > batch_time * 0.5:
                         logger.warning(f"⚠️  Training step is the bottleneck ({train_time/batch_time*100:.1f}% of time)")
                         logger.info("  → Consider reducing batch_size or max_length")
+
+                # --- Offline JSON summaries (every batch) ---
+                try:
+                    gen_backend = "mlx" if (self.mlx_model is not None and self.mlx_tokenizer is not None) else ("unsloth" if self._unsloth_enabled else "pytorch")
+                    train_backend = "unsloth" if self._unsloth_enabled else "pytorch"
+                    batch_size_actual = len(batch.get('prompt', [])) if isinstance(batch, dict) else 0
+                    raw_samples = int(before_n) if 'before_n' in locals() else int(len(samples_all) if 'samples_all' in locals() else 0)
+                    kept_samples = int(after_n) if 'after_n' in locals() else int(len(samples) if 'samples' in locals() else 0)
+                    dup_filtered = max(0, raw_samples - kept_samples)
+                    diversity_ratio = (kept_samples / raw_samples) if raw_samples > 0 else 0.0
+
+                    # Avg-per-sample tok/s (mean over per-call tok/s if available)
+                    def _mean_sample_tps(sample_list):
+                        vals = []
+                        for s in (sample_list or []):
+                            ot = int(s.get('output_tokens', 0) or 0)
+                            ts = float(s.get('gen_seconds', 0.0) or 0.0)
+                            if ot > 0 and ts > 0:
+                                vals.append(ot / ts)
+                        return float(np.mean(vals)) if vals else 0.0
+
+                    raw_sample_tps = _mean_sample_tps(samples_all if 'samples_all' in locals() else [])
+                    kept_sample_tps = _mean_sample_tps(samples if 'samples' in locals() else [])
+
+                    reward_api_input_tokens = int(reward_api_input_tokens) if 'reward_api_input_tokens' in locals() else 0
+                    reward_api_output_tokens = int(reward_api_output_tokens) if 'reward_api_output_tokens' in locals() else 0
+                    reward_api_total_tokens = reward_api_input_tokens + reward_api_output_tokens
+
+                    rewards_mean = float(np.mean(rewards)) if rewards else 0.0
+                    rewards_min = float(np.min(rewards)) if rewards else 0.0
+                    rewards_max = float(np.max(rewards)) if rewards else 0.0
+                    rewards_var = float(np.var(rewards)) if rewards and len(rewards) > 1 else 0.0
+
+                    # Best-of-N per prompt (batch-level)
+                    best_by_prompt: Dict[str, float] = {}
+                    try:
+                        for s, r in zip((samples or []), (rewards or [])):
+                            p = s.get("prompt")
+                            if not p:
+                                continue
+                            rr = float(r)
+                            if p not in best_by_prompt or rr > best_by_prompt[p]:
+                                best_by_prompt[p] = rr
+                    except Exception:
+                        best_by_prompt = {}
+                    avg_best_per_prompt = float(np.mean(list(best_by_prompt.values()))) if best_by_prompt else None
+
+                    # Reward gain tracking (vs baseline and vs previous batch)
+                    baseline = float(self.baseline_reward) if self.baseline_reward is not None else 0.0
+                    gain_from_baseline = rewards_mean - baseline if self.baseline_reward is not None else 0.0
+                    prev = float(self._prev_batch_avg_reward) if self._prev_batch_avg_reward is not None else None
+                    gain_vs_prev = (rewards_mean - prev) if prev is not None else 0.0
+
+                    # EMA smoothing helps compare "improving with more samples" when batch reward is noisy.
+                    ema_alpha = 0.2
+                    if self._reward_ema is None:
+                        self._reward_ema = rewards_mean
+                    else:
+                        self._reward_ema = (1.0 - ema_alpha) * float(self._reward_ema) + ema_alpha * rewards_mean
+                    ema = float(self._reward_ema)
+                    ema_gain_from_baseline = (ema - baseline) if self.baseline_reward is not None else 0.0
+
+                    sysm = {}
+                    try:
+                        sysm = self._get_system_metrics() or {}
+                    except Exception:
+                        sysm = {}
+
+                    self._log_batch_json({
+                        "kind": "batch",
+                        "run_id": os.environ.get("RUN_ID") or None,
+                        "model": self.config.base_model,
+                        "device": str(self.device),
+                        "generation_backend": gen_backend,
+                        "training_backend": train_backend,
+                        "epoch": int(epoch + 1),
+                        "batch_idx": int(batch_idx),
+                        "global_step": int(global_step),
+                        "micro_step_in_epoch": int(micro_step_in_epoch),
+                        "batch_size": int(batch_size_actual),
+                        "timing_s": {
+                            "generation": float(gen_time),
+                            "scoring": float(reward_time),
+                            "training": float(train_time),
+                            "total": float(batch_time),
+                        },
+                        "tokens": {
+                            "gen_raw": int(raw_num_tokens) if 'raw_num_tokens' in locals() else 0,
+                            "gen_kept": int(num_tokens) if 'num_tokens' in locals() else 0,
+                            "train_input": int(train_num_tokens) if 'train_num_tokens' in locals() else 0,
+                            "scoring_api_input": int(reward_api_input_tokens),
+                            "scoring_api_output": int(reward_api_output_tokens),
+                            "scoring_api_total": int(reward_api_total_tokens),
+                        },
+                        "throughput_tok_s": {
+                            "gen_raw_overall": float(raw_tokens_per_sec) if 'raw_tokens_per_sec' in locals() else 0.0,
+                            "gen_kept_overall": float(tokens_per_sec) if 'tokens_per_sec' in locals() else 0.0,
+                            "gen_raw_avg_per_sample": float(raw_sample_tps),
+                            "gen_kept_avg_per_sample": float(kept_sample_tps),
+                            "scoring_api_total": float(reward_tokens_per_sec) if 'reward_tokens_per_sec' in locals() else 0.0,
+                            "training": float(train_tokens_per_sec) if 'train_tokens_per_sec' in locals() else 0.0,
+                        },
+                        "samples": {
+                            "raw": int(raw_samples),
+                            "kept": int(kept_samples),
+                            "dup_filtered": int(dup_filtered),
+                            "diversity_ratio": float(diversity_ratio),
+                            "avg_tok_per_sample_raw": float((raw_num_tokens / raw_samples) if raw_samples > 0 else 0.0) if 'raw_num_tokens' in locals() else 0.0,
+                            "avg_tok_per_sample_kept": float((num_tokens / kept_samples) if kept_samples > 0 else 0.0) if 'num_tokens' in locals() else 0.0,
+                        },
+                        "rewards": {
+                            "mean": rewards_mean,
+                            "min": rewards_min,
+                            "max": rewards_max,
+                            "var": rewards_var,
+                            "count": int(len(rewards)) if rewards else 0,
+                        },
+                        "rewards_best_of_n": {
+                            "n": int(self.config.num_samples_per_prompt),
+                            "avg_best_per_prompt": avg_best_per_prompt,
+                        },
+                        "reward_gain": {
+                            "baseline_reward": float(baseline) if self.baseline_reward is not None else None,
+                            "gain_from_baseline": float(gain_from_baseline) if self.baseline_reward is not None else None,
+                            "prev_batch_reward": float(prev) if prev is not None else None,
+                            "gain_vs_prev_batch": float(gain_vs_prev) if prev is not None else None,
+                            "ema_reward": float(ema),
+                            "ema_gain_from_baseline": float(ema_gain_from_baseline) if self.baseline_reward is not None else None,
+                            "ema_alpha": float(ema_alpha),
+                        },
+                        "loss": {
+                            "loss": float(loss_dict.get("loss", 0.0)) if isinstance(loss_dict, dict) else 0.0,
+                            "policy_loss": float(loss_dict.get("policy_loss", 0.0)) if isinstance(loss_dict, dict) else 0.0,
+                            "kl_penalty": float(loss_dict.get("kl_penalty", 0.0)) if isinstance(loss_dict, dict) else 0.0,
+                        },
+                        "cache": {
+                            "api_calls_total": int(self.cache_stats.get("api_calls", 0)),
+                            "cache_hits_total": int(self.cache_stats.get("cache_hits", 0)),
+                            "cache_misses_total": int(self.cache_stats.get("cache_misses", 0)),
+                        },
+                        "errors": {
+                            "generation_error_batch": bool(generation_error),
+                            "generation_errors_total": int(self.error_stats.get("generation_errors", 0)),
+                            "scoring_errors_total": int(self.error_stats.get("scoring_errors", 0)),
+                            "teacher_generate_errors_total": int(self.error_stats.get("teacher_generate_errors", 0)),
+                            "teacher_scoring_errors_total": int(self.error_stats.get("teacher_scoring_errors", 0)),
+                        },
+                        "system": sysm,
+                    })
+
+                    # Update previous batch reward after logging
+                    self._prev_batch_avg_reward = rewards_mean
+                except Exception:
+                    pass
+
+                # --- TensorBoard per-batch time series (continuous) ---
+                try:
+                    if self.writer:
+                        interval = int(getattr(self.config, "tensorboard_batch_interval", 1) or 1)
+                        if interval < 1:
+                            interval = 1
+                        # Increment batch step (monotonic) and log at the chosen interval.
+                        self._batch_step += 1
+                        if (self._batch_step % interval) == 0:
+                            bs = int(self._batch_step)
+                            # Safe defaults (some vars only exist if rewards/scoring ran)
+                            _teacher_in = float(reward_api_input_tokens) if 'reward_api_input_tokens' in locals() else 0.0
+                            _teacher_out = float(reward_api_output_tokens) if 'reward_api_output_tokens' in locals() else 0.0
+                            _gen_raw_tok = float(raw_num_tokens) if 'raw_num_tokens' in locals() else 0.0
+                            _gen_kept_tok = float(num_tokens) if 'num_tokens' in locals() else 0.0
+
+                            # Core reward signals
+                            self.writer.add_scalar("Batch/Reward_Mean", rewards_mean, bs)
+                            if avg_best_per_prompt is not None:
+                                self.writer.add_scalar("Batch/Reward_BestOfN_PerPrompt", float(avg_best_per_prompt), bs)
+                            if self.baseline_reward is not None:
+                                self.writer.add_scalar("Batch/Reward_GainFromBaseline", float(gain_from_baseline), bs)
+                                self.writer.add_scalar("Batch/Reward_EMA_GainFromBaseline", float(ema_gain_from_baseline), bs)
+                            self.writer.add_scalar("Batch/Reward_EMA", float(ema), bs)
+
+                            # Generation shape/efficiency
+                            self.writer.add_scalar("Batch/Gen_Samples_Raw", float(raw_samples), bs)
+                            self.writer.add_scalar("Batch/Gen_Samples_Kept", float(kept_samples), bs)
+                            self.writer.add_scalar("Batch/Gen_DiversityRatio", float(diversity_ratio), bs)
+                            self.writer.add_scalar("Batch/Gen_TokPerSample_Raw", float((_gen_raw_tok / raw_samples) if raw_samples > 0 else 0.0), bs)
+                            self.writer.add_scalar("Batch/Gen_TokPerSample_Kept", float((_gen_kept_tok / kept_samples) if kept_samples > 0 else 0.0), bs)
+                            self.writer.add_scalar("Batch/Gen_TokPerSec_RawOverall", float(raw_tokens_per_sec) if 'raw_tokens_per_sec' in locals() else 0.0, bs)
+                            self.writer.add_scalar("Batch/Gen_TokPerSec_KeptOverall", float(tokens_per_sec) if 'tokens_per_sec' in locals() else 0.0, bs)
+                            self.writer.add_scalar("Batch/Gen_TokPerSec_RawAvgPerSample", float(raw_sample_tps), bs)
+                            self.writer.add_scalar("Batch/Gen_TokPerSec_KeptAvgPerSample", float(kept_sample_tps), bs)
+
+                            # Phase times and throughput
+                            self.writer.add_scalar("Batch/Time_Generation_s", float(gen_time), bs)
+                            self.writer.add_scalar("Batch/Time_Scoring_s", float(reward_time), bs)
+                            self.writer.add_scalar("Batch/Time_Training_s", float(train_time), bs)
+                            self.writer.add_scalar("Batch/Time_Total_s", float(batch_time), bs)
+                            self.writer.add_scalar("Batch/Training_TokPerSec", float(train_tokens_per_sec) if 'train_tokens_per_sec' in locals() else 0.0, bs)
+                            self.writer.add_scalar("Batch/Scoring_TokPerSec_Total", float(reward_tokens_per_sec) if 'reward_tokens_per_sec' in locals() else 0.0, bs)
+
+                            # Teacher calls (per batch) + tokens
+                            if 'teacher_gen_calls_batch' in locals():
+                                self.writer.add_scalar("Batch/TeacherGenCalls", float(teacher_gen_calls_batch), bs)
+                                self.writer.add_scalar("Batch/TeacherGenCacheHits", float(teacher_gen_hits_batch), bs)
+                                self.writer.add_scalar("Batch/TeacherScoreCalls", float(teacher_score_calls_batch), bs)
+                                self.writer.add_scalar("Batch/TeacherScoreCacheHits", float(teacher_score_hits_batch), bs)
+                            self.writer.add_scalar("Batch/TeacherTokens_Input", _teacher_in, bs)
+                            self.writer.add_scalar("Batch/TeacherTokens_Output", _teacher_out, bs)
+
+                            # Training params trend (LR) if scheduler exists
+                            try:
+                                current_lr = scheduler.get_last_lr()[0] if hasattr(scheduler, "get_last_lr") else None
+                                if current_lr is not None:
+                                    self.writer.add_scalar("Batch/LR", float(current_lr), bs)
+                            except Exception:
+                                pass
+
+                            # Loss scalars (batch)
+                            if isinstance(loss_dict, dict):
+                                self.writer.add_scalar("Batch/Loss", float(loss_dict.get("loss", 0.0)), bs)
+                                self.writer.add_scalar("Batch/PolicyLoss", float(loss_dict.get("policy_loss", 0.0)), bs)
+                                self.writer.add_scalar("Batch/KLPenalty", float(loss_dict.get("kl_penalty", 0.0)), bs)
+                except Exception:
+                    # Never fail training due to metrics logging
+                    pass
                 
                 # Aggressive memory cleanup after training step to prevent OOM
                 # Do this AFTER all logging is complete to avoid referencing deleted variables
@@ -2859,30 +3317,42 @@ class RLAIFTrainer:
                         f"Flushed leftover grads at epoch end: micro_step_in_epoch={micro_step_in_epoch}, "
                         f"grad_accum={self.config.gradient_accumulation_steps}"
                     )
+
+                    # Stats/logging/checkpointing on flush step
+                    if rewards and len(rewards) > 0:
+                        self.stats['step'] = global_step
+                        self.stats['total_reward'] += float(np.mean(rewards))
+                        self.stats['num_samples'] += int(len(rewards))
+                    if loss_dict and loss_dict.get('loss', 0.0) > 0:
+                        self.stats['total_loss'] += float(loss_dict.get('loss', 0.0))
+                    self.stats['avg_reward'] = self.stats['total_reward'] / max(1, self.stats.get('step', 1))
+                    self.stats['avg_loss'] = self.stats['total_loss'] / max(1, self.stats.get('step', 1))
+
+                    if global_step % self.config.logging_steps == 0:
+                        if loss_dict and rewards:
+                            self._log_stats(global_step, loss_dict, rewards)
+
+                    if global_step % self.config.save_steps == 0:
+                        ckpt_name = f"checkpoint-gs{global_step}-e{epoch+1}-flush"
+                        self._save_checkpoint(
+                            global_step,
+                            checkpoint_name=ckpt_name,
+                            summary={
+                                "kind": "checkpoint",
+                                "reason": "save_steps_flush",
+                                "epoch": int(epoch + 1),
+                                "batch_idx": int(batch_idx),
+                                "global_step": int(global_step),
+                                "avg_reward": float(np.mean(epoch_rewards)) if epoch_rewards else 0.0,
+                                "avg_loss": float(np.mean(epoch_losses)) if epoch_losses else 0.0,
+                            },
+                        )
                 
-                # Update stats
-                # Note: rewards is always assigned at the start of each batch iteration (line 2351)
-                # loss_dict is initialized before the loop (line 2336) and updated during training
-                if 'rewards' in locals() and rewards and len(rewards) > 0:
-                    self.stats['step'] = global_step
-                    self.stats['total_reward'] += np.mean(rewards)
-                    self.stats['num_samples'] += len(rewards)
-                if 'loss_dict' in locals() and loss_dict and loss_dict.get('loss', 0.0) > 0:
-                    self.stats['total_loss'] += loss_dict.get('loss', 0.0)
-                self.stats['avg_reward'] = self.stats['total_reward'] / max(1, self.stats.get('step', 1))
-                self.stats['avg_loss'] = self.stats['total_loss'] / max(1, self.stats.get('step', 1))
-                
-                # Logging (check if variables exist before using)
-                if global_step % self.config.logging_steps == 0:
-                    if 'loss_dict' in locals() and 'rewards' in locals() and loss_dict and rewards:
-                        self._log_stats(global_step, loss_dict, rewards)
-                
-                # Save checkpoint
-                if global_step % self.config.save_steps == 0:
-                    self._save_checkpoint(global_step)
+                # (Moved) stats/logging/checkpointing are handled on optimizer steps above.
             
             # Epoch summary
             avg_epoch_reward = np.mean(epoch_rewards) if epoch_rewards else 0.0
+            avg_epoch_best_reward_per_prompt = float(np.mean(epoch_best_reward_per_prompt)) if epoch_best_reward_per_prompt else 0.0
             avg_epoch_loss = np.mean(epoch_losses) if epoch_losses else 0.0
             
             # Track reward variance (lower is better - more consistent)
@@ -2912,17 +3382,25 @@ class RLAIFTrainer:
             self.training_metrics['api_tokens_by_epoch'].append(epoch_input_tokens)
             self.training_metrics['api_output_tokens_by_epoch'].append(epoch_output_tokens)
             
-            # Track cache statistics for this epoch
-            epoch_api_calls = self.cache_stats['api_calls'] - epoch_start_api_calls
-            epoch_cache_hits = self.cache_stats['cache_hits'] - epoch_start_cache_hits
-            self.training_metrics['api_calls_by_epoch'].append(epoch_api_calls)
-            self.training_metrics['cache_hits_by_epoch'].append(epoch_cache_hits)
+            # Track teacher call/caching statistics for this epoch
+            epoch_teacher_gen_calls = int(self.cache_stats.get('teacher_gen_calls', 0) - epoch_start_teacher_gen_calls)
+            epoch_teacher_gen_cache_hits = int(self.cache_stats.get('teacher_gen_cache_hits', 0) - epoch_start_teacher_gen_cache_hits)
+            epoch_teacher_score_calls = int(self.cache_stats.get('teacher_score_calls', 0) - epoch_start_teacher_score_calls)
+            epoch_teacher_score_cache_hits = int(self.cache_stats.get('teacher_score_cache_hits', 0) - epoch_start_teacher_score_cache_hits)
+
+            # Back-compat: these were historically "teacher gen" stats
+            self.training_metrics['api_calls_by_epoch'].append(epoch_teacher_gen_calls)
+            self.training_metrics['cache_hits_by_epoch'].append(epoch_teacher_gen_cache_hits)
             
             # Track error statistics for this epoch
             epoch_gen_errors = self.error_stats['generation_errors'] - epoch_start_gen_errors
             epoch_scoring_errors = self.error_stats['scoring_errors'] - epoch_start_scoring_errors
+            epoch_teacher_generate_errors = int(self.error_stats.get('teacher_generate_errors', 0) - epoch_start_teacher_generate_errors)
+            epoch_teacher_scoring_errors = int(self.error_stats.get('teacher_scoring_errors', 0) - epoch_start_teacher_scoring_errors)
             self.error_stats['generation_errors_by_epoch'].append(epoch_gen_errors)
             self.error_stats['scoring_errors_by_epoch'].append(epoch_scoring_errors)
+            self.error_stats['teacher_generate_errors_by_epoch'].append(epoch_teacher_generate_errors)
+            self.error_stats['teacher_scoring_errors_by_epoch'].append(epoch_teacher_scoring_errors)
             
             # Calculate code diversity metrics
             code_diversity = self._calculate_code_diversity(epoch_generated_codes)
@@ -2959,9 +3437,15 @@ class RLAIFTrainer:
             }
             self.training_metrics['scoring_breakdown_by_epoch'].append(epoch_scoring_breakdown_avg)
             
-            # Calculate cache hit rate
-            total_scoring_ops = epoch_api_calls + epoch_cache_hits
-            cache_hit_rate = (epoch_cache_hits / total_scoring_ops * 100) if total_scoring_ops > 0 else 0.0
+            # Cache hit rates (separate: teacher reference generation vs scoring)
+            gen_ops = epoch_teacher_gen_calls + epoch_teacher_gen_cache_hits
+            score_ops = epoch_teacher_score_calls + epoch_teacher_score_cache_hits
+            teacher_gen_cache_hit_rate = (epoch_teacher_gen_cache_hits / gen_ops * 100) if gen_ops > 0 else 0.0
+            teacher_score_cache_hit_rate = (epoch_teacher_score_cache_hits / score_ops * 100) if score_ops > 0 else 0.0
+
+            # Back-compat aggregate cache hit rate (used by older logs/TensorBoard).
+            total_ops = gen_ops + score_ops
+            cache_hit_rate = ((epoch_teacher_gen_cache_hits + epoch_teacher_score_cache_hits) / total_ops * 100) if total_ops > 0 else 0.0
             
             # Calculate average performance metrics
             # Average tokens/sec = total tokens / total time
@@ -3028,13 +3512,16 @@ class RLAIFTrainer:
             logger.info(
                 f"Epoch {epoch + 1} Summary:\n"
                 f"  Total Time: {epoch_total_time_str} ({epoch_total_time:.1f}s)\n"
-                f"  Average Reward: {avg_epoch_reward:.4f}\n"
+                f"  Average Reward: {avg_epoch_reward:.4f} (mean over all sampled completions)\n"
+                f"  Best-of-N Reward: {avg_epoch_best_reward_per_prompt:.4f} (avg of per-prompt max; N={self.config.num_samples_per_prompt})\n"
                 f"  Average Loss: {avg_epoch_loss:.4f}\n"
                 f"  Total Samples: {len(epoch_rewards)}\n"
                 f"  Trainable Parameters: {trainable_str} ({trainable_percentage:.2f}% of {total_params:,} total)\n"
-                f"  API Usage: {epoch_input_tokens:,} input tokens, {epoch_output_tokens:,} output tokens ({epoch_api_calls:,} calls, {epoch_cache_hits:,} cache hits, {cache_hit_rate:.1f}% hit rate)\n"
+                f"  TeacherGenCalls: {epoch_teacher_gen_calls:,} calls, {epoch_teacher_gen_cache_hits:,} cache hits ({teacher_gen_cache_hit_rate:.1f}% hit rate)\n"
+                f"  TeacherScoreCalls: {epoch_teacher_score_calls:,} calls, {epoch_teacher_score_cache_hits:,} cache hits ({teacher_score_cache_hit_rate:.1f}% hit rate)\n"
+                f"  TeacherTokens: {epoch_input_tokens:,} input tokens, {epoch_output_tokens:,} output tokens\n"
                 f"  Code Diversity: {code_diversity['unique_ratio']:.1%} unique ({code_diversity['unique_count']}/{code_diversity['total_count']}), avg similarity: {code_diversity['avg_similarity']:.3f}\n"
-                f"  Errors: Generation: {epoch_gen_errors}, Scoring: {epoch_scoring_errors}\n"
+                f"  Errors: StudentGeneration: {epoch_gen_errors}, TeacherGenerate: {epoch_teacher_generate_errors}, TeacherScoring: {epoch_teacher_scoring_errors} (total teacher errors: {epoch_scoring_errors})\n"
                 f"  Performance:\n"
                 f"    Generation: raw {avg_gen_tokens_per_sec_raw:.1f} tok/s ({total_gen_tokens_raw:,} tokens) | "
                 f"kept {avg_gen_tokens_per_sec:.1f} tok/s ({total_gen_tokens:,} tokens)\n"
@@ -3046,70 +3533,178 @@ class RLAIFTrainer:
                 f"    Training: {avg_train_tokens_per_sec:.1f} tokens/sec (avg latency: {avg_train_latency:.3f}s, total input sequence tokens: {total_train_tokens:,})"
             )
 
+            # Save checkpoint at end of each epoch (independent of global_step)
+            if int(getattr(self.config, "save_every_epochs", 0) or 0) > 0:
+                n = int(self.config.save_every_epochs)
+                if ((epoch + 1) % n) == 0:
+                    ckpt_name = f"checkpoint-e{epoch+1}-end-gs{global_step}"
+                    self._save_checkpoint(
+                        global_step,
+                        checkpoint_name=ckpt_name,
+                        summary={
+                            "kind": "checkpoint",
+                            "reason": "epoch_end",
+                            "epoch": int(epoch + 1),
+                            "batch_idx": int(batch_idx),
+                            "global_step": int(global_step),
+                            "avg_reward": float(avg_epoch_reward),
+                            "avg_loss": float(avg_epoch_loss),
+                            "reward_variance": float(reward_variance),
+                            "api_input_tokens": int(epoch_input_tokens),
+                            "api_output_tokens": int(epoch_output_tokens),
+                            "cache_hit_rate": float(cache_hit_rate),
+                            "diversity_unique_ratio": float(code_diversity.get("unique_ratio", 0.0)),
+                            "generation_tok_s_raw": float(avg_gen_tokens_per_sec_raw),
+                            "generation_tok_s_kept": float(avg_gen_tokens_per_sec),
+                            "training_tok_s": float(avg_train_tokens_per_sec),
+                        },
+                    )
+
+            # --- Offline JSON summaries (every epoch) ---
+            try:
+                gen_backend = "mlx" if (self.mlx_model is not None and self.mlx_tokenizer is not None) else ("unsloth" if self._unsloth_enabled else "pytorch")
+                train_backend = "unsloth" if self._unsloth_enabled else "pytorch"
+                self._log_epoch_json({
+                    "kind": "epoch",
+                    "run_id": os.environ.get("RUN_ID") or None,
+                    "model": self.config.base_model,
+                    "device": str(self.device),
+                    "generation_backend": gen_backend,
+                    "training_backend": train_backend,
+                    "epoch": int(epoch + 1),
+                    "epoch_time_s": float(epoch_total_time),
+                    "avg_reward": float(avg_epoch_reward),
+                    "avg_loss": float(avg_epoch_loss),
+                    "reward_variance": float(reward_variance),
+                    "reward_trend": float(reward_trend),
+                    "loss_trend": float(loss_trend),
+                    "num_samples": int(len(epoch_rewards)),
+                    "trainable_params": int(trainable_params),
+                    "total_params": int(total_params),
+                    "trainable_percentage": float(trainable_percentage),
+                    "api": {
+                        "input_tokens": int(epoch_input_tokens),
+                        "output_tokens": int(epoch_output_tokens),
+                        "teacher_gen_calls": int(epoch_teacher_gen_calls),
+                        "teacher_gen_cache_hits": int(epoch_teacher_gen_cache_hits),
+                        "teacher_gen_cache_hit_rate": float(teacher_gen_cache_hit_rate),
+                        "teacher_score_calls": int(epoch_teacher_score_calls),
+                        "teacher_score_cache_hits": int(epoch_teacher_score_cache_hits),
+                        "teacher_score_cache_hit_rate": float(teacher_score_cache_hit_rate),
+                        # Back-compat aggregate:
+                        "cache_hit_rate": float(cache_hit_rate),
+                    },
+                    "errors": {
+                        "generation": int(epoch_gen_errors),
+                        "teacher_generate": int(epoch_teacher_generate_errors),
+                        "teacher_scoring": int(epoch_teacher_scoring_errors),
+                        "total_teacher": int(epoch_scoring_errors),
+                    },
+                    "diversity": {
+                        "unique_ratio": float(code_diversity.get("unique_ratio", 0.0)),
+                        "unique_count": int(code_diversity.get("unique_count", 0)),
+                        "total_count": int(code_diversity.get("total_count", 0)),
+                        "avg_similarity": float(code_diversity.get("avg_similarity", 0.0)),
+                    },
+                    "performance": {
+                        "generation": {
+                            "tok_s_raw": float(avg_gen_tokens_per_sec_raw),
+                            "tok_s_kept": float(avg_gen_tokens_per_sec),
+                            "tokens_raw": int(total_gen_tokens_raw),
+                            "tokens_kept": int(total_gen_tokens),
+                            "samples_raw": int(total_gen_samples_raw),
+                            "samples_kept": int(total_gen_samples_kept),
+                            "avg_tok_per_sample_raw": float(avg_tok_per_gen_sample_raw),
+                            "avg_tok_per_sample_kept": float(avg_tok_per_gen_sample_kept),
+                            "avg_per_sample_tok_s_raw": float(avg_gen_sample_tps_raw),
+                            "avg_per_sample_tok_s_kept": float(avg_gen_sample_tps_kept),
+                            "avg_latency_s": float(avg_gen_latency),
+                        },
+                        "scoring": {
+                            "tok_s_total": float(avg_reward_tokens_per_sec),
+                            "avg_latency_s": float(avg_reward_latency),
+                            "input_tokens": int(total_reward_input_tokens),
+                            "output_tokens": int(total_reward_output_tokens),
+                        },
+                        "training": {
+                            "tok_s": float(avg_train_tokens_per_sec),
+                            "avg_latency_s": float(avg_train_latency),
+                            "input_tokens": int(total_train_tokens),
+                        },
+                    },
+                })
+            except Exception:
+                pass
+
             # After reporting this epoch, roll epoch hashes into global hashes so the next epoch
             # treats repeats as “seen before” and triggers novelty retries during generation.
             if hasattr(self, "_epoch_code_hashes") and hasattr(self, "_global_code_hashes"):
                 self._global_code_hashes.update(self._epoch_code_hashes)
             
             if self.writer:
-                # Core epoch metrics
-                self.writer.add_scalar('AvgReward/Epoch', avg_epoch_reward, epoch)
-                self.writer.add_scalar('AvgLoss/Epoch', avg_epoch_loss, epoch)
-                self.writer.add_scalar('RewardVariance/Epoch', reward_variance, epoch)
-                # API tokens: track input (sent) and output (received) separately
-                self.writer.add_scalar('APITokens/Epoch', epoch_input_tokens, epoch)
-                self.writer.add_scalar('APIOutputTokens/Epoch', epoch_output_tokens, epoch)
-                self.writer.add_scalar('APICalls/Epoch', epoch_api_calls, epoch)
-                self.writer.add_scalar('CacheHits/Epoch', epoch_cache_hits, epoch)
-                self.writer.add_scalar('CacheHitRate/Epoch', cache_hit_rate, epoch)
-                self.writer.add_scalar('NumSamples/Epoch', len(epoch_rewards), epoch)
-                self.writer.add_scalar('CodeDiversity_UniqueRatio/Epoch', code_diversity['unique_ratio'], epoch)
-                self.writer.add_scalar('CodeDiversity_AvgSimilarity/Epoch', code_diversity['avg_similarity'], epoch)
-                self.writer.add_scalar('GenerationErrors/Epoch', epoch_gen_errors, epoch)
-                self.writer.add_scalar('ScoringErrors/Epoch', epoch_scoring_errors, epoch)
-                # Generation tokens: raw vs kept (post-dedup)
-                self.writer.add_scalar('GenerationTokens_Raw/Epoch', total_gen_tokens_raw, epoch)
-                self.writer.add_scalar('GenerationTokens_Kept/Epoch', total_gen_tokens, epoch)
-                self.writer.add_scalar('GenerationTokensPerSec_Raw/Epoch', avg_gen_tokens_per_sec_raw, epoch)
-                self.writer.add_scalar('GenerationTokensPerSec_Kept/Epoch', avg_gen_tokens_per_sec, epoch)
-                
-                # Trend metrics
-                if len(self.training_metrics['reward_by_epoch']) > 1:
-                    self.writer.add_scalar('RewardTrend/Epoch', reward_trend, epoch)
-                    self.writer.add_scalar('LossTrend/Epoch', loss_trend, epoch)
-                
-                # Scoring breakdown by criterion
-                self.writer.add_scalar('Scoring_Correctness/Epoch', epoch_scoring_breakdown_avg['correctness'], epoch)
-                self.writer.add_scalar('Scoring_CodeQuality/Epoch', epoch_scoring_breakdown_avg['code_quality'], epoch)
-                self.writer.add_scalar('Scoring_Efficiency/Epoch', epoch_scoring_breakdown_avg['efficiency'], epoch)
-                self.writer.add_scalar('Scoring_Documentation/Epoch', epoch_scoring_breakdown_avg['documentation'], epoch)
-                
-                # Performance metrics (average for this epoch)
-                gen_speeds = self.training_metrics['generation_tokens_per_sec']
-                backprop_speeds = self.training_metrics['backprop_tokens_per_sec']
-                
-                # Calculate epoch-specific performance (approximate by using recent samples)
-                # We'll track cumulative averages and log at epoch end
-                if gen_speeds:
-                    # Get speeds from this epoch (approximate: assume all speeds are from current epoch)
-                    # In practice, we'd need to track which batch belongs to which epoch
-                    # For now, we'll log the overall average and update it each epoch
-                    avg_gen_speed = np.mean(gen_speeds)
-                    p99_gen_speed = np.percentile(gen_speeds, 99) if len(gen_speeds) > 0 else 0
-                    self.writer.add_scalar('Generation_AvgTokensPerSec/Epoch', avg_gen_speed, epoch)
-                    self.writer.add_scalar('Generation_P99TokensPerSec/Epoch', p99_gen_speed, epoch)
-                
-                if backprop_speeds:
-                    avg_backprop_speed = np.mean(backprop_speeds)
-                    p99_backprop_speed = np.percentile(backprop_speeds, 99) if len(backprop_speeds) > 0 else 0
-                    self.writer.add_scalar('Backprop_AvgTokensPerSec/Epoch', avg_backprop_speed, epoch)
-                    self.writer.add_scalar('Backprop_P99TokensPerSec/Epoch', p99_backprop_speed, epoch)
+                # Simplified epoch charts: log only what appears in the epoch summary.
+                ep = int(epoch + 1)
+                self.writer.add_scalar("Epoch/Time_Total_s", float(epoch_total_time), ep)
+
+                # Rewards & loss (summary)
+                self.writer.add_scalar("Epoch/Reward_Mean", float(avg_epoch_reward), ep)
+                self.writer.add_scalar("Epoch/Reward_BestOfN_PerPrompt", float(avg_epoch_best_reward_per_prompt), ep)
+                self.writer.add_scalar("Epoch/Loss_Mean", float(avg_epoch_loss), ep)
+                self.writer.add_scalar("Epoch/RewardVariance", float(reward_variance), ep)
+                self.writer.add_scalar("Epoch/TotalSamples", float(len(epoch_rewards)), ep)
+
+                # Teacher calls/tokens (summary)
+                self.writer.add_scalar("Epoch/TeacherGenCalls", float(epoch_teacher_gen_calls), ep)
+                self.writer.add_scalar("Epoch/TeacherGenCacheHits", float(epoch_teacher_gen_cache_hits), ep)
+                self.writer.add_scalar("Epoch/TeacherGenCacheHitRate", float(teacher_gen_cache_hit_rate), ep)
+                self.writer.add_scalar("Epoch/TeacherScoreCalls", float(epoch_teacher_score_calls), ep)
+                self.writer.add_scalar("Epoch/TeacherScoreCacheHits", float(epoch_teacher_score_cache_hits), ep)
+                self.writer.add_scalar("Epoch/TeacherScoreCacheHitRate", float(teacher_score_cache_hit_rate), ep)
+                self.writer.add_scalar("Epoch/TeacherTokens_Input", float(epoch_input_tokens), ep)
+                self.writer.add_scalar("Epoch/TeacherTokens_Output", float(epoch_output_tokens), ep)
+
+                # Diversity + errors (summary)
+                self.writer.add_scalar("Epoch/CodeDiversity_UniqueRatio", float(code_diversity.get("unique_ratio", 0.0)), ep)
+                self.writer.add_scalar("Epoch/CodeDiversity_AvgSimilarity", float(code_diversity.get("avg_similarity", 0.0)), ep)
+                self.writer.add_scalar("Epoch/Errors_StudentGeneration", float(epoch_gen_errors), ep)
+                self.writer.add_scalar("Epoch/Errors_TeacherGenerate", float(epoch_teacher_generate_errors), ep)
+                self.writer.add_scalar("Epoch/Errors_TeacherScoring", float(epoch_teacher_scoring_errors), ep)
+
+                # Performance (summary)
+                self.writer.add_scalar("Epoch/Gen_TokPerSec_Raw", float(avg_gen_tokens_per_sec_raw), ep)
+                self.writer.add_scalar("Epoch/Gen_TokPerSec_Kept", float(avg_gen_tokens_per_sec), ep)
+                self.writer.add_scalar("Epoch/Gen_Tokens_Raw", float(total_gen_tokens_raw), ep)
+                self.writer.add_scalar("Epoch/Gen_Tokens_Kept", float(total_gen_tokens), ep)
+                self.writer.add_scalar("Epoch/Gen_Samples_Raw", float(total_gen_samples_raw), ep)
+                self.writer.add_scalar("Epoch/Gen_Samples_Kept", float(total_gen_samples_kept), ep)
+                self.writer.add_scalar("Epoch/Gen_TokPerSample_Raw", float(avg_tok_per_gen_sample_raw), ep)
+                self.writer.add_scalar("Epoch/Gen_TokPerSample_Kept", float(avg_tok_per_gen_sample_kept), ep)
+                self.writer.add_scalar("Epoch/Gen_TokPerSec_RawAvgPerSample", float(avg_gen_sample_tps_raw), ep)
+                self.writer.add_scalar("Epoch/Gen_TokPerSec_KeptAvgPerSample", float(avg_gen_sample_tps_kept), ep)
+                self.writer.add_scalar("Epoch/Gen_AvgBatchLatency_s", float(avg_gen_latency), ep)
+                self.writer.add_scalar("Epoch/Scoring_TokPerSec_Total", float(avg_reward_tokens_per_sec), ep)
+                self.writer.add_scalar("Epoch/Scoring_AvgLatency_s", float(avg_reward_latency), ep)
+                self.writer.add_scalar("Epoch/Training_TokPerSec", float(avg_train_tokens_per_sec), ep)
+                self.writer.add_scalar("Epoch/Training_AvgLatency_s", float(avg_train_latency), ep)
+                self.writer.add_scalar("Epoch/Training_InputTokens", float(total_train_tokens), ep)
         
         # Record training end time
         self.training_metrics['training_end_time'] = time.time()
         
-        # Final save
-        self._save_checkpoint(global_step, final=True)
+        # Final save (unique name to avoid overwriting checkpoint-0)
+        self._save_checkpoint(
+            global_step,
+            final=True,
+            checkpoint_name=f"checkpoint-final-gs{global_step}",
+            summary={
+                "kind": "checkpoint",
+                "reason": "final",
+                "epoch": int(self.stats.get("epoch", 0) or 0),
+                "global_step": int(global_step),
+                "avg_reward": float(self.training_metrics["reward_by_epoch"][-1]) if self.training_metrics.get("reward_by_epoch") else float(self.stats.get("avg_reward", 0.0)),
+                "avg_loss": float(self.training_metrics["loss_by_epoch"][-1]) if self.training_metrics.get("loss_by_epoch") else float(self.stats.get("avg_loss", 0.0)),
+            },
+        )
         
         # Stop system monitoring
         self._stop_monitoring()
@@ -3433,9 +4028,16 @@ class RLAIFTrainer:
                 self.writer.add_scalar('System/GPU_Memory_Percent', system_metrics.get('gpu_memory_percent', 0), step)
                 self.writer.add_scalar('System/GPU_Utilization', system_metrics.get('gpu_utilization', 0), step)
     
-    def _save_checkpoint(self, step: int, final: bool = False):
+    def _save_checkpoint(self, step: int, final: bool = False, checkpoint_name: Optional[str] = None, summary: Optional[Dict] = None):
         """Save model checkpoint in both PyTorch and MLX formats"""
-        checkpoint_dir = Path(self.config.output_dir) / f"checkpoint-{step}"
+        # IMPORTANT: step can be 0 for long periods with large grad accumulation.
+        # Use a unique checkpoint_name when provided to avoid overwriting checkpoint-0.
+        name = checkpoint_name or f"checkpoint-{step}"
+        checkpoint_dir = Path(self.config.output_dir) / name
+        if checkpoint_dir.exists() and any(checkpoint_dir.iterdir()):
+            # Avoid overwriting an existing checkpoint directory.
+            suffix = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+            checkpoint_dir = Path(self.config.output_dir) / f"{name}-{suffix}"
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
         # Save PyTorch format (standard)
@@ -3465,6 +4067,39 @@ class RLAIFTrainer:
         stats_file = checkpoint_dir / "training_stats.json"
         with open(stats_file, 'w') as f:
             json.dump(self.stats, f, indent=2)
+
+        # Save checkpoint summary (epoch/batch context + baseline gain)
+        if summary:
+            try:
+                summary_payload = dict(summary)
+                summary_payload.setdefault("checkpoint_name", checkpoint_dir.name)
+                summary_payload.setdefault("step", int(step))
+                summary_payload.setdefault("final", bool(final))
+                if self.baseline_reward is not None:
+                    summary_payload.setdefault("baseline_reward", float(self.baseline_reward))
+                    if "avg_reward" in summary_payload:
+                        summary_payload.setdefault("reward_gain_from_baseline", float(summary_payload["avg_reward"]) - float(self.baseline_reward))
+                summary_payload.setdefault("ts_iso", datetime.utcnow().isoformat() + "Z")
+                with open(checkpoint_dir / "checkpoint_summary.json", "w", encoding="utf-8") as f:
+                    json.dump(summary_payload, f, indent=2)
+            except Exception as e:
+                logger.debug(f"Failed to write checkpoint_summary.json: {e}")
+
+        # Keep only the most recent checkpoints (best-effort)
+        try:
+            limit = int(getattr(self.config, "save_total_limit", 0) or 0)
+            if limit > 0:
+                ckpt_root = Path(self.config.output_dir)
+                ckpts = [p for p in ckpt_root.iterdir() if p.is_dir() and p.name.startswith("checkpoint-")]
+                ckpts.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                for old in ckpts[limit:]:
+                    try:
+                        import shutil
+                        shutil.rmtree(old)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         
         logger.info(f"Saved checkpoint to {checkpoint_dir}")
     
@@ -4033,6 +4668,8 @@ def load_config(config_path: str) -> Tuple[RLAIFConfig, dict]:
         save_steps=to_int(training_cfg.get('save_steps'), 500),
         eval_steps=to_int(training_cfg.get('eval_steps'), 250),
         logging_steps=to_int(training_cfg.get('logging_steps'), 50),
+        save_every_epochs=to_int(training_cfg.get('save_every_epochs'), 1),
+        save_every_batches=to_int(training_cfg.get('save_every_batches'), 0),
         max_grad_norm=to_float(training_cfg.get('max_grad_norm'), 1.0),
         weight_decay=to_float(training_cfg.get('weight_decay'), 0.01),
         lr_scheduler_type=training_cfg.get('lr_scheduler_type', 'cosine'),
@@ -4055,6 +4692,10 @@ def load_config(config_path: str) -> Tuple[RLAIFConfig, dict]:
         mixed_precision=hardware_cfg.get('mixed_precision', 'bf16'),
         tensorboard_dir=logging_cfg.get('tensorboard_dir', './logs/tensorboard'),
         log_level=logging_cfg.get('log_level', 'INFO'),
+        save_json_summaries=to_bool(logging_cfg.get('save_json_summaries'), True),
+        json_summaries_dir=logging_cfg.get('json_summaries_dir', './logs/json_summaries'),
+        baseline_eval_batches=to_int(logging_cfg.get('baseline_eval_batches'), 1),
+        tensorboard_batch_interval=to_int(logging_cfg.get('tensorboard_batch_interval'), 1),
         top_k=to_int(rlaif_cfg.get('top_k'), 50),
         top_p=to_float(rlaif_cfg.get('top_p'), 0.95),
         save_mlx_format=to_bool(hardware_cfg.get('save_mlx_format'), True),
