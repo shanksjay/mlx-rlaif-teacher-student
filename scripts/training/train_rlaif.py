@@ -645,6 +645,10 @@ class RLAIFTrainer:
             else:
                 self.model = self._apply_lora(config)
         
+        # Apply LoRA/QLoRA if enabled
+        if config.use_lora or config.use_qlora:
+            self.model = self._apply_lora(config)
+        
         # Validate model was loaded correctly - check for NaN/Inf in weights
         logger.info("Validating model weights for corruption...")
         corrupted_params = []
@@ -2435,6 +2439,13 @@ class RLAIFTrainer:
             for key in keys_to_remove:
                 del self.teacher_score_cache[key]
             logger.info(f"Cleared {len(keys_to_remove)} student score cache entries at start of epoch {epoch + 1} (kept teacher code cache)")
+            
+            # Track API tokens at start of epoch
+            epoch_start_api_tokens = self.training_metrics['api_tokens_sent']
+            epoch_start_api_calls = self.cache_stats['api_calls']
+            epoch_start_cache_hits = self.cache_stats['cache_hits']
+            epoch_start_gen_errors = self.error_stats['generation_errors']
+            epoch_start_scoring_errors = self.error_stats['scoring_errors']
             
             # Track API tokens at start of epoch
             epoch_start_api_tokens = self.training_metrics['api_tokens_sent']
