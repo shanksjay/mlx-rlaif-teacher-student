@@ -30,15 +30,23 @@ training:
   output_dir: "./checkpoints"
   num_epochs: 7  # Increased from 3 to 7 for better convergence (5-10 range recommended)
   batch_size: 2  # Reduced from 4 to prevent MPS OOM on 32GB systems
-  gradient_accumulation_steps: 32  # Increased from 16 to maintain effective batch size of 64
+  # Aligned with logging_steps for efficient GPU/memory usage:
+  # - gradient_accumulation_steps = 50 matches logging_steps exactly
+  # - Optimizer steps happen every 50 batches, aligning with logging boundaries
+  # - Effective batch size = 50 * 2 = 100 (slightly larger than previous 64, but better alignment)
+  gradient_accumulation_steps: 50  # Aligned with logging_steps (50) for efficient batch boundaries
   learning_rate: 1e-5  # Optimized: reduced from 2e-5 to 1e-5 (range: 5e-6 to 2e-5)
+  # Optimizer:
+  # - adamw: best default on CUDA, but can OOM on Apple Silicon for full fine-tunes due to 2× moment states.
+  # - adafactor: much lower optimizer-state memory; recommended on MPS when not using LoRA/QLoRA.
+  optimizer: "adamw"
   warmup_steps: 100
   save_steps: 500
   # Additional checkpointing (independent of optimizer global_step):
   save_every_epochs: 1  # Save a checkpoint at the end of each epoch
-  save_every_batches: 25  # Save every N batches (0 = disabled; can be useful for long epochs)
+  save_every_batches: 0  # Save every N batches (0 = disabled; can be useful for long epochs)
   eval_steps: 250
-  logging_steps: 50
+  logging_steps: 50  # Aligned: matches gradient_accumulation_steps (50) exactly - optimizer steps align with logging boundaries
   max_grad_norm: 1.0
   weight_decay: 0.01
   lr_scheduler_type: "cosine"  # Learning rate scheduling enabled for better convergence
@@ -55,7 +63,7 @@ rlaif:
   generation_temperature: 1.0  # Increased from 0.9 to 1.0 for more diversity (range: 0.7-1.2)
   curriculum_learning: true  # Enable curriculum learning (start easy, increase difficulty)
   reward_bonuses: true  # Enable reward bonuses for specific improvements
-  use_lora: false  # Use LoRA for efficient fine-tuning (reduces memory, faster training)
+  use_lora: true  # Use LoRA for efficient fine-tuning (reduces memory, faster training)
   use_qlora: false  # Use QLoRA (4-bit + LoRA) for maximum efficiency (best for memory-constrained systems)
   lora_r: 16  # LoRA rank (higher = more parameters, better quality but slower)
   lora_alpha: 32  # LoRA alpha (scaling factor, typically 2x rank)
@@ -90,6 +98,11 @@ logging:
   json_summaries_dir: "./logs/json_summaries"  # Writes: batches.jsonl, epochs.jsonl
   baseline_eval_batches: 1  # Compute a pre-training baseline reward on the first N batches (0 = disable)
   tensorboard_batch_interval: 1  # Log per-batch time-series scalars every N batches (1 = every batch)
+  # System metrics (System/* in TensorBoard):
+  # - monitoring_interval_s: how often we sample in the background thread
+  # - system_monitor_step_mode: x-axis for System/* charts ("tick" = sample index, "batch" = aligns with Batch/*)
+  monitoring_interval_s: 5
+  system_monitor_step_mode: "batch"
   health_check_enabled: true  # Print periodic training health checks while training is running
   health_check_interval_batches: 5  # Run health check every N batches
   health_check_grace_batches: 3  # Suppress reward/baseline warnings for the first N batches of epoch 1 (warmup/noise)
@@ -119,17 +132,22 @@ hardware:
   # Experimental: warm the MPS allocator by allocating+freeing some large chunks at startup.
   # Can reduce early fragmentation spikes on some setups; set to 0 to disable.
   mps_allocator_warmup_gb: 0.0
-  save_mlx_format: true  # Save model in MLX format for faster inference on Apple Silicon
+  save_mlx_format: true  # LoRA-aware MLX export will merge adapters before convert
   mlx_quantization: q8_bit  # Options: "q4_bit", "q8_bit", or null for no quantization
-  use_mlx_for_generation: true  # Use MLX for generation (5-10x faster than PyTorch MPS) - enabled by default
-  require_mlx_for_generation: true  # If true, fail fast when MLX model is missing (no PyTorch fallback)
+  use_mlx_for_generation: true
+  require_mlx_for_generation: true
   allow_4bit_on_mps: false  # If true, allow BitsAndBytes 4-bit on MPS (NOT recommended; can cause NaNs)
-  reload_mlx_from_latest_checkpoint: true  # If true, after each MLX checkpoint save, reload MLX generation weights from it
+  reload_mlx_from_latest_checkpoint: false  # LoRA uses a dedicated MLX-sync pipeline (below)
   # MLX Metal cache limit (helps reduce long-run fragmentation). 0 = unlimited (default).
-  mlx_metal_cache_limit_gb: 0.0
+  mlx_metal_cache_limit_gb: 1.0
   # MLX generation worker process (recommended when mixing MLX generation + PyTorch MPS training):
   # Runs MLX generation in a separate process to reduce Metal allocator contention/fragmentation.
   use_mlx_generation_worker: true
+  # LoRA + MLX generation:
+  # We periodically (after optimizer steps) export a merged HF model (base + adapters),
+  # run mlx_lm.convert, then hot-swap the MLX generation worker to the new weights.
+  lora_mlx_sync_enabled: true
+  lora_mlx_sync_every_optimizer_steps: 1
   mlx_generation_worker_timeout_s: 240
   # Auto-detects MLX model if mlx_model_path is null by checking common locations
   mlx_model_path: ./mlx_model/q4  # Path to MLX model (e.g., "./mlx_model/q8", "./mlx_model/q4", "./mlx_model/base")
