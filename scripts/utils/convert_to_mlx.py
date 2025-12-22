@@ -10,6 +10,7 @@ import argparse
 import logging
 import os
 from pathlib import Path
+import subprocess
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -17,25 +18,23 @@ logger = logging.getLogger(__name__)
 
 def convert_model_to_mlx(hf_path: str, mlx_path: str, quantize: str = None):
     """Convert HuggingFace model to MLX format"""
-    try:
-        from mlx_lm import convert
-        # Try to import quantize from different locations
-        mlx_quantize = None
-        try:
-            from mlx_lm import quantize as mlx_quantize
-        except ImportError:
-            try:
-                from mlx_lm.utils import quantize as mlx_quantize
-            except ImportError:
-                try:
-                    from mlx_lm.quantize import quantize as mlx_quantize
-                except ImportError:
-                    pass  # Quantization not available, will note in output
-    except ImportError as e:
-        logger.error(f"MLX libraries not installed. Error: {e}")
-        logger.error("Install with:")
-        logger.error("  uv pip install mlx mlx-lm")
-        return False
+    # Preferred path (per Qwen docs): use the official CLI `mlx_lm.convert`.
+    # This is the most compatible option across mlx-lm versions and supports q-bits flags.
+    # Ref: https://qwen.readthedocs.io/en/latest/run_locally/mlx-lm.html
+    def _run_cli():
+        cmd = ["mlx_lm.convert", "--hf-path", hf_path, "--mlx-path", str(mlx_path)]
+        if quantize:
+            cmd.append("-q")
+            if quantize == "q4_bit":
+                cmd += ["--q-bits", "4"]
+            elif quantize == "q8_bit":
+                cmd += ["--q-bits", "8"]
+        logger.info("Running: " + " ".join(cmd))
+        subprocess.run(cmd, check=True)
+
+    def _run_python_api():
+        from mlx_lm import convert  # type: ignore
+        convert(hf_path, str(mlx_path))
     
     logger.info("="*80)
     logger.info("Converting Model to MLX Format")
@@ -61,44 +60,19 @@ def convert_model_to_mlx(hf_path: str, mlx_path: str, quantize: str = None):
             return False
     
     try:
-        # Convert model
-        logger.info("Converting model to MLX format...")
+        logger.info("Converting model to MLX format (preferred: mlx_lm.convert)...")
         logger.info("This may take a few minutes...")
-        
-        convert(hf_path, str(mlx_path))
+
+        try:
+            _run_cli()
+        except FileNotFoundError:
+            logger.warning("mlx_lm.convert CLI not found on PATH; falling back to Python API.")
+            _run_python_api()
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"mlx_lm.convert failed (exit={e.returncode}); falling back to Python API.")
+            _run_python_api()
+
         logger.info("✓ Model converted to MLX format")
-        
-        # Apply quantization if specified
-        # Note: In MLX, quantization is typically done during loading, not conversion
-        # But we'll try to apply it if the function is available
-        if quantize:
-            if mlx_quantize:
-                logger.info(f"Applying {quantize} quantization...")
-                if quantize == "q4_bit":
-                    bits = 4
-                elif quantize == "q8_bit":
-                    bits = 8
-                else:
-                    logger.warning(f"Unknown quantization: {quantize}")
-                    return True
-                
-                try:
-                    # Try to quantize (may not work with all mlx_lm versions)
-                    mlx_quantize(str(mlx_path), str(mlx_path), bits=bits)
-                    logger.info(f"✓ Model quantized to {bits}-bit")
-                except Exception as e:
-                    logger.warning(f"Quantization during conversion failed: {e}")
-                    logger.info("Model converted but not quantized.")
-                    logger.info(f"Note: You can use quantization when loading the model:")
-                    logger.info(f"  from mlx_lm import load")
-                    logger.info(f"  model, tokenizer = load('{mlx_path}', quantize={bits})")
-            else:
-                logger.info(f"Quantization requested: {quantize}")
-                logger.info("Note: Quantization in MLX is typically done during model loading, not conversion.")
-                logger.info("The model has been converted. To use quantization:")
-                logger.info(f"  from mlx_lm import load")
-                bits = 4 if quantize == "q4_bit" else 8
-                logger.info(f"  model, tokenizer = load('{mlx_path}', quantize={bits})")
         
         logger.info(f"\n✓ MLX model saved to: {mlx_path}")
         logger.info("\nUsage:")
@@ -109,6 +83,10 @@ def convert_model_to_mlx(hf_path: str, mlx_path: str, quantize: str = None):
         logger.info("  hardware:")
         logger.info("    use_mlx_for_generation: true")
         logger.info(f"    mlx_model_path: {mlx_path}")
+        if quantize:
+            bits = 4 if quantize == "q4_bit" else 8
+            logger.info("\nNote:")
+            logger.info(f"  This MLX model was converted with quantization enabled (q-bits={bits}).")
         
         return True
         

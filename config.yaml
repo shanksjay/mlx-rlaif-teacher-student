@@ -36,7 +36,7 @@ training:
   save_steps: 500
   # Additional checkpointing (independent of optimizer global_step):
   save_every_epochs: 1  # Save a checkpoint at the end of each epoch
-  save_every_batches: 0  # Save every N batches (0 = disabled; can be useful for long epochs)
+  save_every_batches: 25  # Save every N batches (0 = disabled; can be useful for long epochs)
   eval_steps: 250
   logging_steps: 50
   max_grad_norm: 1.0
@@ -90,17 +90,49 @@ logging:
   json_summaries_dir: "./logs/json_summaries"  # Writes: batches.jsonl, epochs.jsonl
   baseline_eval_batches: 1  # Compute a pre-training baseline reward on the first N batches (0 = disable)
   tensorboard_batch_interval: 1  # Log per-batch time-series scalars every N batches (1 = every batch)
+  health_check_enabled: true  # Print periodic training health checks while training is running
+  health_check_interval_batches: 5  # Run health check every N batches
+  health_check_grace_batches: 3  # Suppress reward/baseline warnings for the first N batches of epoch 1 (warmup/noise)
+  health_check_gen_bottleneck_pct: 85  # Only warn if generation dominates >= this percentage AND tok/s is below target
+  health_check_gen_target_tps: 6.0  # Target raw generation tokens/sec (warn if below when gen is dominant)
+  # Fragmentation / cache growth health checks (Apple Silicon / Metal):
+  # - MPS keeps "driver allocated" memory that can exceed "currently allocated" due to caching/fragmentation.
+  # - MLX keeps a Metal cache; growth can indicate fragmentation or memory pressure.
+  health_check_fragmentation_enabled: true
+  # NOTE: On Apple Silicon, this value can be high but stable due to caching.
+  # We trigger GC primarily on *growth*; keep this as a “high watermark” only.
+  health_check_mps_fragmentation_gb: 10.0  # High watermark for (MPS_driver_alloc - MPS_current_alloc)
+  health_check_mlx_cache_gb: 3.0           # Warn/GC if MLX Metal cache exceeds this
+  health_check_fragmentation_growth_gb: 0.75  # Warn/GC if fragmentation grows by >= this since last check
+  health_check_trigger_gc_on_fragmentation: true
+  health_check_gc_cooldown_batches: 10     # Don't trigger GC more often than this many batches
+  # GPU utilization on Apple Silicon:
+  # - "memory_proxy": uses MPS memory usage as a crude proxy (fast, but can disagree with Activity Monitor, especially when using MLX)
+  # - "powermetrics": uses macOS `powermetrics` GPU sampler when available (more accurate, may require elevated permissions)
+  gpu_utilization_mode: "memory_proxy"
 
 # Hardware Configuration (M5 MacBook)
 hardware:
   use_mps: true  # Use Metal Performance Shaders for M5
   mixed_precision: "bf16"  # bfloat16 for M5
   dataloader_num_workers: 4
+  # Experimental: warm the MPS allocator by allocating+freeing some large chunks at startup.
+  # Can reduce early fragmentation spikes on some setups; set to 0 to disable.
+  mps_allocator_warmup_gb: 0.0
   save_mlx_format: true  # Save model in MLX format for faster inference on Apple Silicon
   mlx_quantization: q8_bit  # Options: "q4_bit", "q8_bit", or null for no quantization
   use_mlx_for_generation: true  # Use MLX for generation (5-10x faster than PyTorch MPS) - enabled by default
+  require_mlx_for_generation: true  # If true, fail fast when MLX model is missing (no PyTorch fallback)
+  allow_4bit_on_mps: false  # If true, allow BitsAndBytes 4-bit on MPS (NOT recommended; can cause NaNs)
+  reload_mlx_from_latest_checkpoint: true  # If true, after each MLX checkpoint save, reload MLX generation weights from it
+  # MLX Metal cache limit (helps reduce long-run fragmentation). 0 = unlimited (default).
+  mlx_metal_cache_limit_gb: 0.0
+  # MLX generation worker process (recommended when mixing MLX generation + PyTorch MPS training):
+  # Runs MLX generation in a separate process to reduce Metal allocator contention/fragmentation.
+  use_mlx_generation_worker: true
+  mlx_generation_worker_timeout_s: 240
   # Auto-detects MLX model if mlx_model_path is null by checking common locations
-  mlx_model_path: null  # Path to MLX model (e.g., "./mlx_model/q8", "./mlx_model/q4", "./mlx_model/base")
+  mlx_model_path: ./mlx_model/q4  # Path to MLX model (e.g., "./mlx_model/q8", "./mlx_model/q4", "./mlx_model/base")
                          # If null, will auto-detect from: ./mlx_model/q8, ./mlx_model/q4, ./mlx_model/base
 
   # NVIDIA / CUDA Configuration (for comparison runs on a Linux/Windows box w/ NVIDIA GPU)

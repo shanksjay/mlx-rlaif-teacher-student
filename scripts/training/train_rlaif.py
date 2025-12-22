@@ -14,7 +14,7 @@ import yaml
 import logging
 import argparse
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional
 from dataclasses import dataclass, field
 from datetime import datetime
 import asyncio
@@ -85,8 +85,6 @@ class RLAIFConfig:
     save_steps: int
     eval_steps: int
     logging_steps: int
-    save_every_epochs: int = 1
-    save_every_batches: int = 0
     max_grad_norm: float
     weight_decay: float
     lr_scheduler_type: str
@@ -100,10 +98,26 @@ class RLAIFConfig:
     mixed_precision: str
     tensorboard_dir: str
     log_level: str
+    save_every_epochs: int = 1
+    save_every_batches: int = 0
     save_json_summaries: bool = True
     json_summaries_dir: str = "./logs/json_summaries"
     baseline_eval_batches: int = 1
     tensorboard_batch_interval: int = 1
+    health_check_enabled: bool = True
+    health_check_interval_batches: int = 5
+    health_check_grace_batches: int = 3
+    health_check_gen_bottleneck_pct: float = 85.0
+    health_check_gen_target_tps: float = 6.0
+    health_check_fragmentation_enabled: bool = True
+    # NOTE: On Apple Silicon, MPS "driver allocated - current allocated" can be high but stable due to caching.
+    # We primarily react to *growth* (health_check_fragmentation_growth_gb), treating this as a high watermark.
+    health_check_mps_fragmentation_gb: float = 10.0
+    health_check_mlx_cache_gb: float = 3.0
+    health_check_fragmentation_growth_gb: float = 0.75
+    health_check_trigger_gc_on_fragmentation: bool = True
+    health_check_gc_cooldown_batches: int = 10
+    gpu_utilization_mode: str = "memory_proxy"  # "memory_proxy" or "powermetrics"
     top_k: int = 50
     top_p: float = 0.95
     generation_temperature: float = 0.8  # Temperature for generation (higher = more exploration)
@@ -130,6 +144,15 @@ class RLAIFConfig:
     low_cpu_mem_usage: bool = True
     use_mlx_for_generation: bool = True  # Use MLX for faster generation (requires MLX model) - enabled by default
     mlx_model_path: Optional[str] = None  # Path to MLX model for generation
+    require_mlx_for_generation: bool = False  # Fail fast if MLX model isn't found (no PyTorch fallback)
+    allow_4bit_on_mps: bool = False  # Allow BitsAndBytes 4-bit on MPS (NOT recommended)
+    reload_mlx_from_latest_checkpoint: bool = True  # Reload MLX weights from latest saved checkpoint for generation
+    mlx_metal_cache_limit_gb: float = 0.0  # 0 = unlimited; otherwise caps MLX Metal cache to reduce fragmentation
+    # Experimental: "warm" the MPS allocator by allocating and freeing a few large chunks at startup.
+    # This can reduce early-run fragmentation spikes on some macOS/PyTorch builds, but may do nothing on others.
+    mps_allocator_warmup_gb: float = 0.0
+    use_mlx_generation_worker: bool = False  # Run MLX generation in a separate process to reduce Metal fragmentation
+    mlx_generation_worker_timeout_s: int = 240
     # CUDA/Unsloth (optional): enables Unsloth optimized model loading/training/generation on NVIDIA GPUs
     use_unsloth: bool = False
     unsloth_dtype: str = "bf16"  # "bf16" or "fp16"
@@ -495,6 +518,494 @@ class RLAIFTrainer:
         if getattr(self.config, "save_json_summaries", True):
             self._append_jsonl(self._epoch_jsonl_path, payload)
 
+    def _get_fragmentation_metrics_gb(self) -> Dict[str, float]:
+        """Best-effort Metal fragmentation/cache metrics (Apple Silicon).
+
+        These are proxies:
+        - MPS fragmentation proxy: driver_allocated - current_allocated
+        - MLX cache proxy: mx.get_cache_memory()
+        """
+        out: Dict[str, float] = {
+            "mps_alloc_gb": 0.0,
+            "mps_driver_gb": 0.0,
+            "mps_frag_gb": 0.0,
+            "mlx_active_gb": 0.0,
+            "mlx_cache_gb": 0.0,
+            "mlx_peak_gb": 0.0,
+        }
+        # MPS metrics
+        try:
+            if torch.backends.mps.is_available() and hasattr(torch.mps, "current_allocated_memory"):
+                alloc = float(torch.mps.current_allocated_memory()) / (1024 ** 3)
+                driver = float(torch.mps.driver_allocated_memory()) / (1024 ** 3) if hasattr(torch.mps, "driver_allocated_memory") else 0.0
+                out["mps_alloc_gb"] = alloc
+                out["mps_driver_gb"] = driver
+                out["mps_frag_gb"] = max(0.0, driver - alloc) if driver > 0 else 0.0
+        except Exception:
+            pass
+
+        # MLX Metal metrics
+        try:
+            if getattr(self, "_mlx_worker", None) is not None:
+                # When using the MLX worker subprocess, we can't query mx.* memory in-process.
+                # Instead, use the latest stats returned by the worker on generate().
+                last = getattr(self, "_mlx_worker_last_mem", None) or {}
+                out["mlx_active_gb"] = float(last.get("active_gb", 0.0) or 0.0)
+                out["mlx_cache_gb"] = float(last.get("cache_gb", 0.0) or 0.0)
+                out["mlx_peak_gb"] = float(last.get("peak_gb", 0.0) or 0.0)
+            elif self.mlx_model is not None:
+                import mlx.core as mx
+                if hasattr(mx, "get_active_memory"):
+                    out["mlx_active_gb"] = float(mx.get_active_memory()) / (1024 ** 3)
+                if hasattr(mx, "get_cache_memory"):
+                    out["mlx_cache_gb"] = float(mx.get_cache_memory()) / (1024 ** 3)
+                if hasattr(mx, "get_peak_memory"):
+                    out["mlx_peak_gb"] = float(mx.get_peak_memory()) / (1024 ** 3)
+        except Exception:
+            pass
+
+        return out
+
+    def _maybe_trigger_fragmentation_gc(self, *, batch_idx: int, frag: Dict[str, float]) -> bool:
+        """Trigger GC/cache clears if fragmentation proxies exceed thresholds (with cooldown)."""
+        try:
+            if not bool(getattr(self.config, "health_check_fragmentation_enabled", True)):
+                return False
+            if not bool(getattr(self.config, "health_check_trigger_gc_on_fragmentation", True)):
+                return False
+
+            cooldown = int(getattr(self.config, "health_check_gc_cooldown_batches", 10) or 10)
+            if cooldown < 0:
+                cooldown = 0
+            last = int(getattr(self, "_last_fragment_gc_batch", -10**9))
+            if batch_idx - last < cooldown:
+                return False
+
+            mps_frag = float(frag.get("mps_frag_gb", 0.0))
+            mlx_cache = float(frag.get("mlx_cache_gb", 0.0))
+            mps_thr = float(getattr(self.config, "health_check_mps_fragmentation_gb", 10.0) or 10.0)
+            mlx_thr = float(getattr(self.config, "health_check_mlx_cache_gb", 3.0) or 3.0)
+            growth_thr = float(getattr(self.config, "health_check_fragmentation_growth_gb", 0.75) or 0.75)
+
+            prev = getattr(self, "_prev_frag_metrics", None) or {}
+            prev_mps = float(prev.get("mps_frag_gb", 0.0))
+            prev_mlx = float(prev.get("mlx_cache_gb", 0.0))
+            mps_delta = mps_frag - prev_mps
+            mlx_delta = mlx_cache - prev_mlx
+            grew = (mps_delta >= growth_thr) or (mlx_delta >= growth_thr)
+
+            # IMPORTANT:
+            # On MPS/Metal, "driver allocated - current allocated" can be very high but stable due to caching.
+            # Triggering GC just because it's high tends to thrash the allocator and can *increase* fragmentation.
+            # So we only GC when it's BOTH high AND growing (or when growth alone is large).
+            high_and_growing = ((mps_frag >= mps_thr) and (mps_delta >= (growth_thr * 0.5))) or (
+                (mlx_cache >= mlx_thr) and (mlx_delta >= (growth_thr * 0.5))
+            )
+
+            should = bool(grew or high_and_growing)
+            if not should:
+                return False
+
+            # Trigger cleanup
+            import gc
+            gc.collect()
+            if torch.backends.mps.is_available():
+                try:
+                    torch.mps.empty_cache()
+                    torch.mps.synchronize()
+                except Exception:
+                    pass
+            if self.mlx_model is not None:
+                try:
+                    import mlx.core as mx
+                    if hasattr(mx, "clear_cache"):
+                        mx.clear_cache()
+                except Exception:
+                    pass
+
+            self._last_fragment_gc_batch = int(batch_idx)
+            return True
+        except Exception:
+            return False
+
+    def _maybe_apply_mlx_metal_cache_limit(self) -> None:
+        """Apply MLX Metal cache limit once (best-effort)."""
+        try:
+            if self.mlx_model is None:
+                return
+            limit_gb = float(getattr(self.config, "mlx_metal_cache_limit_gb", 0.0) or 0.0)
+            if limit_gb <= 0:
+                return
+            import mlx.core as mx
+            limit_bytes = int(limit_gb * (1024 ** 3))
+            if hasattr(mx, "set_cache_limit"):
+                mx.set_cache_limit(limit_bytes)
+            elif hasattr(mx, "metal") and hasattr(mx.metal, "set_cache_limit"):
+                # Back-compat for older MLX versions
+                mx.metal.set_cache_limit(limit_bytes)
+            else:
+                return
+            logger.info(f"MLX Metal cache limit set to {limit_gb:.2f} GB")
+        except Exception:
+            return
+
+    def _start_mlx_generation_worker(self, model_path: str) -> None:
+        """Start MLX generation worker subprocess."""
+        try:
+            import subprocess
+            import sys
+            import os
+            from pathlib import Path
+
+            # Stop existing worker if any
+            self._stop_mlx_generation_worker()
+
+            worker_path = Path(__file__).resolve().parents[1] / "utils" / "mlx_gen_worker.py"
+            cmd = [sys.executable, str(worker_path), "--model-path", str(model_path)]
+            env = os.environ.copy()
+            # Reduce noisy python output buffering for timely responses
+            env.setdefault("PYTHONUNBUFFERED", "1")
+            p = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                env=env,
+            )
+            self._mlx_worker = p
+            self._mlx_worker_req_id = 0
+            self._mlx_worker_model_path = str(model_path)
+
+            # Quick ping to ensure it is alive
+            try:
+                _ = self._mlx_worker_call({"op": "ping"})
+                logger.info("✓ MLX generation worker started")
+            except Exception as e:
+                # If ping fails, treat worker as failed and stop it.
+                err_tail = ""
+                try:
+                    err_tail = self._mlx_worker_read_stderr_tail(max_bytes=4096)
+                except Exception:
+                    pass
+                self._stop_mlx_generation_worker()
+                msg = f"MLX generation worker ping failed: {e}"
+                if err_tail:
+                    msg += f"\nWorker stderr tail:\n{err_tail}"
+                if getattr(self.config, "require_mlx_for_generation", False):
+                    logger.error(msg)
+                    raise
+                logger.warning(msg)
+        except Exception as e:
+            logger.warning(f"Failed to start MLX generation worker: {e}")
+            self._mlx_worker = None
+            self._mlx_worker_model_path = None
+
+    def _stop_mlx_generation_worker(self) -> None:
+        """Stop MLX generation worker subprocess (best-effort)."""
+        try:
+            p = getattr(self, "_mlx_worker", None)
+            if not p:
+                return
+            try:
+                self._mlx_worker_call({"op": "shutdown"}, timeout_s=2)
+            except Exception:
+                pass
+            try:
+                p.terminate()
+            except Exception:
+                pass
+            self._mlx_worker = None
+            self._mlx_worker_model_path = None
+        except Exception:
+            self._mlx_worker = None
+            self._mlx_worker_model_path = None
+
+    def _mlx_worker_read_stderr_tail(self, max_bytes: int = 4096) -> str:
+        """Best-effort: read up to max_bytes of worker stderr without blocking too long."""
+        p = getattr(self, "_mlx_worker", None)
+        if not p or p.stderr is None:
+            return ""
+        try:
+            # stderr is a TextIO; read whatever is currently buffered (may block on some platforms).
+            # Keep it best-effort; if it blocks, caller catches.
+            data = p.stderr.read()
+            if not data:
+                return ""
+            if len(data) > max_bytes:
+                return data[-max_bytes:]
+            return data
+        except Exception:
+            return ""
+
+    def _mlx_worker_call(self, payload: Dict, timeout_s: Optional[int] = None) -> Dict:
+        """Send a JSON request to the worker and wait for a JSON response."""
+        import json
+        import time
+        import selectors
+
+        p = getattr(self, "_mlx_worker", None)
+        if not p or p.stdin is None or p.stdout is None:
+            raise RuntimeError("MLX worker is not running")
+
+        # If worker already exited, surface stderr and fail fast
+        try:
+            rc = p.poll()
+        except Exception:
+            rc = None
+        if rc is not None:
+            err_tail = self._mlx_worker_read_stderr_tail()
+            raise RuntimeError(f"MLX worker exited (rc={rc}). stderr tail:\n{err_tail}")
+
+        self._mlx_worker_req_id += 1
+        req_id = int(self._mlx_worker_req_id)
+        payload = dict(payload)
+        payload["id"] = req_id
+
+        # Write request (handle broken pipe by attempting one restart)
+        try:
+            p.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            p.stdin.flush()
+        except BrokenPipeError:
+            # Attempt one restart and retry
+            model_path = getattr(self, "_mlx_worker_model_path", None)
+            if model_path:
+                logger.warning("MLX worker stdin broken pipe; restarting worker once...")
+                self._start_mlx_generation_worker(model_path)
+                p = getattr(self, "_mlx_worker", None)
+                if not p or p.stdin is None or p.stdout is None:
+                    raise
+                p.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                p.stdin.flush()
+            else:
+                raise
+
+        deadline = time.time() + float(timeout_s if timeout_s is not None else getattr(self.config, "mlx_generation_worker_timeout_s", 240))
+        sel = selectors.DefaultSelector()
+        try:
+            sel.register(p.stdout, selectors.EVENT_READ)
+            while time.time() < deadline:
+                remaining = max(0.0, deadline - time.time())
+                events = sel.select(timeout=min(0.25, remaining))
+                if not events:
+                    # check if worker died mid-wait
+                    try:
+                        rc = p.poll()
+                    except Exception:
+                        rc = None
+                    if rc is not None:
+                        err_tail = self._mlx_worker_read_stderr_tail()
+                        raise RuntimeError(f"MLX worker exited (rc={rc}). stderr tail:\n{err_tail}")
+                    continue
+                line = p.stdout.readline()
+                if not line:
+                    break
+                try:
+                    resp = json.loads(line)
+                except Exception:
+                    continue
+                # Worker can emit fatal startup errors with id=-1; surface them immediately.
+                if int(resp.get("id", -2)) == -1 and not bool(resp.get("ok", False)):
+                    raise RuntimeError(f"MLX worker fatal error: {resp.get('error')}")
+                if int(resp.get("id", -1)) == req_id:
+                    return resp
+        finally:
+            try:
+                sel.close()
+            except Exception:
+                pass
+
+        raise TimeoutError("MLX worker response timed out or worker exited")
+
+    def _mlx_generate_via_worker(
+        self,
+        *,
+        prompt_text: str,
+        max_tokens: int,
+        do_sample: bool,
+        temp: float,
+        top_p: float,
+        top_k: int,
+    ) -> Dict[str, Any]:
+        resp = self._mlx_worker_call(
+            {
+                "op": "generate",
+                "prompt": prompt_text,
+                "max_tokens": int(max_tokens),
+                "do_sample": bool(do_sample),
+                "temp": float(temp),
+                "top_p": float(top_p),
+                "top_k": int(top_k),
+            }
+        )
+        if not resp.get("ok", False):
+            raise RuntimeError(resp.get("error", "worker_generate_failed"))
+        # Capture MLX worker memory stats (used for TensorBoard + health checks).
+        try:
+            active_b = int(resp.get("mlx_active_bytes", 0) or 0)
+            cache_b = int(resp.get("mlx_cache_bytes", 0) or 0)
+            peak_b = int(resp.get("mlx_peak_bytes", 0) or 0)
+            pid = int(resp.get("pid", 0) or 0)
+            self._mlx_worker_last_mem = {
+                "active_gb": float(active_b) / (1024.0**3),
+                "cache_gb": float(cache_b) / (1024.0**3),
+                "peak_gb": float(peak_b) / (1024.0**3),
+                "pid": pid,
+            }
+        except Exception:
+            pass
+        return resp
+
+    def _run_health_check(
+        self,
+        *,
+        epoch: int,
+        batch_idx: int,
+        rewards_mean: float,
+        best_of_n: Optional[float],
+        ema_reward: float,
+        ema_gain_from_baseline: Optional[float],
+        gen_time: float,
+        reward_time: float,
+        train_time: float,
+        batch_time: float,
+        raw_tokens_per_sec: float,
+        kept_tokens_per_sec: float,
+        diversity_ratio: float,
+        kept_samples: int,
+        frag_mps_gb: float = 0.0,
+        frag_mlx_cache_gb: float = 0.0,
+        frag_triggered_gc: bool = False,
+        frag_mps_growth_gb: float = 0.0,
+        frag_gc_cooldown_blocked: bool = False,
+        teacher_gen_calls_batch: Optional[int] = None,
+        teacher_score_calls_batch: Optional[int] = None,
+        teacher_in_tokens: float = 0.0,
+        teacher_out_tokens: float = 0.0,
+    ) -> None:
+        """Lightweight runtime health check: prints warnings if training appears off-track."""
+        try:
+            if not getattr(self.config, "health_check_enabled", True):
+                return
+            every = int(getattr(self.config, "health_check_interval_batches", 5) or 5)
+            if every < 1:
+                every = 1
+            if (batch_idx % every) != 0:
+                return
+
+            # Ratios for bottleneck detection
+            gen_pct = (gen_time / batch_time * 100.0) if batch_time > 0 else 0.0
+            score_pct = (reward_time / batch_time * 100.0) if batch_time > 0 else 0.0
+            train_pct = (train_time / batch_time * 100.0) if batch_time > 0 else 0.0
+
+            issues = []
+
+            # Health-check grace period:
+            # Early batches/epoch can look "bad" due to warmup, randomness, and baseline noise.
+            grace_batches = int(getattr(self.config, "health_check_grace_batches", 3) or 3)
+            if grace_batches < 0:
+                grace_batches = 0
+            in_grace = (epoch <= 1 and batch_idx < grace_batches)
+
+            # Reward thresholds (tuned for your 0-1 normalized reward; aim upward over time)
+            # Interpretation note:
+            # - Mean reward can drop when we increase exploration (temperature, prompt salting).
+            # - Best-of-N captures whether sampling is finding strong candidates for learning.
+            # Use Best-of-N as the primary early signal; mean/EMA becomes more meaningful later.
+            if not in_grace:
+                if best_of_n is not None and best_of_n < 0.65:
+                    issues.append(f"Best-of-N low ({best_of_n:.3f} < 0.65)")
+                if ema_reward < 0.60 and (best_of_n is None or best_of_n < 0.85):
+                    issues.append(f"Reward EMA low ({ema_reward:.3f} < 0.60)")
+                if best_of_n is not None and best_of_n < (rewards_mean + 0.05):
+                    issues.append("Sampling not helping (Best-of-N < Mean + 0.05)")
+                # Baseline comparison is noisy in epoch 1; only enforce after grace period.
+                if ema_gain_from_baseline is not None and (epoch >= 2 or batch_idx >= (grace_batches * 2)):
+                    if ema_gain_from_baseline <= 0.00:
+                        issues.append(f"No gain vs baseline (EMA gain {ema_gain_from_baseline:+.3f})")
+
+            # If Best-of-N is much higher than mean, exploration variance is high.
+            # That's not necessarily bad, but it often indicates the mean reward will look low.
+            if best_of_n is not None and (best_of_n - rewards_mean) >= 0.25 and not in_grace:
+                issues.append("High sample variance (Best-of-N - Mean >= 0.25); consider lowering temperature or fewer samples/prompt")
+
+            # Time breakdown
+            # On Apple Silicon with cached scoring, generation often dominates. Only warn if it's BOTH dominant and slow.
+            gen_bottleneck_pct = float(getattr(self.config, "health_check_gen_bottleneck_pct", 85.0) or 85.0)
+            gen_target_tps = float(getattr(self.config, "health_check_gen_target_tps", 6.0) or 6.0)
+            if gen_pct >= gen_bottleneck_pct and raw_tokens_per_sec < gen_target_tps:
+                issues.append(f"Generation bottleneck ({gen_pct:.1f}% >= {gen_bottleneck_pct:.0f}% and raw tok/s {raw_tokens_per_sec:.1f} < {gen_target_tps:.1f})")
+            if score_pct >= 40.0:
+                issues.append(f"Scoring bottleneck ({score_pct:.1f}% >= 40%)")
+            if train_pct >= 50.0:
+                issues.append(f"Training bottleneck ({train_pct:.1f}% >= 50%)")
+
+            # Generation efficiency
+            if raw_tokens_per_sec < 4.0:
+                issues.append(f"Gen raw tok/s low ({raw_tokens_per_sec:.1f} < 4.0)")
+            if kept_tokens_per_sec < 2.0:
+                issues.append(f"Gen kept tok/s low ({kept_tokens_per_sec:.1f} < 2.0)")
+            if diversity_ratio < 0.60:
+                issues.append(f"Diversity ratio low ({diversity_ratio:.2f} < 0.60)")
+            if kept_samples <= 0:
+                issues.append("No kept samples (all filtered/failed)")
+
+            # Fragmentation / cache growth (Apple Silicon / Metal)
+            if bool(getattr(self.config, "health_check_fragmentation_enabled", True)) and not in_grace:
+                mps_thr = float(getattr(self.config, "health_check_mps_fragmentation_gb", 10.0) or 10.0)
+                mlx_thr = float(getattr(self.config, "health_check_mlx_cache_gb", 3.0) or 3.0)
+                # Prefer alerting on growth (fragmentation getting worse), not just "high cached memory" which can be normal.
+                growth_thr = float(getattr(self.config, "health_check_fragmentation_growth_gb", 0.75) or 0.75)
+                if frag_mps_gb >= mps_thr and (frag_mps_growth_gb >= growth_thr or frag_gc_cooldown_blocked):
+                    msg = f"MPS fragmentation high ({frag_mps_gb:.2f}GB >= {mps_thr:.2f}GB)"
+                    if frag_mps_growth_gb >= growth_thr:
+                        msg += f" and growing (+{frag_mps_growth_gb:.2f}GB)"
+                    if frag_gc_cooldown_blocked:
+                        msg += " (GC cooldown active)"
+                    issues.append(msg)
+                if frag_mlx_cache_gb >= mlx_thr:
+                    issues.append(f"MLX cache high ({frag_mlx_cache_gb:.2f}GB >= {mlx_thr:.2f}GB)")
+                if frag_triggered_gc:
+                    issues.append("Triggered GC/cache clear due to fragmentation")
+
+            # Teacher activity sanity
+            if teacher_score_calls_batch is not None and teacher_score_calls_batch == 0 and teacher_in_tokens > 0:
+                issues.append("TeacherScoreCalls=0 but teacher input tokens > 0 (unexpected)")
+
+            status = "OK" if not issues else "WARN"
+            base = (
+                f"[HealthCheck] {status} | e{epoch} b{batch_idx} | "
+                f"reward(mean={rewards_mean:.3f}, ema={ema_reward:.3f}"
+            )
+            if best_of_n is not None:
+                base += f", bestN={best_of_n:.3f}"
+            base += ") | "
+            base += f"time(gen={gen_pct:.0f}%, score={score_pct:.0f}%, train={train_pct:.0f}%) | "
+            base += f"gen(tok/s raw={raw_tokens_per_sec:.1f}, kept={kept_tokens_per_sec:.1f}, div={diversity_ratio:.2f})"
+
+            if issues:
+                logger.warning(base + " | " + "; ".join(issues))
+            else:
+                logger.info(base)
+
+            # Optional: log a small set of health flags to TensorBoard for quick filtering
+            if self.writer:
+                bs = int(getattr(self, "_batch_step", 0))
+                self.writer.add_scalar("Health/Gen_BottleneckPct", float(gen_pct), bs)
+                self.writer.add_scalar("Health/Score_BottleneckPct", float(score_pct), bs)
+                self.writer.add_scalar("Health/Train_BottleneckPct", float(train_pct), bs)
+                self.writer.add_scalar("Health/DiversityRatio", float(diversity_ratio), bs)
+                self.writer.add_scalar("Health/Reward_EMA", float(ema_reward), bs)
+                if ema_gain_from_baseline is not None:
+                    self.writer.add_scalar("Health/Reward_EMA_GainFromBaseline", float(ema_gain_from_baseline), bs)
+                self.writer.add_scalar("Health/Metal_MPS_Fragmentation_GB", float(frag_mps_gb), bs)
+                self.writer.add_scalar("Health/Metal_MLX_Cache_GB", float(frag_mlx_cache_gb), bs)
+                self.writer.add_scalar("Health/Metal_GC_Triggered", 1.0 if frag_triggered_gc else 0.0, bs)
+        except Exception:
+            # Never fail training due to health checks
+            return
+
     def _compute_baseline_reward(self, train_loader: DataLoader) -> float:
         """Compute a pre-training baseline reward (no weight updates).
         
@@ -553,6 +1064,13 @@ class RLAIFTrainer:
         self._prev_batch_avg_reward = None
         self._reward_ema = None  # exponential moving average of batch avg reward
         self._batch_step = 0  # monotonic batch counter for continuous TensorBoard time series
+        self._prev_frag_metrics = {}
+        self._last_fragment_gc_batch = -10**9
+        self._mlx_worker = None
+        self._mlx_worker_req_id = 0
+        self._mlx_worker_model_path = None
+        self._mlx_worker_last_mem = {"active_gb": 0.0, "cache_gb": 0.0, "peak_gb": 0.0, "pid": 0}
+        self._warned_mlx_missing_for_checkpointing = False
         
         # Load model and tokenizer
         logger.info(f"Loading base model: {config.base_model}")
@@ -632,6 +1150,14 @@ class RLAIFTrainer:
                 "trust_remote_code": True,
                 "low_cpu_mem_usage": config.low_cpu_mem_usage,  # Optimize memory usage during loading
             }
+            # Prefer SDPA on Apple Silicon for better memory behavior (flash_attention_2 is CUDA-only).
+            # This can materially reduce peak activation memory during training forward/backward.
+            try:
+                if getattr(config, "use_flash_attention", False) and (config.use_mps and torch.backends.mps.is_available()):
+                    model_kwargs["attn_implementation"] = "sdpa"
+                    logger.info("Attention impl: using SDPA on MPS (memory-efficient)")
+            except Exception:
+                pass
             
             # Prefer safetensors format for faster loading
             if config.use_safetensors:
@@ -645,6 +1171,13 @@ class RLAIFTrainer:
             # Setup quantization for M5 MacBook
             # WARNING: 4-bit quantization with bfloat16 on MPS can cause NaN logits
             # BitsAndBytes quantization may not be fully compatible with MPS
+            if config.use_4bit and config.use_mps and torch.backends.mps.is_available() and not getattr(config, "allow_4bit_on_mps", False):
+                # Default-safe behavior: do NOT use bitsandbytes 4-bit on MPS.
+                # You already get the speed benefits via MLX quantized generation (q4/q8).
+                logger.info("Disabling BitsAndBytes 4-bit for PyTorch training on MPS (stability). "
+                            "To override, set `hardware.allow_4bit_on_mps: true`.")
+                config.use_4bit = False
+
             if config.use_4bit:
                 if config.use_mps and torch.backends.mps.is_available():
                     logger.warning("⚠️  4-bit quantization on MPS may cause NaN logits!")
@@ -843,7 +1376,10 @@ class RLAIFTrainer:
             if len(quarter_times) == 4:
                 avg_first_three = sum(quarter_times[:3]) / 3
                 last_quarter = quarter_times[3]
-                if last_quarter > avg_first_three * 1.2:
+                # Guard against zero/near-zero timings (can happen with very small sample counts or coarse timers)
+                if avg_first_three <= 1e-6:
+                    logger.debug("Skipping shard slowdown ratio: insufficient timing resolution (avg_first_three≈0).")
+                elif last_quarter > avg_first_three * 1.2:
                     ratio = last_quarter / avg_first_three
                     logger.info(f"\n⚠️  Last shard (75-100%) is {ratio:.1f}x slower than average")
                     logger.info("   This is normal due to:")
@@ -1051,6 +1587,22 @@ class RLAIFTrainer:
             logger.info("Unsloth enabled; skipping MLX generation (MLX is Apple Silicon only).")
 
         if config.use_mlx_for_generation and not config.use_unsloth:
+            def _is_mlx_dir(p: str) -> bool:
+                try:
+                    if not p or not os.path.exists(p) or not os.path.isdir(p):
+                        return False
+                    # mlx_lm.convert output formats vary by mlx-lm version.
+                    # On mlx-lm 0.29.x, `mlx_lm.load()` can load a directory that contains:
+                    # - config.json
+                    # - model.safetensors (and sometimes model.safetensors.index.json)
+                    # Older versions may emit weights.npz / model.npz instead.
+                    has_cfg = os.path.exists(os.path.join(p, "config.json"))
+                    has_npz = os.path.exists(os.path.join(p, "weights.npz")) or os.path.exists(os.path.join(p, "model.npz"))
+                    has_safetensors = os.path.exists(os.path.join(p, "model.safetensors")) or os.path.exists(os.path.join(p, "weights.safetensors"))
+                    return bool(has_cfg and (has_npz or has_safetensors))
+                except Exception:
+                    return False
+
             # Auto-detect MLX model path if not specified
             mlx_path = config.mlx_model_path
             if mlx_path is None:
@@ -1059,22 +1611,48 @@ class RLAIFTrainer:
                     "./mlx_model/q4",  # Q4 quantized (fastest + smallest; best throughput)
                     "./mlx_model/q8",  # Q8 quantized (best balance)
                     "./mlx_model/base", # Unquantized base model
+                    "./mlx/q4",         # Alternate common folder name
+                    "./mlx/q8",
+                    "./mlx/base",
                 ]
+                # First pass: exact known locations
                 for path in possible_paths:
-                    if os.path.exists(path):
+                    if _is_mlx_dir(path):
                         mlx_path = path
                         logger.info(f"Auto-detected MLX model at: {mlx_path}")
                         break
+                # Second pass: scan likely parent dirs for any MLX model dir
+                if mlx_path is None:
+                    for parent in ("./mlx_model", "./mlx"):
+                        try:
+                            if os.path.exists(parent) and os.path.isdir(parent):
+                                for name in os.listdir(parent):
+                                    cand = os.path.join(parent, name)
+                                    if _is_mlx_dir(cand):
+                                        mlx_path = cand
+                                        logger.info(f"Auto-detected MLX model at: {mlx_path}")
+                                        break
+                        except Exception:
+                            pass
+                        if mlx_path is not None:
+                            break
                 if mlx_path is None:
                     logger.warning("MLX enabled but no model found. Expected locations:")
                     for path in possible_paths:
                         logger.warning(f"  - {path}")
                     logger.warning("To convert model to MLX:")
-                    logger.warning(f"  uv run python scripts/utils/convert_to_mlx.py --hf-path {self.config.base_model} --mlx-path ./mlx_model/q8 --quantize q8_bit")
+                    logger.warning(f"  uv run mlx_lm.convert --hf-path {self.config.base_model} --mlx-path ./mlx_model/q8 -q --q-bits 8")
+                    if getattr(config, "require_mlx_for_generation", False):
+                        raise RuntimeError("MLX generation required but no MLX model directory was found. Set hardware.mlx_model_path or run mlx_lm.convert.")
                     logger.warning("Falling back to PyTorch MPS for generation (slower)")
             
             # Load MLX model if path was found or specified
             if mlx_path is not None:
+                if not _is_mlx_dir(mlx_path) and os.path.isdir(mlx_path):
+                    logger.warning(f"MLX path exists but does not look like an mlx_lm.convert output dir: {mlx_path}")
+                    logger.warning("Expected: config.json + (weights.npz/model.npz OR model.safetensors).")
+                    if getattr(config, "require_mlx_for_generation", False):
+                        raise RuntimeError(f"MLX generation required but MLX model dir is invalid: {mlx_path}")
                 self._load_mlx_model_for_generation(mlx_path)
         elif config.mlx_model_path:
             # MLX path specified but not enabled - warn user
@@ -1106,6 +1684,33 @@ class RLAIFTrainer:
                 # This leaves room for system and other allocations
                 torch.backends.mps.set_per_process_memory_fraction(0.7)
                 logger.info("MPS memory fraction set to 0.7 (70%) to prevent OOM")
+
+            # Experimental allocator warmup: allocate+free a few large chunks to prime the Metal heap.
+            warm_gb = float(getattr(self.config, "mps_allocator_warmup_gb", 0.0) or 0.0)
+            if warm_gb > 0:
+                try:
+                    target_bytes = int(warm_gb * (1024 ** 3))
+                    chunk_bytes = int(256 * (1024 ** 2))  # 256MB chunks
+                    allocated = 0
+                    chunks = []
+                    logger.info(f"MPS allocator warmup: attempting ~{warm_gb:.2f} GB (in 256MB chunks)")
+                    while allocated < target_bytes:
+                        # float16 = 2 bytes/elem -> numel = bytes/2
+                        numel = max(1, chunk_bytes // 2)
+                        chunks.append(torch.empty((numel,), device=device, dtype=torch.float16))
+                        allocated += chunk_bytes
+                    try:
+                        torch.mps.synchronize()
+                    except Exception:
+                        pass
+                    del chunks
+                    try:
+                        torch.mps.empty_cache()
+                    except Exception:
+                        pass
+                    logger.info("MPS allocator warmup complete")
+                except Exception as e:
+                    logger.warning(f"MPS allocator warmup failed/skipped: {type(e).__name__}: {e}")
         elif torch.cuda.is_available():
             device = torch.device("cuda")
             logger.info("Using CUDA")
@@ -1117,6 +1722,15 @@ class RLAIFTrainer:
     def _load_mlx_model_for_generation(self, model_path: str):
         """Load MLX model for faster generation (similar to preload_model.py)"""
         try:
+            # If enabled, use a separate process for MLX generation to reduce Metal allocator contention.
+            if getattr(self.config, "use_mlx_generation_worker", False):
+                logger.info(f"Starting MLX generation worker for model: {model_path}")
+                self._start_mlx_generation_worker(model_path)
+                # Do NOT load MLX model in-process (avoid allocations in the training process)
+                self.mlx_model = None
+                self.mlx_tokenizer = None
+                return
+
             from mlx_lm import load
             logger.info(f"Loading MLX model for faster generation: {model_path}")
             
@@ -1169,7 +1783,7 @@ class RLAIFTrainer:
                     logger.info(f"  Using {quantize_bits}-bit quantization for faster inference")
                 else:
                     logger.info("  Using full precision (this is MUCH slower). For best throughput, use q4/q8:")
-                    logger.info(f"    uv run python scripts/utils/convert_to_mlx.py --hf-path {self.config.base_model} --mlx-path ./mlx_model/q4 --quantize q4_bit")
+                    logger.info(f"    uv run mlx_lm.convert --hf-path {self.config.base_model} --mlx-path ./mlx_model/q4 -q --q-bits 4")
 
                 # Warm up MLX generation to pay compilation/Metal setup once (not inside epoch timing).
                 # This is a major source of “Batch 0 took minutes” behavior.
@@ -1189,6 +1803,9 @@ class RLAIFTrainer:
                     self.generation_warmup_done = True
                 except Exception as e:
                     logger.debug(f"MLX warmup failed (non-critical): {e}")
+
+                # Apply Metal cache limit (optional) to reduce long-run fragmentation.
+                self._maybe_apply_mlx_metal_cache_limit()
                 
                 # Verify tokenizer compatibility between MLX and PyTorch
                 # This is CRITICAL: if tokenizers produce different token IDs, we'll get NaN logits
@@ -1233,14 +1850,14 @@ class RLAIFTrainer:
                 logger.warning(f"MLX model path specified but not found: {model_path}")
                 logger.info("Will use PyTorch for generation (slower)")
                 logger.info("Tip: Convert model to MLX format:")
-                logger.info(f"  uv run python scripts/utils/convert_to_mlx.py --hf-path {self.config.base_model} --mlx-path {model_path}")
+                logger.info(f"  uv run mlx_lm.convert --hf-path {self.config.base_model} --mlx-path {model_path}")
                 if self.config.mlx_quantization:
                     logger.info(f"  --quantize {self.config.mlx_quantization}")
             else:
                 # No MLX model specified or found
                 logger.info("MLX model not found. Will use PyTorch for generation (slower).")
                 logger.info("Tip: Convert model to MLX format for 5-10x faster generation:")
-                logger.info(f"  uv run python scripts/utils/convert_to_mlx.py --hf-path {self.config.base_model} --mlx-path ./mlx_model/q8 --quantize q8_bit")
+                logger.info(f"  uv run mlx_lm.convert --hf-path {self.config.base_model} --mlx-path ./mlx_model/q8 -q --q-bits 8")
                 logger.info("Then update config.yaml:")
                 logger.info("  hardware:")
                 logger.info("    use_mlx_for_generation: true")
@@ -1326,12 +1943,16 @@ class RLAIFTrainer:
         varied_prompt = prompt_variations[variation_idx]
 
         # Add an epoch “salt” so the same prompt yields different completions across epochs.
-        epoch_salt = (
-            f"\n\n[Epoch Variation: {epoch + 1} | nonce={nonce}]\n"
-            f"- {style_directives[style_idx]}\n"
-            f"- IMPORTANT: Try to produce a meaningfully different solution than previous epochs "
-            f"(different structure/approach), while staying correct.\n"
-        )
+        #
+        # Important performance note (Apple Silicon / MLX):
+        # Prompt *prefill* cost is a big chunk of total time. Keep this salt short so we don't
+        # pay a large prefill penalty for every sample.
+        #
+        # We still inject diversity via:
+        # - template randomization
+        # - prompt variation text
+        # - (optionally) sampling on retries
+        epoch_salt = f"\n\n[Var e{epoch + 1} n{nonce}] {style_directives[style_idx]}\n"
 
         return template.format(prompt=varied_prompt + epoch_salt)
     
@@ -1343,6 +1964,10 @@ class RLAIFTrainer:
                 self._unsloth_flm.for_inference(self.model)
             except Exception:
                 pass
+
+        # Use MLX generation worker if enabled (isolates Metal allocations from PyTorch MPS)
+        if getattr(self, "_mlx_worker", None) is not None:
+            return self._generate_with_mlx_worker(prompts, languages, num_samples, epoch=epoch)
 
         # Use MLX for generation if available (much faster than PyTorch MPS)
         if self.mlx_model is not None and self.mlx_tokenizer is not None:
@@ -1379,13 +2004,41 @@ class RLAIFTrainer:
         import hashlib
 
         # Import sampler once (avoid per-sample import overhead)
+        # mlx-lm 0.29.x uses sample_utils.make_sampler; older builds may have mlx_lm.sample.
+        mlx_sample = None
+        make_sampler = None
         try:
-            from mlx_lm.sample import sample as mlx_sample
+            from mlx_lm.sample_utils import make_sampler as make_sampler  # type: ignore
         except Exception:
-            mlx_sample = None
+            make_sampler = None
+        if make_sampler is None:
+            try:
+                from mlx_lm.sample import sample as mlx_sample  # type: ignore
+            except Exception:
+                mlx_sample = None
 
-        # Track duplicates within this generation call to avoid wasting samples.
-        seen_hashes_in_call = set()
+        # Track duplicates *per original prompt* (NOT global across prompts).
+        # Global dedup across different prompts can over-filter useful samples and hurt throughput.
+        seen_hashes_by_prompt: Dict[str, set] = {}
+
+        # Cache prompt tokenization to reduce Python overhead (MLX accepts prompt token IDs).
+        # Keyed by full prompt string (already includes epoch salt/nonce).
+        prompt_token_cache: Dict[str, List[int]] = {}
+
+        def _encode_prompt_ids(p: str) -> Optional[List[int]]:
+            try:
+                enc = getattr(self.mlx_tokenizer, "encode", None)
+                if callable(enc):
+                    ids = enc(p)
+                    if isinstance(ids, list) and ids and isinstance(ids[0], int):
+                        return ids
+                # Fallback to HF tokenizer (works if tokenizers match)
+                ids = self.tokenizer.encode(p, add_special_tokens=False)
+                if isinstance(ids, list) and ids and isinstance(ids[0], int):
+                    return ids
+            except Exception:
+                return None
+            return None
 
         for formatted_prompt, (prompt, language, sample_idx) in zip(all_formatted_prompts, prompt_metadata):
             try:
@@ -1421,6 +2074,10 @@ class RLAIFTrainer:
                 # - Attempt 0: greedy for ALL samples (fast, maximizes tokens/sec)
                 # - If we detect a duplicate hash (call/epoch/global): retry with higher-entropy sampling + new nonce
                 max_novelty_attempts = 3 if epoch > 0 else 2
+                # Use a prompt-scoped key so cross-prompt duplicates don't trigger retries/filters.
+                prompt_key = hashlib.md5(str(prompt).encode()).hexdigest()[:10]
+                prompt_seen = seen_hashes_by_prompt.setdefault(prompt_key, set())
+
                 generated_text = ""
                 generated_code = ""
                 code_hash = ""
@@ -1429,7 +2086,7 @@ class RLAIFTrainer:
                     sampler = None
                     # Enable sampling ONLY on retries (duplicates detected). This avoids a Python callback per token
                     # on the common (unique) path and significantly improves overall throughput.
-                    if attempt > 0 and mlx_sample is not None and base_temp and base_temp > 0:
+                    if attempt > 0 and base_temp and base_temp > 0:
                         import random
                         # Retry attempts should explore more to avoid duplicates.
                         # Use a higher base temperature and wider variation on retries.
@@ -1447,7 +2104,13 @@ class RLAIFTrainer:
                             top_k = max(top_k, 80)
                             top_p = max(top_p, 0.98)
 
-                        sampler = lambda logits: mlx_sample(logits, temp=sample_temp, top_k=top_k, top_p=top_p)
+                        if make_sampler is not None:
+                            # make_sampler returns a logits->token sampler callable
+                            sampler = make_sampler(temp=sample_temp, top_p=top_p, top_k=top_k)
+                        elif mlx_sample is not None:
+                            sampler = lambda logits: mlx_sample(logits, temp=sample_temp, top_k=top_k, top_p=top_p)
+                        else:
+                            sampler = None
 
                     # Attempt 0 uses the pre-built per-sample prompt (unique nonce already baked in).
                     # On retries, change the prompt nonce so the model sees a different “context salt”.
@@ -1460,11 +2123,17 @@ class RLAIFTrainer:
                         nonce=(sample_idx * 10 + attempt),
                     )
                     used_prompt = attempt_prompt
+                    # Prefer passing prompt token IDs to avoid repeated tokenization inside mlx-lm.
+                    prompt_ids = prompt_token_cache.get(attempt_prompt)
+                    if prompt_ids is None:
+                        prompt_ids = _encode_prompt_ids(attempt_prompt)
+                        if prompt_ids is not None:
+                            prompt_token_cache[attempt_prompt] = prompt_ids
                     gen_call_start = time.time()
                     generated_text = mlx_generate(
                         self.mlx_model,
                         self.mlx_tokenizer,
-                        prompt=attempt_prompt,
+                        prompt=prompt_ids if prompt_ids is not None else attempt_prompt,
                         max_tokens=max_gen_tokens,  # Reduced for faster generation
                         sampler=sampler if sampler else None,  # Use sampler for temperature control
                     )
@@ -1478,21 +2147,22 @@ class RLAIFTrainer:
                     
                     normalized = ' '.join(generated_code.split())
                     code_hash = hashlib.md5(normalized.encode()).hexdigest()
+                    scoped_hash = f"{prompt_key}:{code_hash}"
                     # Retry only if we collided with something we've already seen:
-                    # - within this generation call (most common)
-                    # - earlier in the epoch
-                    # - in previous epochs (global)
+                    # - within this prompt (most common + most important)
+                    # - earlier in the epoch for this prompt
+                    # - in previous epochs for this prompt (optional; same structure across different prompts is allowed)
                     is_unique = (
-                        (code_hash not in seen_hashes_in_call)
-                        and (code_hash not in self._epoch_code_hashes)
-                        and (code_hash not in self._global_code_hashes)
+                        (code_hash not in prompt_seen)
+                        and (scoped_hash not in self._epoch_code_hashes)
+                        and (scoped_hash not in self._global_code_hashes)
                     )
                     if is_unique:
                         break
                 
                 if code_hash:
-                    self._epoch_code_hashes.add(code_hash)
-                    seen_hashes_in_call.add(code_hash)
+                    self._epoch_code_hashes.add(scoped_hash)
+                    prompt_seen.add(code_hash)
                 
                 # Optional micro-profiling (debug-only): log prompt vs output token sizes and per-sample time.
                 # This helps identify whether we're prefill-bound (long prompts) or decode-bound.
@@ -1515,8 +2185,11 @@ class RLAIFTrainer:
                     'full_prompt': used_prompt,
                     # Per-sample timing / token stats (helps compute avg-per-sample tok/s)
                     'gen_seconds': float(gen_call_seconds) if 'gen_call_seconds' in locals() else 0.0,
-                    'output_tokens': int(len(self.tokenizer.encode(generated_code, add_special_tokens=False))) if generated_code else 0,
+                    # NOTE: token counting is intentionally deferred to the batch loop (batched tokenizer pass)
+                    # to avoid per-sample CPU overhead during generation.
+                    'output_tokens': 0,
                     'code_hash': code_hash,
+                    'prompt_key': prompt_key,
                 })
             except Exception as e:
                 logger.warning(f"MLX generation failed for prompt: {e}")
@@ -1529,6 +2202,108 @@ class RLAIFTrainer:
                     'full_prompt': formatted_prompt,
                 })
         
+        return samples
+
+    def _generate_with_mlx_worker(self, prompts: List[str], languages: List[str], num_samples: int, epoch: int = 0) -> List[Dict]:
+        """Generate using MLX worker subprocess (isolates Metal allocations from PyTorch MPS)."""
+        samples: List[Dict] = []
+        all_formatted_prompts: List[str] = []
+        prompt_metadata = []  # (prompt, language, sample_idx)
+
+        for prompt, language in zip(prompts, languages):
+            for sample_idx in range(num_samples):
+                formatted_prompt = self._generate_prompt_variation(prompt, language, sample_idx, num_samples, epoch=epoch, nonce=sample_idx)
+                all_formatted_prompts.append(formatted_prompt)
+                prompt_metadata.append((prompt, language, sample_idx))
+
+        import hashlib
+        seen_hashes_by_prompt: Dict[str, set] = {}
+
+        max_gen_tokens = min(128, self.config.max_length // 4)
+        base_temp = float(self.config.generation_temperature)
+        base_top_k = int(self.config.top_k)
+        base_top_p = float(self.config.top_p)
+
+        for formatted_prompt, (prompt, language, sample_idx) in zip(all_formatted_prompts, prompt_metadata):
+            try:
+                prompt_key = hashlib.md5(str(prompt).encode()).hexdigest()[:10]
+                prompt_seen = seen_hashes_by_prompt.setdefault(prompt_key, set())
+
+                generated_text = ""
+                generated_code = ""
+                code_hash = ""
+                used_prompt = formatted_prompt
+                max_novelty_attempts = 3 if epoch > 0 else 2
+
+                for attempt in range(max_novelty_attempts):
+                    do_sample = bool(attempt > 0 and base_temp and base_temp > 0)
+                    temp = float(base_temp)
+                    top_k = int(base_top_k)
+                    top_p = float(base_top_p)
+                    if do_sample:
+                        # Wider exploration on retries
+                        temp = max(1.0, temp + 0.35 * attempt)
+                        top_k = max(top_k, 80)
+                        top_p = max(top_p, 0.98)
+
+                    attempt_prompt = formatted_prompt if attempt == 0 else self._generate_prompt_variation(
+                        prompt, language, sample_idx=sample_idx, num_samples=num_samples, epoch=epoch, nonce=(sample_idx * 10 + attempt)
+                    )
+                    used_prompt = attempt_prompt
+
+                    gen_call_start = time.time()
+                    resp = self._mlx_generate_via_worker(
+                        prompt_text=attempt_prompt,
+                        max_tokens=max_gen_tokens,
+                        do_sample=do_sample,
+                        temp=temp,
+                        top_p=top_p,
+                        top_k=top_k,
+                    )
+                    gen_call_seconds = float(resp.get("seconds", 0.0) or 0.0)
+                    generated_text = str(resp.get("text", "") or "")
+
+                    if generated_text.startswith(attempt_prompt):
+                        generated_code = generated_text[len(attempt_prompt):].strip()
+                    else:
+                        generated_code = generated_text.strip()
+
+                    normalized = " ".join(generated_code.split())
+                    code_hash = hashlib.md5(normalized.encode()).hexdigest()
+                    scoped_hash = f"{prompt_key}:{code_hash}"
+                    is_unique = (code_hash not in prompt_seen) and (scoped_hash not in self._epoch_code_hashes) and (scoped_hash not in self._global_code_hashes)
+                    if is_unique:
+                        break
+
+                if code_hash:
+                    self._epoch_code_hashes.add(f"{prompt_key}:{code_hash}")
+                    prompt_seen.add(code_hash)
+
+                samples.append(
+                    {
+                        "prompt": prompt,
+                        "language": language,
+                        "code": generated_code,
+                        "full_prompt": used_prompt,
+                        "gen_seconds": float(gen_call_seconds) if gen_call_seconds else 0.0,
+                        "output_tokens": int(resp.get("output_tokens", 0) or 0) if "resp" in locals() else 0,
+                        "code_hash": code_hash,
+                        "prompt_key": prompt_key,
+                    }
+                )
+            except Exception as e:
+                # If worker died, try restarting once (best-effort) then continue.
+                if "Broken pipe" in str(e) or "exited" in str(e):
+                    try:
+                        mp = getattr(self, "_mlx_worker_model_path", None)
+                        if mp:
+                            logger.warning("MLX worker appears dead; restarting...")
+                            self._start_mlx_generation_worker(mp)
+                    except Exception:
+                        pass
+                logger.warning(f"MLX worker generation failed for prompt: {e}")
+                samples.append({"prompt": prompt, "language": language, "code": "", "full_prompt": formatted_prompt})
+
         return samples
     
     def _generate_with_pytorch(self, prompts: List[str], languages: List[str], num_samples: int, epoch: int = 0) -> List[Dict]:
@@ -1721,7 +2496,9 @@ class RLAIFTrainer:
             Filtered list with duplicates removed (keeping first occurrence)
         """
         import hashlib
-        seen_hashes = set()
+        # Deduplicate *within each original prompt*, not across different prompts.
+        # Cross-prompt dedup can drop too many samples and is usually not what we want for training.
+        seen_by_prompt: Dict[str, set] = {}
         unique_samples = []
         
         for sample in samples:
@@ -1736,14 +2513,23 @@ class RLAIFTrainer:
                 code_hash = hashlib.md5(normalized.encode()).hexdigest()
                 sample['code_hash'] = code_hash
             
-            if code_hash not in seen_hashes:
-                seen_hashes.add(code_hash)
+            prompt_key = sample.get("prompt_key")
+            if not prompt_key:
+                prompt_key = hashlib.md5(str(sample.get("prompt", "")).encode()).hexdigest()[:10]
+                sample["prompt_key"] = prompt_key
+            seen = seen_by_prompt.setdefault(prompt_key, set())
+
+            if code_hash not in seen:
+                seen.add(code_hash)
                 unique_samples.append(sample)
             else:
                 logger.debug(f"Filtered duplicate sample (hash: {code_hash[:8]}...)")
         
         if len(unique_samples) < len(samples):
-            logger.info(f"Filtered {len(samples) - len(unique_samples)} duplicate samples (diversity: {len(unique_samples)/len(samples)*100:.1f}%)")
+            logger.info(
+                f"Filtered {len(samples) - len(unique_samples)} duplicate samples "
+                f"(prompt-scoped diversity: {len(unique_samples)/len(samples)*100:.1f}%)"
+            )
         
         return unique_samples
     
@@ -2546,8 +3332,12 @@ class RLAIFTrainer:
         logger.info(f"  Gradient accumulation: {self.config.gradient_accumulation_steps}")
         logger.info(f"  Effective batch size: {self.config.batch_size * self.config.gradient_accumulation_steps}")
         logger.info(f"  Samples per prompt: {self.config.num_samples_per_prompt}")
-        logger.info(f"  Using MLX for generation: {self.mlx_model is not None}")
-        if self.mlx_model is None:
+        mlx_enabled = (getattr(self, "_mlx_worker", None) is not None) or (self.mlx_model is not None and self.mlx_tokenizer is not None)
+        if getattr(self, "_mlx_worker", None) is not None:
+            logger.info("  Using MLX for generation: True (worker subprocess)")
+        else:
+            logger.info(f"  Using MLX for generation: {self.mlx_model is not None}")
+        if not mlx_enabled:
             logger.warning("  ⚠️  MLX not enabled - generation will be slow. Enable for 5-10x speedup.")
         
         # Setup optimizer
@@ -2671,6 +3461,9 @@ class RLAIFTrainer:
                 gen_start = time.time()
                 # samples is already initialized above
                 try:
+                    # NOTE: Avoid clearing MLX Metal cache every batch (can create GPU idle gaps).
+                    # We rely on the fragmentation health check to trigger cache clears only when needed.
+
                     samples_all = self.generate_student_samples(
                         prompts,
                         languages,
@@ -2682,11 +3475,11 @@ class RLAIFTrainer:
                     # Prefer already-computed token counts from generation (avoid extra tokenizer passes)
                     raw_num_tokens = sum(int(s.get('output_tokens', 0) or 0) for s in samples_all)
                     if raw_num_tokens == 0:
-                        # Fallback for PyTorch samples that don't have output_tokens
-                        for s in samples_all:
-                            code = s.get('code', '')
-                            if code:
-                                raw_num_tokens += len(self.tokenizer.encode(code, add_special_tokens=False))
+                        # Fast fallback: batched tokenization (much cheaper than per-sample encode in a loop)
+                        codes = [s.get('code', '') for s in samples_all if s.get('code', '')]
+                        if codes:
+                            tok = self.tokenizer(codes, add_special_tokens=False, return_attention_mask=False)
+                            raw_num_tokens = int(sum(len(ids) for ids in tok.get('input_ids', [])))
                     raw_tokens_per_sec = raw_num_tokens / max(gen_time := (time.time() - gen_start), 1e-6)
 
                     samples = samples_all
@@ -2721,6 +3514,7 @@ class RLAIFTrainer:
                     before_n = after_n = 0
                     samples = []  # Ensure samples is empty list on error
                 gen_time = time.time() - gen_start
+                # (cache clear handled by fragmentation health check / OOM handlers)
                 
                 # Synchronize MPS only if needed (after generation, before training)
                 if torch.backends.mps.is_available() and batch_idx % 5 == 0:
@@ -2731,10 +3525,10 @@ class RLAIFTrainer:
                 # - kept_*: after dedup filtering (effective training throughput)
                 num_tokens = sum(int(s.get('output_tokens', 0) or 0) for s in samples)
                 if num_tokens == 0:
-                    for s in samples:
-                        code = s.get('code', '')
-                        if code:
-                            num_tokens += len(self.tokenizer.encode(code, add_special_tokens=False))
+                    codes = [s.get('code', '') for s in samples if s.get('code', '')]
+                    if codes:
+                        tok = self.tokenizer(codes, add_special_tokens=False, return_attention_mask=False)
+                        num_tokens = int(sum(len(ids) for ids in tok.get('input_ids', [])))
                 tokens_per_sec = num_tokens / gen_time if gen_time > 0 else 0
                 self.training_metrics['generation_tokens_per_sec'].append(tokens_per_sec)
                 
@@ -2749,10 +3543,12 @@ class RLAIFTrainer:
                     epoch_gen_samples_raw.append(before_n if 'before_n' in locals() else len(samples_all))
                     epoch_gen_samples_kept.append(after_n if 'after_n' in locals() else len(samples))
                 
-                # Log to TensorBoard periodically
+                # Log to TensorBoard periodically.
+                # Use monotonic batch step for time-series (global_step can stay flat under grad accumulation).
                 if self.writer and batch_idx % 10 == 0:
-                    self.writer.add_scalar('Performance/Generation_TokensPerSec', tokens_per_sec, global_step)
-                    self.writer.add_scalar('Performance/Generation_Time', gen_time, global_step)
+                    bs = int(getattr(self, "_batch_step", 0))
+                    self.writer.add_scalar('Performance/Generation_TokensPerSec', tokens_per_sec, bs)
+                    self.writer.add_scalar('Performance/Generation_Time', gen_time, bs)
                 
                 # Log generation performance (similar to preload_model.py)
                 if batch_idx % 5 == 0:
@@ -2778,7 +3574,7 @@ class RLAIFTrainer:
                     elif tokens_per_sec < 1.0:
                         # PyTorch MPS is slow - provide actionable advice
                         logger.warning("⚠️  Slow generation. Consider using MLX for 5-10x speedup:")
-                        logger.warning(f"  1. Convert model: uv run python scripts/utils/convert_to_mlx.py --hf-path {self.config.base_model} --mlx-path ./mlx_model/q8 --quantize q8_bit")
+                        logger.warning(f"  1. Convert model: uv run mlx_lm.convert --hf-path {self.config.base_model} --mlx-path ./mlx_model/q8 -q --q-bits 8")
                         logger.warning("  2. Update config.yaml: hardware.use_mlx_for_generation: true")
                 
                 # Compute rewards and collect dataset entries (optimized)
@@ -2881,7 +3677,43 @@ class RLAIFTrainer:
                         train_start = time.time()
                         # Ensure rewards list is long enough (train_batch uses one sample per prompt)
                         rewards_for_training = rewards[:len(batch['prompt'])] if len(rewards) >= len(batch['prompt']) else rewards + [0.0] * (len(batch['prompt']) - len(rewards))
-                        loss_dict = self.train_step(train_batch, rewards_for_training)
+                        try:
+                            # Proactively clear caches before the biggest peak (PyTorch backward)
+                            if torch.backends.mps.is_available():
+                                try:
+                                    torch.mps.empty_cache()
+                                except Exception:
+                                    pass
+                            if self.mlx_model is not None:
+                                try:
+                                    import mlx.core as mx
+                                    if hasattr(mx, "clear_cache"):
+                                        mx.clear_cache()
+                                except Exception:
+                                    pass
+
+                            loss_dict = self.train_step(train_batch, rewards_for_training)
+                        except RuntimeError as e:
+                            # Catch Apple GPU/MPS OOM / Metal command buffer errors and skip batch gracefully.
+                            msg = str(e)
+                            if "OutOfMemory" in msg or "Insufficient Memory" in msg or "kIOGPUCommandBufferCallbackErrorOutOfMemory" in msg or "command buffer exited with error status" in msg:
+                                self.error_stats['scoring_errors'] += 1  # count as a pipeline failure
+                                logger.error("MPS/Metal OOM during training step. Skipping this batch to continue.")
+                                logger.error(f"OOM detail: {msg[:300]}")
+                                if torch.backends.mps.is_available():
+                                    try:
+                                        torch.mps.empty_cache()
+                                        torch.mps.synchronize()
+                                    except Exception:
+                                        pass
+                                try:
+                                    import gc
+                                    gc.collect()
+                                except Exception:
+                                    pass
+                                loss_dict = {'loss': 0.0, 'policy_loss': 0.0, 'kl_penalty': 0.0, 'avg_reward': float(np.mean(rewards_for_training)) if rewards_for_training else 0.0}
+                            else:
+                                raise
                         train_time = max(time.time() - train_start, 0.001)  # Ensure non-zero (min 1ms for display)
                         epoch_losses.append(loss_dict['loss'])
                         
@@ -3041,7 +3873,8 @@ class RLAIFTrainer:
                     # Identify bottleneck
                     if gen_time > batch_time * 0.5:
                         logger.warning(f"⚠️  Generation is the bottleneck ({gen_time/batch_time*100:.1f}% of time)")
-                        if self.mlx_model is None:
+                        mlx_enabled = (getattr(self, "_mlx_worker", None) is not None) or (self.mlx_model is not None)
+                        if not mlx_enabled:
                             logger.warning("  → Enable MLX for 5-10x speedup (see above)")
                     elif reward_time > batch_time * 0.5:
                         logger.warning(f"⚠️  Scoring is the bottleneck ({reward_time/batch_time*100:.1f}% of time)")
@@ -3220,58 +4053,132 @@ class RLAIFTrainer:
                             _gen_raw_tok = float(raw_num_tokens) if 'raw_num_tokens' in locals() else 0.0
                             _gen_kept_tok = float(num_tokens) if 'num_tokens' in locals() else 0.0
 
-                            # Core reward signals
-                            self.writer.add_scalar("Batch/Reward_Mean", rewards_mean, bs)
+                            # =========================
+                            # TensorBoard "live dashboards" (4 panels)
+                            # We keep the tag space intentionally small so it's comprehensible.
+                            # =========================
+
+                            # 1) Reward / learning quality
+                            self.writer.add_scalar("Batch/Reward/Mean", rewards_mean, bs)
                             if avg_best_per_prompt is not None:
-                                self.writer.add_scalar("Batch/Reward_BestOfN_PerPrompt", float(avg_best_per_prompt), bs)
+                                self.writer.add_scalar("Batch/Reward/BestOfN_PerPrompt", float(avg_best_per_prompt), bs)
+                            self.writer.add_scalar("Batch/Reward/EMA", float(ema), bs)
                             if self.baseline_reward is not None:
-                                self.writer.add_scalar("Batch/Reward_GainFromBaseline", float(gain_from_baseline), bs)
-                                self.writer.add_scalar("Batch/Reward_EMA_GainFromBaseline", float(ema_gain_from_baseline), bs)
-                            self.writer.add_scalar("Batch/Reward_EMA", float(ema), bs)
+                                self.writer.add_scalar("Batch/Reward/EMA_GainFromBaseline", float(ema_gain_from_baseline), bs)
 
-                            # Generation shape/efficiency
-                            self.writer.add_scalar("Batch/Gen_Samples_Raw", float(raw_samples), bs)
-                            self.writer.add_scalar("Batch/Gen_Samples_Kept", float(kept_samples), bs)
-                            self.writer.add_scalar("Batch/Gen_DiversityRatio", float(diversity_ratio), bs)
-                            self.writer.add_scalar("Batch/Gen_TokPerSample_Raw", float((_gen_raw_tok / raw_samples) if raw_samples > 0 else 0.0), bs)
-                            self.writer.add_scalar("Batch/Gen_TokPerSample_Kept", float((_gen_kept_tok / kept_samples) if kept_samples > 0 else 0.0), bs)
-                            self.writer.add_scalar("Batch/Gen_TokPerSec_RawOverall", float(raw_tokens_per_sec) if 'raw_tokens_per_sec' in locals() else 0.0, bs)
-                            self.writer.add_scalar("Batch/Gen_TokPerSec_KeptOverall", float(tokens_per_sec) if 'tokens_per_sec' in locals() else 0.0, bs)
-                            self.writer.add_scalar("Batch/Gen_TokPerSec_RawAvgPerSample", float(raw_sample_tps), bs)
-                            self.writer.add_scalar("Batch/Gen_TokPerSec_KeptAvgPerSample", float(kept_sample_tps), bs)
+                            # Stage-oriented tags (Generation / Scoring / Training) for clearer dashboards.
+                            # Generation
+                            self.writer.add_scalar("Stage/Generation/TokPerSec_Raw", float(raw_tokens_per_sec) if 'raw_tokens_per_sec' in locals() else 0.0, bs)
+                            self.writer.add_scalar("Stage/Generation/TokPerSec_Kept", float(tokens_per_sec) if 'tokens_per_sec' in locals() else 0.0, bs)
+                            self.writer.add_scalar("Stage/Generation/TokPerSample_Raw", float((_gen_raw_tok / raw_samples) if raw_samples > 0 else 0.0), bs)
+                            self.writer.add_scalar("Stage/Generation/TokPerSample_Kept", float((_gen_kept_tok / kept_samples) if kept_samples > 0 else 0.0), bs)
+                            self.writer.add_scalar("Stage/Generation/DiversityRatio", float(diversity_ratio), bs)
+                            self.writer.add_scalar("Stage/Generation/Time_s", float(gen_time), bs)
+                            # Scoring
+                            self.writer.add_scalar("Stage/Scoring/Tokens_Input", float(_teacher_in), bs)
+                            self.writer.add_scalar("Stage/Scoring/Tokens_Output", float(_teacher_out), bs)
+                            self.writer.add_scalar("Stage/Scoring/TokensPerSec_Total", float(reward_tokens_per_sec) if 'reward_tokens_per_sec' in locals() else 0.0, bs)
+                            self.writer.add_scalar("Stage/Scoring/Latency_s", float(reward_time), bs)
+                            self.writer.add_scalar("Stage/Scoring/Reward_Mean", float(rewards_mean), bs)
+                            self.writer.add_scalar("Stage/Scoring/Reward_EMA", float(ema), bs)
+                            # Training
+                            self.writer.add_scalar("Stage/Training/Time_s", float(train_time), bs)
+                            self.writer.add_scalar("Stage/Training/TokensPerSec", float(train_tokens_per_sec) if 'train_tokens_per_sec' in locals() else 0.0, bs)
+                            self.writer.add_scalar("Stage/Training/Loss", float(loss_dict.get("loss", 0.0)) if isinstance(loss_dict, dict) else 0.0, bs)
+                            self.writer.add_scalar("Stage/Training/PolicyLoss", float(loss_dict.get("policy_loss", 0.0)) if isinstance(loss_dict, dict) else 0.0, bs)
+                            self.writer.add_scalar("Stage/Training/KLPenalty", float(loss_dict.get("kl_penalty", 0.0)) if isinstance(loss_dict, dict) else 0.0, bs)
 
-                            # Phase times and throughput
-                            self.writer.add_scalar("Batch/Time_Generation_s", float(gen_time), bs)
-                            self.writer.add_scalar("Batch/Time_Scoring_s", float(reward_time), bs)
-                            self.writer.add_scalar("Batch/Time_Training_s", float(train_time), bs)
-                            self.writer.add_scalar("Batch/Time_Total_s", float(batch_time), bs)
-                            self.writer.add_scalar("Batch/Training_TokPerSec", float(train_tokens_per_sec) if 'train_tokens_per_sec' in locals() else 0.0, bs)
-                            self.writer.add_scalar("Batch/Scoring_TokPerSec_Total", float(reward_tokens_per_sec) if 'reward_tokens_per_sec' in locals() else 0.0, bs)
+                            # A simple "progress score" that moves over time (reward EMA).
+                            self.writer.add_scalar("Progress/Reward_EMA", float(ema), bs)
+                            self.writer.add_scalar("Progress/Loss", float(loss_dict.get("loss", 0.0)) if isinstance(loss_dict, dict) else 0.0, bs)
 
-                            # Teacher calls (per batch) + tokens
+                            # 2) Time breakdown
+                            self.writer.add_scalar("Batch/Time/Generation_s", float(gen_time), bs)
+                            self.writer.add_scalar("Batch/Time/Scoring_s", float(reward_time), bs)
+                            self.writer.add_scalar("Batch/Time/Training_s", float(train_time), bs)
+                            self.writer.add_scalar("Batch/Time/Total_s", float(batch_time), bs)
+
+                            # 3) Generation efficiency
+                            self.writer.add_scalar("Batch/Gen/TokPerSample_Raw", float((_gen_raw_tok / raw_samples) if raw_samples > 0 else 0.0), bs)
+                            self.writer.add_scalar("Batch/Gen/TokPerSample_Kept", float((_gen_kept_tok / kept_samples) if kept_samples > 0 else 0.0), bs)
+                            self.writer.add_scalar("Batch/Gen/TokPerSec_RawOverall", float(raw_tokens_per_sec) if 'raw_tokens_per_sec' in locals() else 0.0, bs)
+                            self.writer.add_scalar("Batch/Gen/TokPerSec_KeptOverall", float(tokens_per_sec) if 'tokens_per_sec' in locals() else 0.0, bs)
+                            self.writer.add_scalar("Batch/Gen/DiversityRatio", float(diversity_ratio), bs)
+                            self.writer.add_scalar("Batch/Gen/Samples_Kept", float(kept_samples), bs)
+
+                            # 4) Teacher activity + (epoch errors are tracked separately under Epoch/*)
                             if 'teacher_gen_calls_batch' in locals():
-                                self.writer.add_scalar("Batch/TeacherGenCalls", float(teacher_gen_calls_batch), bs)
-                                self.writer.add_scalar("Batch/TeacherGenCacheHits", float(teacher_gen_hits_batch), bs)
-                                self.writer.add_scalar("Batch/TeacherScoreCalls", float(teacher_score_calls_batch), bs)
-                                self.writer.add_scalar("Batch/TeacherScoreCacheHits", float(teacher_score_hits_batch), bs)
-                            self.writer.add_scalar("Batch/TeacherTokens_Input", _teacher_in, bs)
-                            self.writer.add_scalar("Batch/TeacherTokens_Output", _teacher_out, bs)
-
-                            # Training params trend (LR) if scheduler exists
-                            try:
-                                current_lr = scheduler.get_last_lr()[0] if hasattr(scheduler, "get_last_lr") else None
-                                if current_lr is not None:
-                                    self.writer.add_scalar("Batch/LR", float(current_lr), bs)
-                            except Exception:
-                                pass
-
-                            # Loss scalars (batch)
-                            if isinstance(loss_dict, dict):
-                                self.writer.add_scalar("Batch/Loss", float(loss_dict.get("loss", 0.0)), bs)
-                                self.writer.add_scalar("Batch/PolicyLoss", float(loss_dict.get("policy_loss", 0.0)), bs)
-                                self.writer.add_scalar("Batch/KLPenalty", float(loss_dict.get("kl_penalty", 0.0)), bs)
+                                self.writer.add_scalar("Batch/Teacher/GenCalls", float(teacher_gen_calls_batch), bs)
+                                self.writer.add_scalar("Batch/Teacher/ScoreCalls", float(teacher_score_calls_batch), bs)
+                            self.writer.add_scalar("Batch/Teacher/Tokens_Input", _teacher_in, bs)
+                            self.writer.add_scalar("Batch/Teacher/Tokens_Output", _teacher_out, bs)
                 except Exception:
                     # Never fail training due to metrics logging
+                    pass
+
+                # --- Health check (periodic, cheap) ---
+                try:
+                    frag = self._get_fragmentation_metrics_gb()
+                    # Track growth (simple deltas)
+                    prev = getattr(self, "_prev_frag_metrics", None) or {}
+                    self._prev_frag_metrics = dict(frag)
+                    frag_mps_growth = float(frag.get("mps_frag_gb", 0.0)) - float(prev.get("mps_frag_gb", 0.0))
+
+                    # Determine if GC would be helpful but we're in cooldown (for clearer warnings)
+                    cooldown = int(getattr(self.config, "health_check_gc_cooldown_batches", 10) or 10)
+                    last_gc = int(getattr(self, "_last_fragment_gc_batch", -10**9))
+                    frag_gc_cooldown_blocked = (int(batch_idx) - last_gc) < max(0, cooldown)
+
+                    frag_triggered_gc = self._maybe_trigger_fragmentation_gc(batch_idx=int(batch_idx), frag=frag)
+
+                    # Batch-level TB for memory fragmentation proxies (helps spot growth trends)
+                    if self.writer:
+                        bs = int(getattr(self, "_batch_step", 0))
+                        self.writer.add_scalar("Batch/Metal/MPS_Allocated_GB", float(frag.get("mps_alloc_gb", 0.0)), bs)
+                        self.writer.add_scalar("Batch/Metal/MPS_DriverAllocated_GB", float(frag.get("mps_driver_gb", 0.0)), bs)
+                        self.writer.add_scalar("Batch/Metal/MPS_Fragmentation_GB", float(frag.get("mps_frag_gb", 0.0)), bs)
+                        self.writer.add_scalar("Batch/Metal/MLX_Active_GB", float(frag.get("mlx_active_gb", 0.0)), bs)
+                        self.writer.add_scalar("Batch/Metal/MLX_Cache_GB", float(frag.get("mlx_cache_gb", 0.0)), bs)
+                        self.writer.add_scalar("Batch/Metal/MLX_Peak_GB", float(frag.get("mlx_peak_gb", 0.0)), bs)
+                        # Growth
+                        self.writer.add_scalar("Batch/Metal/MPS_Fragmentation_Growth_GB", float(frag.get("mps_frag_gb", 0.0)) - float(prev.get("mps_frag_gb", 0.0)), bs)
+                        self.writer.add_scalar("Batch/Metal/MLX_Cache_Growth_GB", float(frag.get("mlx_cache_gb", 0.0)) - float(prev.get("mlx_cache_gb", 0.0)), bs)
+                        self.writer.add_scalar("Batch/Metal/GC_Triggered", 1.0 if frag_triggered_gc else 0.0, bs)
+
+                        # Stage-split Metal memory (generation is MLX worker, training is PyTorch/MPS).
+                        self.writer.add_scalar("Stage/Training/MPS_Allocated_GB", float(frag.get("mps_alloc_gb", 0.0)), bs)
+                        self.writer.add_scalar("Stage/Training/MPS_DriverAllocated_GB", float(frag.get("mps_driver_gb", 0.0)), bs)
+                        self.writer.add_scalar("Stage/Training/MPS_Fragmentation_GB", float(frag.get("mps_frag_gb", 0.0)), bs)
+                        self.writer.add_scalar("Stage/Generation/MLX_Active_GB", float(frag.get("mlx_active_gb", 0.0)), bs)
+                        self.writer.add_scalar("Stage/Generation/MLX_Cache_GB", float(frag.get("mlx_cache_gb", 0.0)), bs)
+                        self.writer.add_scalar("Stage/Generation/MLX_Peak_GB", float(frag.get("mlx_peak_gb", 0.0)), bs)
+
+                    self._run_health_check(
+                        epoch=int(epoch + 1),
+                        batch_idx=int(batch_idx),
+                        rewards_mean=float(rewards_mean),
+                        best_of_n=float(avg_best_per_prompt) if avg_best_per_prompt is not None else None,
+                        ema_reward=float(ema),
+                        ema_gain_from_baseline=float(ema_gain_from_baseline) if self.baseline_reward is not None else None,
+                        gen_time=float(gen_time),
+                        reward_time=float(reward_time),
+                        train_time=float(train_time),
+                        batch_time=float(batch_time),
+                        raw_tokens_per_sec=float(raw_tokens_per_sec) if 'raw_tokens_per_sec' in locals() else 0.0,
+                        kept_tokens_per_sec=float(tokens_per_sec) if 'tokens_per_sec' in locals() else 0.0,
+                        diversity_ratio=float(diversity_ratio),
+                        kept_samples=int(kept_samples),
+                        frag_mps_gb=float(frag.get("mps_frag_gb", 0.0)),
+                        frag_mlx_cache_gb=float(frag.get("mlx_cache_gb", 0.0)),
+                        frag_triggered_gc=bool(frag_triggered_gc),
+                        frag_mps_growth_gb=float(frag_mps_growth),
+                        frag_gc_cooldown_blocked=bool(frag_gc_cooldown_blocked),
+                        teacher_gen_calls_batch=int(teacher_gen_calls_batch) if 'teacher_gen_calls_batch' in locals() else None,
+                        teacher_score_calls_batch=int(teacher_score_calls_batch) if 'teacher_score_calls_batch' in locals() else None,
+                        teacher_in_tokens=float(_teacher_in) if '_teacher_in' in locals() else 0.0,
+                        teacher_out_tokens=float(_teacher_out) if '_teacher_out' in locals() else 0.0,
+                    )
+                except Exception:
                     pass
                 
                 # Aggressive memory cleanup after training step to prevent OOM
@@ -3282,8 +4189,11 @@ class RLAIFTrainer:
                         del train_batch
                     if 'samples' in locals() and samples is not None:
                         del samples
+                    # IMPORTANT: don't `del rewards` here. Epoch-end gradient flush may still reference it,
+                    # and deleting it causes `UnboundLocalError: local variable 'rewards' referenced before assignment`.
+                    # Keep memory low by resetting to an empty list instead.
                     if 'rewards' in locals() and rewards is not None:
-                        del rewards
+                        rewards = []
                     
                     # Force garbage collection
                     import gc
@@ -3687,6 +4597,19 @@ class RLAIFTrainer:
                 self.writer.add_scalar("Epoch/Training_TokPerSec", float(avg_train_tokens_per_sec), ep)
                 self.writer.add_scalar("Epoch/Training_AvgLatency_s", float(avg_train_latency), ep)
                 self.writer.add_scalar("Epoch/Training_InputTokens", float(total_train_tokens), ep)
+                # Parameter update footprint (useful for LoRA/QLoRA vs full fine-tune)
+                self.writer.add_scalar("Epoch/Training_TrainableParams", float(trainable_params), ep)
+                self.writer.add_scalar("Epoch/Training_TrainablePct", float(trainable_percentage), ep)
+
+                # Stage-oriented epoch tags (mirrors per-batch Stage/*)
+                self.writer.add_scalar("StageEpoch/Generation/TokPerSec_Raw", float(avg_gen_tokens_per_sec_raw), ep)
+                self.writer.add_scalar("StageEpoch/Generation/TokPerSec_Kept", float(avg_gen_tokens_per_sec), ep)
+                self.writer.add_scalar("StageEpoch/Scoring/Tokens_Input", float(total_reward_input_tokens), ep)
+                self.writer.add_scalar("StageEpoch/Scoring/Tokens_Output", float(total_reward_output_tokens), ep)
+                self.writer.add_scalar("StageEpoch/Scoring/TokensPerSec_Total", float(avg_reward_tokens_per_sec), ep)
+                self.writer.add_scalar("StageEpoch/Training/TokensPerSec", float(avg_train_tokens_per_sec), ep)
+                self.writer.add_scalar("StageEpoch/Training/Loss_Mean", float(avg_epoch_loss), ep)
+                self.writer.add_scalar("StageEpoch/Training/TrainableParams", float(trainable_params), ep)
         
         # Record training end time
         self.training_metrics['training_end_time'] = time.time()
@@ -3708,6 +4631,12 @@ class RLAIFTrainer:
         
         # Stop system monitoring
         self._stop_monitoring()
+
+        # Stop MLX generation worker (if any)
+        try:
+            self._stop_mlx_generation_worker()
+        except Exception:
+            pass
         
         # Shutdown executor
         self.executor.shutdown(wait=True)
@@ -3738,12 +4667,92 @@ class RLAIFTrainer:
             # Process-specific memory
             process = psutil.Process()
             process_memory = process.memory_info()
-            process_memory_gb = process_memory.rss / (1024 ** 3)
+            process_rss_gb = process_memory.rss / (1024 ** 3)
+
+            # macOS "Memory" column in Activity Monitor is closer to "physical footprint" than RSS.
+            # We can query phys_footprint via Mach task_info(TASK_VM_INFO) for a closer match.
+            process_footprint_gb = None
+            if sys.platform == "darwin":
+                try:
+                    import ctypes
+                    import ctypes.util
+
+                    lib = ctypes.CDLL(ctypes.util.find_library("System") or "/usr/lib/libSystem.B.dylib")
+
+                    mach_port_t = ctypes.c_uint32
+                    kern_return_t = ctypes.c_int
+                    natural_t = ctypes.c_uint32
+
+                    TASK_VM_INFO = 22  # from <mach/task_info.h>
+
+                    class TaskVMInfo(ctypes.Structure):
+                        _fields_ = [
+                            ("virtual_size", ctypes.c_uint64),
+                            ("region_count", ctypes.c_int),
+                            ("page_size", ctypes.c_int),
+                            ("resident_size", ctypes.c_uint64),
+                            ("resident_size_peak", ctypes.c_uint64),
+                            ("device", ctypes.c_uint64),
+                            ("device_peak", ctypes.c_uint64),
+                            ("internal", ctypes.c_uint64),
+                            ("internal_peak", ctypes.c_uint64),
+                            ("external", ctypes.c_uint64),
+                            ("external_peak", ctypes.c_uint64),
+                            ("reusable", ctypes.c_uint64),
+                            ("reusable_peak", ctypes.c_uint64),
+                            ("purgeable_volatile_pmap", ctypes.c_uint64),
+                            ("purgeable_volatile_resident", ctypes.c_uint64),
+                            ("purgeable_volatile_virtual", ctypes.c_uint64),
+                            ("compressed", ctypes.c_uint64),
+                            ("compressed_peak", ctypes.c_uint64),
+                            ("compressed_lifetime", ctypes.c_uint64),
+                            ("phys_footprint", ctypes.c_uint64),
+                            ("min_address", ctypes.c_uint64),
+                            ("max_address", ctypes.c_uint64),
+                        ]
+
+                    lib.mach_task_self.restype = mach_port_t
+                    lib.task_info.argtypes = [mach_port_t, ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(natural_t)]
+                    lib.task_info.restype = kern_return_t
+
+                    info = TaskVMInfo()
+                    count = natural_t(ctypes.sizeof(TaskVMInfo) // ctypes.sizeof(natural_t))
+                    kr = lib.task_info(lib.mach_task_self(), TASK_VM_INFO, ctypes.byref(info), ctypes.byref(count))
+                    if kr == 0 and int(info.phys_footprint) > 0:
+                        process_footprint_gb = float(info.phys_footprint) / (1024 ** 3)
+                except Exception:
+                    process_footprint_gb = None
             
-            # GPU/MPS memory and utilization (if using PyTorch)
+            # GPU/MPS memory and utilization
+            # NOTE: On Apple Silicon, there is no official PyTorch/MLX API for true GPU utilization.
+            # - "memory_proxy": uses memory usage as a rough proxy (fast, but can disagree with Activity Monitor).
+            # - "powermetrics": uses macOS powermetrics GPU sampler when available (more accurate, may require sudo).
             gpu_memory_used = 0.0
             gpu_memory_total = 0.0
             gpu_utilization = 0.0
+            gpu_utilization_source = "memory_proxy"
+
+            def _powermetrics_gpu_util() -> Optional[float]:
+                try:
+                    import subprocess
+                    import re
+                    # powermetrics often requires elevated permissions; try without prompting.
+                    # We keep this best-effort and fast (timeout).
+                    cmd = ["powermetrics", "--samplers", "gpu_power", "-n", "1", "-i", "1000"]
+                    p = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
+                    out = (p.stdout or "") + "\n" + (p.stderr or "")
+                    # Look for a GPU active residency percentage-like value.
+                    # Different macOS versions format this differently; match the first percentage on a GPU line.
+                    m = re.search(r"GPU.*?([0-9]{1,3}(?:\\.[0-9]+)?)%\\s*$", out, re.MULTILINE)
+                    if not m:
+                        # fallback: any "GPU active" percent
+                        m = re.search(r"GPU.*active.*?([0-9]{1,3}(?:\\.[0-9]+)?)%", out, re.IGNORECASE)
+                    if m:
+                        v = float(m.group(1))
+                        return max(0.0, min(100.0, v))
+                except Exception:
+                    return None
+                return None
             if torch.backends.mps.is_available():
                 # MPS doesn't have direct memory query, but we can track allocations
                 if hasattr(torch.mps, 'current_allocated_memory'):
@@ -3753,14 +4762,22 @@ class RLAIFTrainer:
                 # For MPS, we estimate utilization based on memory usage and activity
                 # MPS doesn't provide direct utilization metrics like CUDA
                 # We use memory usage as a proxy: high memory usage = likely active
-                if gpu_memory_total > 0:
-                    memory_util = (gpu_memory_used / gpu_memory_total) * 100
-                    # Also check if there are active operations (heuristic)
-                    # If memory is being used, assume GPU is active
-                    gpu_utilization = min(100.0, memory_util * 1.2)  # Scale up slightly as proxy
-                else:
-                    # Fallback: if we can't get memory, check if MPS is initialized
-                    gpu_utilization = 50.0 if gpu_memory_used > 0 else 0.0
+                mode = (getattr(self.config, "gpu_utilization_mode", "memory_proxy") or "memory_proxy").lower()
+                if mode == "powermetrics":
+                    v = _powermetrics_gpu_util()
+                    if v is not None:
+                        gpu_utilization = v
+                        gpu_utilization_source = "powermetrics"
+                    else:
+                        # Fallback to memory proxy if powermetrics is unavailable
+                        mode = "memory_proxy"
+
+                if mode == "memory_proxy":
+                    if gpu_memory_total > 0:
+                        memory_util = (gpu_memory_used / gpu_memory_total) * 100
+                        gpu_utilization = min(100.0, memory_util * 1.2)  # proxy
+                    else:
+                        gpu_utilization = 50.0 if gpu_memory_used > 0 else 0.0
             elif torch.cuda.is_available():
                 gpu_memory_used = torch.cuda.memory_allocated() / (1024 ** 3)
                 gpu_memory_total = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
@@ -3770,6 +4787,7 @@ class RLAIFTrainer:
                     gpu_utilization = (gpu_memory_used / gpu_memory_total) * 100
                 else:
                     gpu_utilization = 0.0
+                gpu_utilization_source = "cuda_memory_proxy"
             
             return {
                 'cpu_percent': cpu_percent,
@@ -3778,11 +4796,15 @@ class RLAIFTrainer:
                 'memory_used_gb': memory_used_gb,
                 'memory_total_gb': memory_total_gb,
                 'memory_available_gb': memory_available_gb,
-                'process_memory_gb': process_memory_gb,
+                # Back-compat: Process_Memory_GB == RSS
+                'process_memory_gb': process_rss_gb,
+                'process_rss_gb': process_rss_gb,
+                'process_footprint_gb': float(process_footprint_gb) if process_footprint_gb is not None else 0.0,
                 'gpu_memory_used_gb': gpu_memory_used,
                 'gpu_memory_total_gb': gpu_memory_total,
                 'gpu_memory_percent': (gpu_memory_used / gpu_memory_total * 100) if gpu_memory_total > 0 else 0.0,
-                'gpu_utilization': gpu_utilization,  # GPU/Neural Engine utilization estimate
+                'gpu_utilization': gpu_utilization,  # may be a proxy; see gpu_utilization_source
+                'gpu_utilization_source': gpu_utilization_source,
             }
         except Exception as e:
             logger.warning(f"Error getting system metrics: {e}")
@@ -3806,14 +4828,19 @@ class RLAIFTrainer:
                         self.writer.add_scalar('System/Memory_Percent', metrics.get('memory_percent', 0), step)
                         self.writer.add_scalar('System/Memory_Used_GB', metrics.get('memory_used_gb', 0), step)
                         self.writer.add_scalar('System/Memory_Available_GB', metrics.get('memory_available_gb', 0), step)
-                        self.writer.add_scalar('System/Process_Memory_GB', metrics.get('process_memory_gb', 0), step)
+                        # Process memory (RSS) + macOS footprint (Activity Monitor-like)
+                        self.writer.add_scalar('System/Process_Memory_GB', metrics.get('process_memory_gb', 0), step)  # RSS (back-compat)
+                        self.writer.add_scalar('System/Process_RSS_GB', metrics.get('process_rss_gb', 0), step)
+                        self.writer.add_scalar('System/Process_Footprint_GB', metrics.get('process_footprint_gb', 0), step)
                         
                         # Log GPU/MPS metrics if available
                         if metrics.get('gpu_memory_total_gb', 0) > 0:
                             self.writer.add_scalar('System/GPU_Memory_Used_GB', metrics.get('gpu_memory_used_gb', 0), step)
                             self.writer.add_scalar('System/GPU_Memory_Total_GB', metrics.get('gpu_memory_total_gb', 0), step)
                             self.writer.add_scalar('System/GPU_Memory_Percent', metrics.get('gpu_memory_percent', 0), step)
+                            # Back-compat tag + clarified tag
                             self.writer.add_scalar('System/GPU_Utilization', metrics.get('gpu_utilization', 0), step)
+                            self.writer.add_scalar('System/GPU_Utilization_Estimated', metrics.get('gpu_utilization', 0), step)
                     
                     step += 1
                     time.sleep(self.monitoring_interval)
@@ -4022,11 +5049,16 @@ class RLAIFTrainer:
             self.writer.add_scalar('System/CPU_Percent', system_metrics.get('cpu_percent', 0), step)
             self.writer.add_scalar('System/Memory_Percent', system_metrics.get('memory_percent', 0), step)
             self.writer.add_scalar('System/Memory_Used_GB', system_metrics.get('memory_used_gb', 0), step)
-            self.writer.add_scalar('System/Process_Memory_GB', system_metrics.get('process_memory_gb', 0), step)
+            # Process memory (RSS) + macOS footprint (Activity Monitor-like)
+            self.writer.add_scalar('System/Process_Memory_GB', system_metrics.get('process_memory_gb', 0), step)  # RSS (back-compat)
+            self.writer.add_scalar('System/Process_RSS_GB', system_metrics.get('process_rss_gb', 0), step)
+            self.writer.add_scalar('System/Process_Footprint_GB', system_metrics.get('process_footprint_gb', 0), step)
             if system_metrics.get('gpu_memory_total_gb', 0) > 0:
                 self.writer.add_scalar('System/GPU_Memory_Used_GB', system_metrics.get('gpu_memory_used_gb', 0), step)
                 self.writer.add_scalar('System/GPU_Memory_Percent', system_metrics.get('gpu_memory_percent', 0), step)
+                # Back-compat tag + clarified tag
                 self.writer.add_scalar('System/GPU_Utilization', system_metrics.get('gpu_utilization', 0), step)
+                self.writer.add_scalar('System/GPU_Utilization_Estimated', system_metrics.get('gpu_utilization', 0), step)
     
     def _save_checkpoint(self, step: int, final: bool = False, checkpoint_name: Optional[str] = None, summary: Optional[Dict] = None):
         """Save model checkpoint in both PyTorch and MLX formats"""
@@ -4052,6 +5084,21 @@ class RLAIFTrainer:
                 mlx_dir = self._save_mlx_checkpoint(checkpoint_dir, step)
             except Exception as e:
                 logger.warning(f"Failed to save MLX checkpoint: {e}. Continuing with PyTorch format only.")
+        
+        # Optional: reload MLX generation model from the newest checkpoint so generation uses updated weights.
+        # NOTE: This does NOT make backprop happen in MLX. It only refreshes the *generation* weights.
+        # Setting `training.save_every_batches` to a small number increases how often generation sees new weights,
+        # but conversion/reload can be expensive.
+        if (
+            mlx_dir
+            and getattr(self.config, "use_mlx_for_generation", False)
+            and getattr(self.config, "reload_mlx_from_latest_checkpoint", True)
+        ):
+            try:
+                logger.info(f"Reloading MLX generation model from latest checkpoint: {mlx_dir}")
+                self._load_mlx_model_for_generation(str(mlx_dir))
+            except Exception as e:
+                logger.warning(f"Failed to reload MLX generation model from checkpoint: {e}")
         
         # Upload to Hugging Face if enabled (only on final checkpoint or if specified)
         if self.config.upload_to_hub and (final or step % (self.config.save_steps * 2) == 0):
@@ -4106,15 +5153,33 @@ class RLAIFTrainer:
     def _save_mlx_checkpoint(self, checkpoint_dir: Path, step: int):
         """Convert and save model to MLX format for faster inference on Apple Silicon"""
         try:
-            import mlx.core as mx
-            from mlx_lm import convert, quantize
-            from mlx_lm.utils import fetch_from_hub
-        except ImportError:
-            logger.warning("MLX libraries not available. Install with: pip install mlx mlx-lm")
-            return
+            import mlx.core as _mx  # noqa: F401
+            import mlx_lm as _mlx_lm  # noqa: F401
+        except Exception as e:
+            # This used to warn even when mlx-lm was installed (API mismatch importing convert/quantize).
+            # Only warn once, and give the exact interpreter that failed.
+            if not getattr(self, "_warned_mlx_missing_for_checkpointing", False):
+                self._warned_mlx_missing_for_checkpointing = True
+                logger.warning(
+                    "MLX checkpoint conversion skipped because `mlx` / `mlx-lm` are not importable in this Python.\n"
+                    f"  - sys.executable: {sys.executable}\n"
+                    f"  - error: {type(e).__name__}: {e}\n"
+                    "Fix (recommended):\n"
+                    "  - `uv pip install -r requirements.txt`\n"
+                    "Or (non-uv):\n"
+                    "  - `python -m pip install mlx mlx-lm`\n"
+                )
+            return None
         
         mlx_dir = checkpoint_dir / "mlx_model"
-        mlx_dir.mkdir(exist_ok=True)
+        # IMPORTANT: mlx_lm.convert requires the output path to NOT exist.
+        # If we pre-create it (or a previous attempt left it behind), conversion fails.
+        try:
+            if mlx_dir.exists():
+                import shutil
+                shutil.rmtree(mlx_dir)
+        except Exception:
+            pass
         
         logger.info(f"Converting model to MLX format at {mlx_dir}")
         
@@ -4128,28 +5193,39 @@ class RLAIFTrainer:
             # Convert model weights to MLX format
             # This uses mlx-lm's convert utility which handles the conversion
             logger.info("Converting PyTorch weights to MLX format...")
-            
-            # Save model config for MLX
+
+            # Convert model weights (and optionally quantize) using mlx_lm.convert.
+            # Prefer invoking the module via sys.executable to guarantee we use the same uv interpreter.
+            ok = self._convert_weights_to_mlx(
+                checkpoint_dir,
+                mlx_dir,
+                quantization=getattr(self.config, "mlx_quantization", None),
+            )
+            if not ok:
+                logger.warning("MLX conversion did not produce a valid MLX model. Skipping MLX checkpoint.")
+                return None
+
+            # Post-conversion: copy config/tokenizer artifacts alongside MLX weights (best-effort).
             import shutil
             config_file = checkpoint_dir / "config.json"
             if config_file.exists():
                 shutil.copy(config_file, mlx_dir / "config.json")
-            
-            # Copy tokenizer files
-            tokenizer_files = ['tokenizer_config.json', 'vocab.json', 'merges.txt', 'special_tokens_map.json']
+
+            tokenizer_files = [
+                "tokenizer_config.json",
+                "vocab.json",
+                "merges.txt",
+                "special_tokens_map.json",
+                "tokenizer.json",
+                "chat_template.jinja",
+            ]
             for file in tokenizer_files:
                 src_file = checkpoint_dir / file
                 if src_file.exists():
-                    shutil.copy(src_file, mlx_dir / file)
-            
-            # Convert model weights
-            # MLX uses safetensors format
-            self._convert_weights_to_mlx(checkpoint_dir, mlx_dir)
-            
-            # Apply quantization if specified
-            if self.config.mlx_quantization:
-                logger.info(f"Applying {self.config.mlx_quantization} quantization to MLX model...")
-                self._quantize_mlx_model(mlx_dir, self.config.mlx_quantization)
+                    try:
+                        shutil.copy(src_file, mlx_dir / file)
+                    except Exception:
+                        pass
             
             logger.info(f"MLX model saved to {mlx_dir}")
             
@@ -4194,23 +5270,75 @@ print(response)
             logger.debug(traceback.format_exc())
             raise
     
-    def _convert_weights_to_mlx(self, pytorch_dir: Path, mlx_dir: Path):
+    def _convert_weights_to_mlx(self, pytorch_dir: Path, mlx_dir: Path, quantization: Optional[str] = None) -> bool:
         """Convert PyTorch model weights to MLX safetensors format"""
         try:
-            # Try using mlx-lm's convert utility first (preferred method)
-            from mlx_lm import convert
-            
-            logger.info("Using mlx-lm convert utility for model conversion...")
+            import subprocess
+            import sys as _sys
+
+            logger.info("Using mlx-lm convert utility (module) for model conversion...")
             pytorch_path = str(pytorch_dir.absolute())
             mlx_path = str(mlx_dir.absolute())
-            
-            # Convert the model
-            convert(pytorch_path, mlx_path)
-            logger.info(f"Successfully converted model to MLX format using mlx-lm")
-            return
+
+            cmd = [
+                _sys.executable,
+                "-m",
+                "mlx_lm.convert",
+                "--hf-path",
+                pytorch_path,
+                "--mlx-path",
+                mlx_path,
+            ]
+            # Apply quantization at conversion time when requested.
+            if quantization == "q4_bit":
+                cmd += ["-q", "--q-bits", "4"]
+            elif quantization == "q8_bit":
+                cmd += ["-q", "--q-bits", "8"]
+
+            # Ensure output path does not exist (mlx_lm.convert will error if it does).
+            try:
+                if mlx_dir.exists():
+                    import shutil
+                    shutil.rmtree(mlx_dir)
+            except Exception:
+                pass
+
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode != 0:
+                msg = (proc.stderr or proc.stdout or "").strip()
+                # Retry once if the failure is due to the output dir already existing.
+                if "already exists" in msg.lower():
+                    try:
+                        import shutil
+                        shutil.rmtree(mlx_dir)
+                    except Exception:
+                        pass
+                    proc = subprocess.run(cmd, capture_output=True, text=True)
+                    if proc.returncode != 0:
+                        msg = (proc.stderr or proc.stdout or "").strip()
+                        raise RuntimeError(msg or f"mlx_lm.convert failed with code {proc.returncode}")
+                else:
+                    raise RuntimeError(msg or f"mlx_lm.convert failed with code {proc.returncode}")
+
+            logger.info("Successfully converted model to MLX format using mlx-lm")
+            # Validate output looks like an MLX model dir.
+            try:
+                candidates = [
+                    mlx_dir / "weights.npz",
+                    mlx_dir / "model.npz",
+                    mlx_dir / "model.safetensors",
+                ]
+                if not any(p.exists() for p in candidates):
+                    # Some mlx-lm versions write weights into nested files; accept any *.npz or *.safetensors.
+                    has_any = any(mlx_dir.glob("*.npz")) or any(mlx_dir.glob("*.safetensors"))
+                    if not has_any:
+                        logger.warning(f"MLX convert finished but no MLX weight files found in {mlx_dir}")
+                        return False
+            except Exception:
+                # If we can't validate, assume success (best-effort).
+                pass
+            return True
         
-        except ImportError:
-            logger.warning("mlx-lm not available. Attempting manual conversion...")
         except Exception as e:
             logger.warning(f"mlx-lm convert failed: {e}. Attempting manual conversion...")
         
@@ -4227,7 +5355,7 @@ print(response)
             
             if not pytorch_model_file.exists():
                 logger.warning("No PyTorch model file found. Skipping MLX conversion.")
-                return
+                return False
             
             # Load the state dict
             if pytorch_model_file.suffix == '.safetensors':
@@ -4254,6 +5382,7 @@ print(response)
             save_numpy_safetensors(mlx_state_dict, mlx_model_file)
             
             logger.info(f"Manually converted {len(mlx_state_dict)} weight tensors to MLX format")
+            return True
         
         except Exception as e:
             logger.error(f"Manual MLX conversion also failed: {e}")
@@ -4696,6 +5825,18 @@ def load_config(config_path: str) -> Tuple[RLAIFConfig, dict]:
         json_summaries_dir=logging_cfg.get('json_summaries_dir', './logs/json_summaries'),
         baseline_eval_batches=to_int(logging_cfg.get('baseline_eval_batches'), 1),
         tensorboard_batch_interval=to_int(logging_cfg.get('tensorboard_batch_interval'), 1),
+        health_check_enabled=to_bool(logging_cfg.get('health_check_enabled'), True),
+        health_check_interval_batches=to_int(logging_cfg.get('health_check_interval_batches'), 5),
+        health_check_grace_batches=to_int(logging_cfg.get('health_check_grace_batches'), 3),
+        health_check_gen_bottleneck_pct=to_float(logging_cfg.get('health_check_gen_bottleneck_pct'), 85.0),
+        health_check_gen_target_tps=to_float(logging_cfg.get('health_check_gen_target_tps'), 6.0),
+        health_check_fragmentation_enabled=to_bool(logging_cfg.get('health_check_fragmentation_enabled'), True),
+        health_check_mps_fragmentation_gb=to_float(logging_cfg.get('health_check_mps_fragmentation_gb'), 10.0),
+        health_check_mlx_cache_gb=to_float(logging_cfg.get('health_check_mlx_cache_gb'), 3.0),
+        health_check_fragmentation_growth_gb=to_float(logging_cfg.get('health_check_fragmentation_growth_gb'), 0.75),
+        health_check_trigger_gc_on_fragmentation=to_bool(logging_cfg.get('health_check_trigger_gc_on_fragmentation'), True),
+        health_check_gc_cooldown_batches=to_int(logging_cfg.get('health_check_gc_cooldown_batches'), 10),
+        gpu_utilization_mode=logging_cfg.get('gpu_utilization_mode', 'memory_proxy'),
         top_k=to_int(rlaif_cfg.get('top_k'), 50),
         top_p=to_float(rlaif_cfg.get('top_p'), 0.95),
         save_mlx_format=to_bool(hardware_cfg.get('save_mlx_format'), True),
@@ -4713,6 +5854,12 @@ def load_config(config_path: str) -> Tuple[RLAIFConfig, dict]:
         dataset_output_dir=config_dict.get('huggingface', {}).get('dataset_output_dir', './datasets'),
         use_mlx_for_generation=to_bool(hardware_cfg.get('use_mlx_for_generation'), True),  # Default to True for better performance
         mlx_model_path=hardware_cfg.get('mlx_model_path', None),
+        require_mlx_for_generation=to_bool(hardware_cfg.get('require_mlx_for_generation'), False),
+        allow_4bit_on_mps=to_bool(hardware_cfg.get('allow_4bit_on_mps'), False),
+        reload_mlx_from_latest_checkpoint=to_bool(hardware_cfg.get('reload_mlx_from_latest_checkpoint'), True),
+        mlx_metal_cache_limit_gb=to_float(hardware_cfg.get('mlx_metal_cache_limit_gb'), 0.0),
+        use_mlx_generation_worker=to_bool(hardware_cfg.get('use_mlx_generation_worker'), False),
+        mlx_generation_worker_timeout_s=to_int(hardware_cfg.get('mlx_generation_worker_timeout_s'), 240),
         use_unsloth=to_bool(hardware_cfg.get('use_unsloth'), False),
         unsloth_dtype=hardware_cfg.get('unsloth_dtype', 'bf16'),
         unsloth_max_seq_length=to_int(hardware_cfg.get('unsloth_max_seq_length'), None),
@@ -4771,6 +5918,29 @@ Examples:
     
     # Load configuration
     config, data_cfg = load_config(args.config)
+
+    # Preflight: MLX dependency check (avoid confusing runtime warnings later).
+    needs_mlx = bool(getattr(config, "use_mlx_for_generation", False) or getattr(config, "save_mlx_format", False))
+    if needs_mlx:
+        try:
+            import mlx  # noqa: F401
+            import mlx_lm  # noqa: F401
+        except Exception:
+            msg = (
+                "MLX was requested (generation/checkpoint), but `mlx` / `mlx-lm` are not installed in this environment.\n"
+                "Fix:\n"
+                "  uv pip install -r requirements.txt\n"
+                "Notes:\n"
+                "  - `mlx-lm` (pip package) provides the `mlx_lm` module.\n"
+            )
+            if getattr(config, "require_mlx_for_generation", False):
+                logger.error(msg)
+                raise SystemExit(1)
+            else:
+                logger.warning(msg)
+                # Best-effort fallback to keep training running
+                config.use_mlx_for_generation = False
+                config.save_mlx_format = False
     
     # Override model if provided via command line
     if args.model:

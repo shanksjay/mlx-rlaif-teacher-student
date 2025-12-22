@@ -15,7 +15,7 @@ Examples:
 import argparse
 import json
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 def _read_jsonl(path: str) -> List[Dict[str, Any]]:
@@ -45,7 +45,7 @@ def _flatten(d: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
     return out
 
 
-def _print_rows(rows: List[Dict[str, Any]], cols: List[str], tail: int | None = None):
+def _print_rows(rows: List[Dict[str, Any]], cols: List[str], tail: Optional[int] = None):
     if tail is not None and tail > 0:
         rows = rows[-tail:]
     # Build table
