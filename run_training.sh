@@ -34,6 +34,20 @@ if [ ! -f "config.yaml" ]; then
 fi
 
 echo ""
+echo "Checking MLX dependencies (needed for MLX generation/checkpoints)..."
+if ! uv run python - <<'PY' >/dev/null 2>&1
+import mlx  # noqa: F401
+import mlx_lm  # noqa: F401
+PY
+then
+  echo "WARNING: MLX packages not found in the uv environment."
+  echo "Fix:"
+  echo "  uv pip install -r requirements.txt"
+  echo ""
+  echo "If you set hardware.require_mlx_for_generation: true, training will fail until MLX is installed."
+fi
+
+echo ""
 echo "Starting training..."
 echo "To monitor progress, run in another terminal:"
 echo "  PYTHONWARNINGS=ignore::UserWarning uv run tensorboard --logdir ./logs/tensorboard"

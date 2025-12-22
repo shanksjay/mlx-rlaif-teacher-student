@@ -390,13 +390,33 @@ These represent the scoring weights used for evaluation:
 - **`System/Memory_Percent`**: System memory usage percentage
 - **`System/Memory_Used_GB`**: System memory used (GB)
 - **`System/Memory_Available_GB`**: System memory available (GB)
-- **`System/Process_Memory_GB`**: Process memory usage (RSS, GB)
+- **`System/Process_Memory_GB`**: Process RSS (GB) (**back-compat** tag; same as `System/Process_RSS_GB`)
+- **`System/Process_RSS_GB`**: Process RSS (GB)
+- **`System/Process_Footprint_GB`**: **macOS physical footprint** (GB) — should match **Activity Monitor “Memory”** more closely
 
 #### GPU/MPS Metrics
 - **`System/GPU_Memory_Used_GB`**: GPU/MPS memory used (GB)
 - **`System/GPU_Memory_Total_GB`**: Total GPU/MPS memory (GB)
 - **`System/GPU_Memory_Percent`**: GPU/MPS memory usage percentage
-- **`System/GPU_Utilization`**: Estimated GPU/Neural Engine utilization (%)
+- **`System/GPU_Utilization`**: **Estimated** GPU utilization (%). On Apple Silicon this is often a **proxy** (see below).
+- **`System/GPU_Utilization_Estimated`**: Same value as above, but explicitly named to avoid confusion.
+
+Note on “Metal Counter API”: it’s designed to profile **Metal command buffers you create** (e.g., a Metal app you control) using counter sample buffers, not to query arbitrary GPU counters for other frameworks’ internal Metal work. For MLX / PyTorch MPS, you generally can’t attach Metal counters from Python to their internal command streams. For deep GPU profiling use Xcode Instruments / Metal System Trace or build a dedicated Metal workload that uses counters (see: `https://developer.apple.com/videos/play/tech-talks/10001/`).
+
+### Metal fragmentation / cache proxies (recommended)
+
+On Apple Silicon, “OOM” can happen due to Metal heap pressure/fragmentation even when system memory looks available. This repo logs **best-effort proxies** per batch:
+
+- **`Batch/Metal/MPS_Fragmentation_GB`**: \( \text{driver\_allocated} - \text{current\_allocated} \) from PyTorch MPS (cache/fragmentation proxy)
+- **`Batch/Metal/MLX_Cache_GB`**: MLX Metal cache size (proxy for retained allocations)
+- **`Batch/Metal/*_Growth_GB`**: growth since previous batch
+- **`Batch/Metal/GC_Triggered`**: whether the trainer triggered cleanup
+
+HealthCheck can trigger cleanup automatically (config under `logging.*health_check_fragmentation*`):
+
+- `gc.collect()`
+- `torch.mps.empty_cache()`
+- `mx.metal.clear_cache()`
 
 System metrics are logged:
 - At each logging step (alongside training metrics)
@@ -440,6 +460,21 @@ uv run python scripts/visualization/view_json_summaries.py --dir ./logs/json_sum
 uv run python scripts/visualization/view_json_summaries.py --dir ./logs/json_summaries --type batch --csv-out ./logs/json_summaries/batches.csv
 ```
 
+### Training health checks (recommended)
+
+The trainer can emit periodic **HealthCheck** logs while training is running to detect regressions early.
+
+Config:
+
+- `logging.health_check_enabled: true`
+- `logging.health_check_interval_batches: 5`
+
+It prints a compact line like:
+
+- `[HealthCheck] OK | e1 b10 | reward(mean=0.712, ema=0.690, bestN=0.801) | time(gen=78%, score=6%, train=16%) | gen(tok/s raw=5.6, kept=4.7, div=0.83)`
+
+If unhealthy, it prints `WARN` with the specific issues (e.g. generation bottleneck, low diversity, no gain vs baseline).
+
 ### Key Metrics to Monitor
 
 #### Training Health
@@ -452,7 +487,9 @@ uv run python scripts/visualization/view_json_summaries.py --dir ./logs/json_sum
 - **`Performance/Backprop_TokensPerSec`**: Monitor for training efficiency
 
 #### System Resources
-- **`System/GPU_Utilization`**: Should be > 50% for efficient GPU usage
+- **`System/GPU_Utilization_Estimated`**:
+  - If `logging.gpu_utilization_mode: "memory_proxy"` (default): treat this as a **rough signal only** (it may not match Activity Monitor, especially when MLX is generating).
+  - If `logging.gpu_utilization_mode: "powermetrics"`: should track Activity Monitor more closely (best-effort; may require elevated permissions).
 - **`System/Memory_Percent`**: Monitor for OOM warnings (> 90%)
 
 #### Convergence Indicators
@@ -484,7 +521,7 @@ uv run python scripts/visualization/view_json_summaries.py --dir ./logs/json_sum
 #### System Health
 - `System/CPU_Percent`
 - `System/Memory_Percent`
-- `System/GPU_Utilization`
+- `System/GPU_Utilization_Estimated`
 - `System/GPU_Memory_Percent`
 
 ## Performance Optimizations
@@ -622,16 +659,18 @@ PyTorch MPS (Metal Performance Shaders) on Apple Silicon provides GPU accelerati
 #### 1. Convert Model to MLX Format
 
 ```bash
-# Convert HuggingFace model to MLX
-uv run python scripts/utils/convert_to_mlx.py \
-    --hf-path Qwen/Qwen2.5-Coder-3B-Instruct \
-    --mlx-path ./mlx_model
+# Preferred (per Qwen docs): use mlx-lm's CLI converter
+# Ref: https://qwen.readthedocs.io/en/latest/run_locally/mlx-lm.html
 
-# Or with quantization (smaller, faster)
-uv run python scripts/utils/convert_to_mlx.py \
-    --hf-path Qwen/Qwen2.5-Coder-3B-Instruct \
-    --mlx-path ./mlx_model/q8 \
-    --quantize q8_bit  # or q4_bit
+# Non-quantized
+uv run mlx_lm.convert --hf-path Qwen/Qwen2.5-Coder-3B-Instruct --mlx-path ./mlx_model/base
+
+# Quantized (recommended): Q4 or Q8
+uv run mlx_lm.convert --hf-path Qwen/Qwen2.5-Coder-3B-Instruct --mlx-path ./mlx_model/q4 -q --q-bits 4
+uv run mlx_lm.convert --hf-path Qwen/Qwen2.5-Coder-3B-Instruct --mlx-path ./mlx_model/q8 -q --q-bits 8
+
+# Alternatively, you can use our wrapper (calls mlx_lm.convert under the hood)
+uv run python scripts/utils/convert_to_mlx.py --hf-path Qwen/Qwen2.5-Coder-3B-Instruct --mlx-path ./mlx_model/q8 --quantize q8_bit
 ```
 
 #### 2. Update Config
@@ -652,6 +691,45 @@ uv run python scripts/training/train_rlaif.py --config config.yaml
 ```
 
 The training will now use MLX for generation (5-10x faster) while keeping PyTorch for training.
+
+#### Keeping generation weights in sync with training updates
+
+Today this repo uses:
+
+- **PyTorch** for backprop/training (weight updates)
+- **MLX** for generation (fast inference)
+
+These are different runtimes, so there is **no cheap per-batch weight sharing** between them.
+
+Best-effort sync option:
+
+- Set `hardware.reload_mlx_from_latest_checkpoint: true` (default)
+- Save checkpoints frequently (`training.save_every_batches` or `training.save_every_epochs`)
+
+When a checkpoint is saved in MLX format, the trainer will **reload the MLX generation model from that checkpoint** so subsequent batches generate with fresher weights. Beware: converting/reloading MLX weights is expensive if done too frequently.
+
+### MLX generation worker mode (recommended on Apple Silicon)
+
+If you run **MLX generation** + **PyTorch MPS training** in the same Python process, their Metal allocators can fight and you may see Metal command-buffer OOMs due to heap pressure/fragmentation.
+
+This repo supports running MLX generation in a **separate subprocess**:
+
+- PyTorch/MPS training stays in the main process
+- MLX/Metal generation runs in `scripts/utils/mlx_gen_worker.py`
+
+Enable in `config.yaml`:
+
+- `hardware.use_mlx_generation_worker: true`
+- `hardware.mlx_generation_worker_timeout_s: 240`
+
+Troubleshooting:
+- If you see `Broken pipe`, it means the worker process exited. The trainer now auto-restarts the worker once and will surface the worker stderr tail on failure. Common causes:
+  - invalid `hardware.mlx_model_path` (worker can't `mlx_lm.load()` the directory)
+  - missing `mlx` / `mlx-lm` in the active `uv` environment
+
+Notes:
+- This isolates MLX allocations from the training process (often stabilizes long runs).
+- Generation semantics match the in-process MLX path (greedy by default, sampling on retries).
 
 ### Performance Comparison
 
