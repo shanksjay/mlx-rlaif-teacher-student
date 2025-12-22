@@ -845,32 +845,41 @@ If generation is still slow even with MLX:
 
 ## Model Validation
 
-After training, validate your model to compare pre-training vs post-training quality:
+After training, validate your model to compare **pre-training (baseline model)** vs **post-training (fine-tuned model)** quality.
+
+On Apple Silicon, validation is fastest and most reliable when you run **both models in MLX** (no multi-GB Hugging Face downloads, and no PyTorch/MPS generation).
 
 ```bash
 uv run python scripts/validation/validate_model.py \
-    --base_model Qwen/Qwen2.5-Coder-3B-Instruct \
     --fine_tuned_path ./checkpoints/checkpoint-500 \
-    --test_prompts ./data/eval.jsonl \
+    --teacher_provider anthropic \
+    --baseline_mlx_path ./mlx_model/q4 \
+    --max_samples 5 \
+    --print_chars 500 \
     --output ./validation_results.json
 ```
 
 The validation script will:
-- Generate code from both baseline and fine-tuned models
+- Generate code from both baseline and fine-tuned models (**MLX by default**)
 - Score outputs using the teacher model
 - Show improvement statistics
 - Display example comparisons
+- Print **generation throughput (tokens/sec)** for both baseline and fine-tuned outputs
+
+Notes:
+- By default, the fine-tuned MLX model is loaded from `<fine_tuned_path>/mlx_model`.
+- If the checkpoint MLX export is incompatible (older config/weights mismatch), the script will automatically rebuild it into `<fine_tuned_path>/mlx_model_repaired` using `mlx_lm.convert` and continue.
 
 ### Example Output
 
 ```
 ================================================================================
-VALIDATION REPORT: Pre-Training vs Post-Training
+VALIDATION REPORT: Pre-Training(baseline model) vs Post-Training (fine tuned model)
 ================================================================================
 
 Test Cases: 5
 
-Average Scores:
+Average Reward Scores:
   Baseline Model:    0.6234
   Fine-tuned Model:  0.7891
   Average Improvement: +0.1657 (+26.58%)
@@ -895,7 +904,10 @@ Then run:
 ```bash
 uv run python scripts/validation/validate_model.py \
     --fine_tuned_path ./checkpoints/checkpoint-500 \
-    --test_prompts ./my_test_prompts.jsonl
+    --teacher_provider anthropic \
+    --baseline_mlx_path ./mlx_model/q4 \
+    --test_prompts ./my_test_prompts.jsonl \
+    --max_samples 5
 ```
 
 ## Dataset Collection and Upload
