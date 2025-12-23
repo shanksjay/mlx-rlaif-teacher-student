@@ -28,6 +28,9 @@ teacher:
 # Training Configuration
 training:
   output_dir: "./checkpoints"
+  # Resume from checkpoint (set to checkpoint directory path, e.g., "./checkpoints/checkpoint-e4-end-gs4")
+  # Leave as null or omit to start fresh training
+  resume_from_checkpoint: null
   num_epochs: 7  # Increased from 3 to 7 for better convergence (5-10 range recommended)
   batch_size: 2  # Reduced from 4 to prevent MPS OOM on 32GB systems
   # Aligned with logging_steps for efficient GPU/memory usage:
@@ -35,32 +38,33 @@ training:
   # - Optimizer steps happen every 50 batches, aligning with logging boundaries
   # - Effective batch size = 50 * 2 = 100 (slightly larger than previous 64, but better alignment)
   gradient_accumulation_steps: 50  # Aligned with logging_steps (50) for efficient batch boundaries
-  learning_rate: 1e-5  # Optimized: reduced from 2e-5 to 1e-5 (range: 5e-6 to 2e-5)
+  learning_rate: 4e-6  # Reduced from 7e-6 to 4e-6 (stabilize training, prevent loss spikes)
   # Optimizer:
   # - adamw: best default on CUDA, but can OOM on Apple Silicon for full fine-tunes due to 2× moment states.
   # - adafactor: much lower optimizer-state memory; recommended on MPS when not using LoRA/QLoRA.
   optimizer: "adamw"
-  warmup_steps: 100
+  warmup_steps: 300  # Increased from 200 to 300 (more gradual LR ramp-up for stability with high-variance rewards)
   save_steps: 500
   # Additional checkpointing (independent of optimizer global_step):
   save_every_epochs: 1  # Save a checkpoint at the end of each epoch
   save_every_batches: 0  # Save every N batches (0 = disabled; can be useful for long epochs)
   eval_steps: 250
   logging_steps: 50  # Aligned: matches gradient_accumulation_steps (50) exactly - optimizer steps align with logging boundaries
-  max_grad_norm: 1.0
+  max_grad_norm: 0.3  # Reduced from 0.5 to 0.3 (tighter clipping to prevent gradient explosions and loss spikes)
   weight_decay: 0.01
   lr_scheduler_type: "cosine"  # Learning rate scheduling enabled for better convergence
   save_total_limit: 3
 
 # RLAIF Configuration
 rlaif:
-  reward_weight: 1.0
-  kl_penalty: 0.05  # Reduced from 0.1 to allow more exploration (was too conservative)
+  reward_weight: 2.0  # Increased from 1.0 to 2.0 (stronger reward signal to improve average reward)
+  kl_penalty: 0.15  # Increased from 0.1 to 0.15 (stronger regularization to stabilize loss and prevent model drift)
+  reward_threshold: 0.25  # Increased from 0.2 to 0.25 (filter more low-reward samples to reduce noise and improve learning)
   beta: 0.1  # Temperature for reward scaling
   top_k: 50
   top_p: 0.95
-  num_samples_per_prompt: 6  # Increased from 2 to 6 for more diverse exploration (range: 4-8)
-  generation_temperature: 1.0  # Increased from 0.9 to 1.0 for more diversity (range: 0.7-1.2)
+  num_samples_per_prompt: 4  # Reduced from 6 to 4 (more focused learning, less exploration noise)
+  generation_temperature: 1.0  # Reduced from 1.2 to 1.0 (less exploration, more consistent higher-quality code)
   curriculum_learning: true  # Enable curriculum learning (start easy, increase difficulty)
   reward_bonuses: true  # Enable reward bonuses for specific improvements
   use_lora: true  # Use LoRA for efficient fine-tuning (reduces memory, faster training)
@@ -106,6 +110,7 @@ logging:
   health_check_enabled: true  # Print periodic training health checks while training is running
   health_check_interval_batches: 5  # Run health check every N batches
   health_check_grace_batches: 3  # Suppress reward/baseline warnings for the first N batches of epoch 1 (warmup/noise)
+  epoch_health_check_enabled: true  # Enable dynamic parameter adjustment after each epoch based on training trends
   health_check_gen_bottleneck_pct: 85  # Only warn if generation dominates >= this percentage AND tok/s is below target
   health_check_gen_target_tps: 6.0  # Target raw generation tokens/sec (warn if below when gen is dominant)
   # Fragmentation / cache growth health checks (Apple Silicon / Metal):

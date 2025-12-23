@@ -314,6 +314,37 @@ For offline analysis (batch-by-batch and epoch-by-epoch), enable JSON summaries 
 - `./logs/json_summaries/batches.jsonl`
 - `./logs/json_summaries/epochs.jsonl`
 
+#### Training Summary Output
+
+At the end of training, you'll see a comprehensive summary including:
+
+```
+📊 Generation Performance:
+  Average: 31.43 tokens/sec
+  P99:     58.37 tokens/sec
+  Samples:  350
+  Total Tokens Generated: 76,505
+
+🔄 Backpropagation Performance:
+  Average: 782.01 tokens/sec
+  P99:     822.40 tokens/sec
+  Samples: 347
+  Total Tokens Consumed: 51,200
+
+🌐 Teacher API Usage:
+  Total Tokens Sent: 3,813,261
+  Total Tokens Received: 4,991
+  Input Tokens/sec: 1,234.56
+  Output Tokens/sec: 1.62
+  Average per Epoch: 540,230
+  Breakdown by Epoch:
+    Epoch 1: 687,218 tokens
+    ...
+
+⏱️  Training Duration:
+  Total Time: 2h 15m 30s (8130.5 seconds)
+```
+
 ## Data Format
 
 Training data should be in JSONL format:
@@ -334,6 +365,33 @@ The training script prints the following statistics:
 - **Reward Std**: Standard deviation of rewards
 - **GPU Utilization**: GPU/Neural Engine utilization percentage
 - **Epoch Summary**: Per-epoch averages
+
+### Training Summary
+
+At the end of training, a comprehensive summary is printed including:
+
+#### Generation Performance
+- **Average**: Average generation speed (tokens/sec)
+- **P99**: 99th percentile generation speed
+- **Samples**: Number of generation samples
+- **Total Tokens Generated**: Cumulative tokens generated across all batches
+
+#### Backpropagation Performance
+- **Average**: Average backpropagation speed (tokens/sec)
+- **P99**: 99th percentile backpropagation speed
+- **Samples**: Number of backpropagation samples
+- **Total Tokens Consumed**: Cumulative tokens processed during backpropagation
+
+#### Teacher API Usage
+- **Total Tokens Sent**: Total input tokens sent to teacher API
+- **Total Tokens Received**: Total output tokens received from teacher API
+- **Input Tokens/sec**: Throughput for input tokens
+- **Output Tokens/sec**: Throughput for output tokens
+- **Average per Epoch**: Average tokens per epoch
+- **Breakdown by Epoch**: Token usage per epoch
+
+#### Training Duration
+- **Total Time**: Complete training duration in hours, minutes, and seconds
 
 ## TensorBoard Metrics
 
@@ -367,11 +425,17 @@ This section provides a comprehensive reference for all metrics logged to Tensor
 - **`Performance/Generation_Time`**: Time taken for generation (logged every 10 batches)
 - **`Performance/Generation_AvgTokensPerSec`**: Average generation speed across all epochs
 - **`Performance/Generation_P99TokensPerSec`**: P99 generation speed (99th percentile)
+- **`Performance/Generation_TotalTokens_Cumulative`**: Cumulative total tokens generated
 
 #### Backpropagation Performance
 - **`Performance/Backprop_TokensPerSec`**: Real-time backpropagation speed (logged at logging steps)
 - **`Performance/Backprop_AvgTokensPerSec`**: Average backpropagation speed across all epochs
 - **`Performance/Backprop_P99TokensPerSec`**: P99 backpropagation speed (99th percentile)
+- **`Performance/Training_TotalTokens_Cumulative`**: Cumulative total tokens processed during training
+
+#### Scoring Performance
+- **`Performance/Scoring_TotalTokens_Input_Cumulative`**: Cumulative input tokens for scoring
+- **`Performance/Scoring_TotalTokens_Output_Cumulative`**: Cumulative output tokens for scoring
 
 ### Scoring Metrics (`Scoring/`)
 

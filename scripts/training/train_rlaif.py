@@ -245,10 +245,12 @@ class RLAIFConfig:
     mixed_precision: str
     tensorboard_dir: str
     log_level: str
+    reward_threshold: Optional[float] = None  # Filter samples with reward below this threshold (None = no filtering)
     optimizer: str = "adamw"  # "adamw" or "adafactor"
     save_every_epochs: int = 1
     save_every_batches: int = 0
     save_json_summaries: bool = True
+    resume_from_checkpoint: Optional[str] = None  # Path to checkpoint directory to resume from
     json_summaries_dir: str = "./logs/json_summaries"
     baseline_eval_batches: int = 1
     tensorboard_batch_interval: int = 1
@@ -257,6 +259,7 @@ class RLAIFConfig:
     health_check_grace_batches: int = 3
     health_check_gen_bottleneck_pct: float = 85.0
     health_check_gen_target_tps: float = 6.0
+    epoch_health_check_enabled: bool = True  # Enable dynamic parameter adjustment after each epoch
     health_check_fragmentation_enabled: bool = True
     # NOTE: On Apple Silicon, MPS "driver allocated - current allocated" can be high but stable due to caching.
     # We primarily react to *growth* (health_check_fragmentation_growth_gb), treating this as a high watermark.
@@ -1967,14 +1970,13 @@ class RLAIFTrainer:
             # Set environment variable to allow more memory allocation
             # 0.0 = no limit (use with caution), 0.8 = 80% of available memory
             os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
-            logger.info("MPS memory management: Set PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0 to allow more memory")
+            logger.debug("MPS memory management: Set PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0 to allow more memory")
             # Also reduce per-process memory fraction to leave more headroom
-            # Check if method exists (not available in all PyTorch versions)
+            # Check if method exists (not available in all PyTorch versions - this is normal)
             if hasattr(torch.backends.mps, 'set_per_process_memory_fraction'):
                 torch.backends.mps.set_per_process_memory_fraction(0.6)  # Reduced from 0.7 to 0.6
-                logger.info("MPS memory: Set per-process memory fraction to 0.6 (60%)")
-            else:
-                logger.info("MPS memory: set_per_process_memory_fraction not available in this PyTorch version")
+                logger.debug("MPS memory: Set per-process memory fraction to 0.6 (60%)")
+            # Note: set_per_process_memory_fraction is not available in all PyTorch versions (this is expected and not an error)
         
         # MLX model for faster generation (optional, much faster than PyTorch MPS)
         # Load MLX model if enabled (similar to preload_model.py)
@@ -1985,8 +1987,11 @@ class RLAIFTrainer:
         self.training_metrics = {
             'generation_tokens_per_sec': [],  # Track all generation speeds
             'backprop_tokens_per_sec': [],    # Track all backprop speeds
+            'generation_tokens_total': 0,     # Total tokens generated across all batches
+            'backprop_tokens_total': 0,       # Total tokens processed during backprop across all batches
             'api_tokens_sent': 0,             # Total tokens sent to teacher API (input tokens)
             'api_tokens_received': 0,         # Total tokens received from teacher API (output tokens)
+            'api_time_total': 0.0,           # Total time spent on API calls (scoring + generation)
             'api_tokens_by_epoch': [],        # Tokens per epoch (input tokens)
             'api_output_tokens_by_epoch': [], # Output tokens per epoch
             'api_calls_by_epoch': [],         # Number of API calls per epoch
@@ -2093,12 +2098,27 @@ class RLAIFTrainer:
             
             # Load MLX model if path was found or specified
             if mlx_path is not None:
-                # Keep a stable "base" MLX path so we can fall back if a checkpoint's MLX export is invalid.
-                # (Checkpoint MLX export can be corrupted by mismatched configs or partial conversions.)
-                try:
-                    self._mlx_base_model_path = str(mlx_path)
-                except Exception:
-                    self._mlx_base_model_path = None
+                # Check if we're resuming from checkpoint and use checkpoint MLX model if available
+                # This needs to be checked here because MLX setup happens before LoRA is applied
+                resume_from = getattr(config, 'resume_from_checkpoint', None)
+                checkpoint_mlx_path = None
+                if resume_from and isinstance(resume_from, str) and resume_from.strip() and resume_from.lower() not in ('null', 'none', ''):
+                    checkpoint_path = Path(resume_from).resolve()
+                    if checkpoint_path.exists():
+                        checkpoint_mlx_path = checkpoint_path / "mlx_model"
+                        if checkpoint_mlx_path.exists() and _is_mlx_dir(str(checkpoint_mlx_path)):
+                            logger.info(f"Using checkpoint MLX model for generation: {checkpoint_mlx_path}")
+                            mlx_path = str(checkpoint_mlx_path)
+                            self._checkpoint_mlx_model_path = str(checkpoint_mlx_path)
+                
+                if not checkpoint_mlx_path:
+                    # Keep a stable "base" MLX path so we can fall back if a checkpoint's MLX export is invalid.
+                    # (Checkpoint MLX export can be corrupted by mismatched configs or partial conversions.)
+                    try:
+                        self._mlx_base_model_path = str(mlx_path)
+                    except Exception:
+                        self._mlx_base_model_path = None
+                
                 if not _is_mlx_dir(mlx_path) and os.path.isdir(mlx_path):
                     logger.warning(f"MLX path exists but does not look like an mlx_lm.convert output dir: {mlx_path}")
                     logger.warning("Expected: config.json + (weights.npz/model.npz OR model.safetensors).")
@@ -2134,7 +2154,8 @@ class RLAIFTrainer:
                 # Reduce memory fraction to prevent OOM (0.7 = 70% of available memory)
                 # This leaves room for system and other allocations
                 torch.backends.mps.set_per_process_memory_fraction(0.7)
-                logger.info("MPS memory fraction set to 0.7 (70%) to prevent OOM")
+                logger.debug("MPS memory fraction set to 0.7 (70%) to prevent OOM")
+            # Note: set_per_process_memory_fraction is not available in all PyTorch versions (this is normal)
 
             # Experimental allocator warmup: allocate+free a few large chunks to prime the Metal heap.
             warm_gb = float(getattr(self.config, "mps_allocator_warmup_gb", 0.0) or 0.0)
@@ -3182,8 +3203,83 @@ class RLAIFTrainer:
     def _apply_lora(self, config: RLAIFConfig):
         """Apply LoRA or QLoRA to the model for efficient fine-tuning"""
         try:
-            from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
+            from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training, PeftModel
             
+            # Check if resuming from checkpoint BEFORE applying new LoRA
+            resume_from = getattr(config, 'resume_from_checkpoint', None)
+            checkpoint_path = None
+            if resume_from:
+                if isinstance(resume_from, str) and resume_from.strip() and resume_from.lower() not in ('null', 'none', ''):
+                    checkpoint_path = Path(resume_from).resolve()
+                    if checkpoint_path.exists() and (checkpoint_path / "adapter_model.safetensors").exists():
+                        logger.info(f"Resuming from checkpoint: {checkpoint_path}")
+                        # Load adapter directly from checkpoint (this will apply LoRA config from checkpoint)
+                        # PeftModel.from_pretrained automatically loads and enables the adapter
+                        self.model = PeftModel.from_pretrained(self.model, str(checkpoint_path))
+                        logger.info("✓ Loaded LoRA adapters from checkpoint")
+                        
+                        # Enable training mode
+                        self.model.train()
+                        
+                        # Ensure all LoRA parameters are trainable (they should be by default, but verify)
+                        trainable_count = 0
+                        for name, param in self.model.named_parameters():
+                            if 'lora' in name.lower() or 'adapter' in name.lower():
+                                if not param.requires_grad:
+                                    param.requires_grad = True
+                                    trainable_count += 1
+                        
+                        if trainable_count > 0:
+                            logger.info(f"Enabled {trainable_count} LoRA parameters for training")
+                        
+                        # Verify adapter is loaded (check peft_config, not active_adapters which may raise error)
+                        if hasattr(self.model, 'peft_config') and self.model.peft_config:
+                            adapter_names = list(self.model.peft_config.keys())
+                            logger.info(f"Adapter(s) loaded: {adapter_names}")
+                        else:
+                            logger.warning("Warning: peft_config not found - adapter may not be properly loaded")
+                        
+                        # Store checkpoint MLX path for generation worker
+                        checkpoint_mlx_path = checkpoint_path / "mlx_model"
+                        if checkpoint_mlx_path.exists():
+                            self._checkpoint_mlx_model_path = str(checkpoint_mlx_path)
+                            logger.info(f"✓ Found MLX model in checkpoint: {self._checkpoint_mlx_model_path}")
+                        else:
+                            self._checkpoint_mlx_model_path = None
+                        
+                        # Load training stats to get resume epoch
+                        stats_file = checkpoint_path / "training_stats.json"
+                        if stats_file.exists():
+                            import json
+                            try:
+                                with open(stats_file, 'r') as f:
+                                    stats = json.load(f)
+                                resume_epoch = stats.get('epoch', 0)
+                                self._resume_from_epoch = resume_epoch
+                                logger.info(f"✓ Will resume from epoch {resume_epoch + 1} (0-indexed: {resume_epoch})")
+                            except Exception as e:
+                                logger.warning(f"Could not load training stats: {e}")
+                                self._resume_from_epoch = None
+                        else:
+                            logger.warning(f"training_stats.json not found in checkpoint, cannot determine resume epoch")
+                            self._resume_from_epoch = None
+                        
+                        # Verify trainable parameters
+                        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+                        total_params = sum(p.numel() for p in self.model.parameters())
+                        trainable_percent = 100 * trainable_params / total_params
+                        logger.info(f"✓ LoRA loaded from checkpoint!")
+                        logger.info(f"  Trainable parameters: {trainable_params:,} ({trainable_percent:.2f}% of total)")
+                        logger.info(f"  Total parameters: {total_params:,}")
+                        if trainable_params == 0:
+                            logger.error("WARNING: No trainable parameters found after loading checkpoint!")
+                            logger.error("This may indicate the checkpoint adapter is incompatible with the base model.")
+                        return self.model  # Exit early - checkpoint loaded, no need to apply new LoRA
+                    else:
+                        logger.warning(f"Checkpoint not found or invalid: {checkpoint_path}")
+                        checkpoint_path = None
+            
+            # If not resuming, apply new LoRA configuration
             # QLoRA requires preparing the model for k-bit training
             if config.use_qlora:
                 logger.info("Preparing model for QLoRA (4-bit + LoRA)...")
@@ -3218,6 +3314,7 @@ class RLAIFTrainer:
             
             # Apply LoRA to model
             self.model = get_peft_model(self.model, lora_config)
+            self._resume_from_epoch = None  # Not resuming, starting fresh
             
             # Print trainable parameters
             trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
@@ -3880,7 +3977,9 @@ class RLAIFTrainer:
                 attn_mask = torch.cat([attn_mask, padding], dim=1)
         
         # Policy gradient: maximize log_prob * reward
-        policy_loss = -(selected_log_probs * reward_tensor * attn_mask).mean()
+        # Apply reward_weight to scale the reward signal strength
+        policy_loss_raw = -(selected_log_probs * reward_tensor * attn_mask).mean()
+        policy_loss = self.config.reward_weight * policy_loss_raw
         
         # Validate policy loss
         if torch.isnan(policy_loss) or torch.isinf(policy_loss):
@@ -3942,6 +4041,7 @@ class RLAIFTrainer:
         num_tokens = input_ids.numel()  # Total tokens in batch
         backprop_tokens_per_sec = num_tokens / backprop_time if backprop_time > 0 else 0
         self.training_metrics['backprop_tokens_per_sec'].append(backprop_tokens_per_sec)
+        self.training_metrics['backprop_tokens_total'] += num_tokens
         
         # Log to TensorBoard (will be logged in _log_stats if step matches logging_steps)
         
@@ -3965,6 +4065,9 @@ class RLAIFTrainer:
     def train(self, train_dataset: CodeDataset, eval_dataset: Optional[CodeDataset] = None):
         """Main training loop"""
         logger.info("Starting RLAIF training...")
+        
+        # Record training start time
+        self.training_metrics['training_start_time'] = time.time()
         
         # Start system monitoring
         self._start_monitoring()
@@ -4082,6 +4185,9 @@ class RLAIFTrainer:
             )
             logger.info("Using optimizer: AdamW")
         
+        # Store optimizer as instance variable for health check adjustments
+        self.optimizer = optimizer
+        
         # Setup scheduler
         total_steps = len(train_loader) * self.config.num_epochs
         scheduler = get_scheduler(
@@ -4109,7 +4215,15 @@ class RLAIFTrainer:
         
         global_step = 0
         
-        for epoch in range(self.config.num_epochs):
+        # Resume from checkpoint epoch if specified
+        start_epoch = getattr(self, '_resume_from_epoch', None)
+        if start_epoch is not None:
+            start_epoch = start_epoch + 1  # Resume from next epoch (e.g., if checkpoint is epoch 4, start from epoch 5)
+            logger.info(f"Resuming training from epoch {start_epoch} (checkpoint was at epoch {start_epoch - 1})")
+        else:
+            start_epoch = 0
+        
+        for epoch in range(start_epoch, self.config.num_epochs):
             epoch_start_time = time.time()  # Track epoch start time
             logger.info(f"Epoch {epoch + 1}/{self.config.num_epochs}")
             self.stats['epoch'] = epoch + 1
@@ -4315,6 +4429,7 @@ class RLAIFTrainer:
                         num_tokens = int(sum(len(ids) for ids in tok.get('input_ids', [])))
                 tokens_per_sec = num_tokens / gen_time if gen_time > 0 else 0
                 self.training_metrics['generation_tokens_per_sec'].append(tokens_per_sec)
+                self.training_metrics['generation_tokens_total'] += num_tokens
                 
                 # Track epoch-level metrics
                 # - gen_time reflects *all* sampled generation compute
@@ -4463,6 +4578,55 @@ class RLAIFTrainer:
                         rewards_for_training = list(train_batch.get("rewards") or [])
                         if not rewards_for_training:
                             rewards_for_training = rewards[:len(batch['prompt'])] if len(rewards) >= len(batch['prompt']) else rewards + [0.0] * (len(batch['prompt']) - len(rewards))
+                        
+                        # Apply reward threshold filtering if enabled
+                        reward_threshold = getattr(self.config, 'reward_threshold', None)
+                        original_batch_size = len(rewards_for_training)
+                        filtered_indices = []
+                        
+                        if reward_threshold is not None and reward_threshold > 0.0:
+                            # Filter samples with reward >= threshold
+                            filtered_indices = [i for i, r in enumerate(rewards_for_training) if r >= reward_threshold]
+                            
+                            if len(filtered_indices) < original_batch_size:
+                                # Filter the batch to only include high-reward samples
+                                filtered_count = original_batch_size - len(filtered_indices)
+                                logger.debug(
+                                    f"Reward threshold filtering: {filtered_count}/{original_batch_size} samples filtered "
+                                    f"(threshold={reward_threshold:.3f}, kept={len(filtered_indices)})"
+                                )
+                                
+                                # Filter batch tensors
+                                if 'input_ids' in train_batch and len(filtered_indices) > 0:
+                                    train_batch['input_ids'] = train_batch['input_ids'][filtered_indices]
+                                    train_batch['attention_mask'] = train_batch['attention_mask'][filtered_indices]
+                                    if 'prompt' in train_batch:
+                                        train_batch['prompt'] = [train_batch['prompt'][i] for i in filtered_indices]
+                                
+                                # Filter rewards
+                                rewards_for_training = [rewards_for_training[i] for i in filtered_indices]
+                                
+                                # Track filtering stats
+                                if not hasattr(self, '_reward_filtering_stats'):
+                                    self._reward_filtering_stats = {'total_filtered': 0, 'total_samples': 0}
+                                self._reward_filtering_stats['total_filtered'] += filtered_count
+                                self._reward_filtering_stats['total_samples'] += original_batch_size
+                            
+                            # Skip training if all samples were filtered
+                            if len(filtered_indices) == 0:
+                                logger.debug(
+                                    f"Skipping training batch: all {original_batch_size} samples filtered "
+                                    f"(reward threshold={reward_threshold:.3f})"
+                                )
+                                train_skipped_reason = "all_samples_filtered"
+                                train_ran = False
+                                # Still update counters to avoid breaking the loop
+                                micro_step_in_epoch += 1
+                                self._micro_step_in_epoch = int(micro_step_in_epoch)
+                                # Skip to next batch iteration
+                                continue
+                        
+                        # Proceed with training if we have samples after filtering
                         try:
                             # Advance micro-step counter BEFORE train_step so debug gating is aligned to this step.
                             micro_step_in_epoch += 1
@@ -5343,6 +5507,9 @@ class RLAIFTrainer:
             total_reward_time = sum(epoch_reward_times) if epoch_reward_times else 0.0
             total_train_time = sum(epoch_train_times) if epoch_train_times else 0.0
             
+            # Accumulate total API time across all epochs
+            self.training_metrics['api_time_total'] += total_reward_time
+            
             total_gen_tokens = sum(epoch_gen_tokens) if epoch_gen_tokens else 0
             total_gen_tokens_raw = sum(epoch_gen_tokens_raw) if epoch_gen_tokens_raw else 0
             total_gen_samples_raw = sum(epoch_gen_samples_raw) if epoch_gen_samples_raw else 0
@@ -5421,6 +5588,20 @@ class RLAIFTrainer:
                 f"    Scoring: {avg_reward_tokens_per_sec:.1f} tokens/sec (avg latency: {avg_reward_latency:.3f}s, input: {total_reward_input_tokens:,}, output: {total_reward_output_tokens:,})\n"
                 f"    Training: {avg_train_tokens_per_sec:.1f} tokens/sec (avg latency: {avg_train_latency:.3f}s, total input sequence tokens: {total_train_tokens:,})"
             )
+            
+            # Add reward filtering stats if available
+            filtering_stats = getattr(self, '_reward_filtering_stats', None)
+            if filtering_stats and filtering_stats.get('total_samples', 0) > 0:
+                filtered_count = filtering_stats.get('total_filtered', 0)
+                total_samples = filtering_stats.get('total_samples', 0)
+                filter_rate = (filtered_count / total_samples * 100) if total_samples > 0 else 0.0
+                reward_threshold = getattr(self.config, 'reward_threshold', None)
+                if reward_threshold is not None:
+                    logger.info(
+                        f"  Reward Filtering: {filtered_count}/{total_samples} samples filtered ({filter_rate:.1f}%, threshold={reward_threshold:.3f})"
+                    )
+                    # Reset stats for next epoch
+                    self._reward_filtering_stats = {'total_filtered': 0, 'total_samples': 0}
 
             # Save checkpoint at end of each epoch (independent of global_step)
             if int(getattr(self.config, "save_every_epochs", 0) or 0) > 0:
@@ -5534,6 +5715,16 @@ class RLAIFTrainer:
                 self._global_code_hashes.update(self._epoch_code_hashes)
             
             if self.writer:
+                # Log reward filtering stats if available
+                filtering_stats = getattr(self, '_reward_filtering_stats', None)
+                if filtering_stats and filtering_stats.get('total_samples', 0) > 0:
+                    filtered_count = filtering_stats.get('total_filtered', 0)
+                    total_samples = filtering_stats.get('total_samples', 0)
+                    filter_rate = (filtered_count / total_samples * 100) if total_samples > 0 else 0.0
+                    reward_threshold = getattr(self.config, 'reward_threshold', None)
+                    if reward_threshold is not None:
+                        logger.info(f"  Reward Filtering: {filtered_count}/{total_samples} samples filtered ({filter_rate:.1f}%, threshold={reward_threshold:.3f})")
+                
                 # Simplified epoch charts: log only what appears in the epoch summary.
                 ep = int(epoch + 1)
                 self.writer.add_scalar("Epoch/Time_Total_s", float(epoch_total_time), ep)
@@ -5582,6 +5773,11 @@ class RLAIFTrainer:
                 # Parameter update footprint (useful for LoRA/QLoRA vs full fine-tune)
                 self.writer.add_scalar("Epoch/Training_TrainableParams", float(trainable_params), ep)
                 self.writer.add_scalar("Epoch/Training_TrainablePct", float(trainable_percentage), ep)
+            
+            # Perform health check and dynamic parameter adjustment after each epoch
+            if (self.config.epoch_health_check_enabled and 
+                epoch < self.config.num_epochs - 1):  # Don't adjust on last epoch
+                self._epoch_health_check_and_adjust(epoch, avg_epoch_reward, avg_epoch_loss, reward_variance, reward_trend, loss_trend)
         
         # Record training end time
         self.training_metrics['training_end_time'] = time.time()
@@ -5807,42 +6003,92 @@ class RLAIFTrainer:
                             step = tick
                             tick += 1
 
-                        # Log to Batch/Metal structure for consistency
-                        # Note: System monitoring provides overall metrics; process separation (Training vs Generation)
-                        # requires tracking MLX worker process separately, which is approximated here
+                        # =========================
+                        # Get Process-Separated Metrics (Training vs Generation)
+                        # =========================
                         
-                        # CPU utilization by process (approximated - overall CPU for training process)
-                        # Generation runs in separate MLX worker process, so we log overall CPU
-                        # In practice, CPU usage correlates with active phase
-                        self.writer.add_scalar('Batch/Metal/CPU/Training_Percent', metrics.get('cpu_percent', 0), step)
-                        # Generation CPU is approximated as 0 when not actively generating (would need MLX worker PID tracking)
-                        self.writer.add_scalar('Batch/Metal/CPU/Generation_Percent', 0.0, step)  # Placeholder - would need MLX worker monitoring
+                        # Training process metrics (main process)
+                        training_cpu = metrics.get('cpu_percent', 0)
+                        training_memory_gb = metrics.get('process_footprint_gb', 0) or metrics.get('process_memory_gb', 0)
+                        training_gpu_memory_gb = metrics.get('gpu_memory_used_gb', 0)  # MPS memory
+                        training_gpu_percent = metrics.get('gpu_memory_percent', 0)  # MPS memory percentage
+                        
+                        # Generation process metrics (MLX worker process)
+                        generation_cpu = 0.0
+                        generation_memory_gb = 0.0
+                        generation_gpu_memory_gb = 0.0
+                        generation_gpu_percent = 0.0
+                        
+                        # Get MLX cache metrics for generation process
+                        frag = self._get_fragmentation_metrics_gb()
+                        mlx_cache_gb = frag.get("mlx_cache_gb", 0.0)
+                        mlx_active_gb = frag.get("mlx_active_gb", 0.0)
+                        mlx_total_gb = mlx_cache_gb + mlx_active_gb
+                        
+                        # Try to get MLX worker process metrics (CPU and memory)
+                        mlx_worker = getattr(self, '_mlx_worker', None)
+                        if mlx_worker and mlx_worker.poll() is None:  # Process is still running
+                            try:
+                                import psutil
+                                worker_pid = mlx_worker.pid
+                                worker_proc = psutil.Process(worker_pid)
+                                
+                                # CPU utilization for generation process
+                                generation_cpu = worker_proc.cpu_percent(interval=0.1) or 0.0
+                                
+                                # Memory for generation process
+                                worker_mem_info = worker_proc.memory_info()
+                                generation_memory_gb = worker_mem_info.rss / (1024 ** 3)
+                            except Exception:
+                                pass  # Fallback to 0 if can't get worker metrics
+                        
+                        # GPU memory for generation (from MLX cache metrics)
+                        generation_gpu_memory_gb = mlx_total_gb
+                        
+                        # GPU utilization for generation (MLX memory as percentage of total)
+                        gpu_total_gb = metrics.get('gpu_memory_total_gb', 0)
+                        if gpu_total_gb > 0:
+                            generation_gpu_percent = (generation_gpu_memory_gb / gpu_total_gb) * 100
+                        
+                        # =========================
+                        # Batch/Metal/* Metrics (for consistency with batch-level logging)
+                        # =========================
+                        
+                        # CPU utilization by process
+                        self.writer.add_scalar('Batch/Metal/CPU/Training_Percent', training_cpu, step)
+                        self.writer.add_scalar('Batch/Metal/CPU/Generation_Percent', generation_cpu, step)
                         
                         # GPU utilization by process
                         if metrics.get('gpu_memory_total_gb', 0) > 0:
-                            # Overall GPU utilization (MPS memory proxy for training, MLX cache for generation)
-                            # Training GPU utilization (MPS memory usage as proxy)
-                            gpu_util = metrics.get('gpu_utilization', 0)
-                            # Approximate: when MPS memory is high, training is active
-                            mps_mem_pct = metrics.get('gpu_memory_percent', 0)
-                            self.writer.add_scalar('Batch/Metal/GPU/Training_Percent', mps_mem_pct, step)
-                            # Generation GPU utilization (approximated from MLX cache - would need MLX worker metrics)
-                            self.writer.add_scalar('Batch/Metal/GPU/Generation_Percent', max(0, gpu_util - mps_mem_pct), step)
+                            # Training GPU utilization: MPS memory percentage
+                            self.writer.add_scalar('Batch/Metal/GPU/Training_Percent', training_gpu_percent, step)
+                            
+                            # Generation GPU utilization: MLX memory percentage
+                            self.writer.add_scalar('Batch/Metal/GPU/Generation_Percent', generation_gpu_percent, step)
+                            
+                            # Total GPU memory utilization (sum of both processes)
+                            total_gpu_mem_pct = min(100.0, training_gpu_percent + generation_gpu_percent)
+                            self.writer.add_scalar('Batch/Metal/GPU/Total_Percent', total_gpu_mem_pct, step)
                         
-                        # Keep legacy System/* tags for backward compatibility
-                        self.writer.add_scalar('System/CPU_Percent', metrics.get('cpu_percent', 0), step)
-                        self.writer.add_scalar('System/Memory_Percent', metrics.get('memory_percent', 0), step)
-                        self.writer.add_scalar('System/Memory_Used_GB', metrics.get('memory_used_gb', 0), step)
-                        self.writer.add_scalar('System/Memory_Available_GB', metrics.get('memory_available_gb', 0), step)
-                        self.writer.add_scalar('System/Process_Memory_GB', metrics.get('process_memory_gb', 0), step)
-                        self.writer.add_scalar('System/Process_RSS_GB', metrics.get('process_rss_gb', 0), step)
-                        self.writer.add_scalar('System/Process_Footprint_GB', metrics.get('process_footprint_gb', 0), step)
+                        # =========================
+                        # System/* Metrics - Process-Separated (Training vs Generation)
+                        # Only Memory, GPU, CPU utilization by process
+                        # =========================
+                        
+                        # CPU utilization by process
+                        self.writer.add_scalar('System/CPU/Training_Percent', training_cpu, step)
+                        self.writer.add_scalar('System/CPU/Generation_Percent', generation_cpu, step)
+                        
+                        # Memory utilization by process (GB)
+                        self.writer.add_scalar('System/Memory/Training_GB', training_memory_gb, step)
+                        self.writer.add_scalar('System/Memory/Generation_GB', generation_memory_gb, step)
+                        
+                        # GPU utilization by process
                         if metrics.get('gpu_memory_total_gb', 0) > 0:
-                            self.writer.add_scalar('System/GPU_Memory_Used_GB', metrics.get('gpu_memory_used_gb', 0), step)
-                            self.writer.add_scalar('System/GPU_Memory_Total_GB', metrics.get('gpu_memory_total_gb', 0), step)
-                            self.writer.add_scalar('System/GPU_Memory_Percent', metrics.get('gpu_memory_percent', 0), step)
-                            self.writer.add_scalar('System/GPU_Utilization', metrics.get('gpu_utilization', 0), step)
-                            self.writer.add_scalar('System/GPU_Utilization_Estimated', metrics.get('gpu_utilization', 0), step)
+                            self.writer.add_scalar('System/GPU/Training_Percent', training_gpu_percent, step)
+                            self.writer.add_scalar('System/GPU/Generation_Percent', generation_gpu_percent, step)
+                            self.writer.add_scalar('System/GPU/Training_Memory_GB', training_gpu_memory_gb, step)
+                            self.writer.add_scalar('System/GPU/Generation_Memory_GB', generation_gpu_memory_gb, step)
                     
                     time.sleep(self.monitoring_interval)
                 except Exception as e:
@@ -5860,6 +6106,170 @@ class RLAIFTrainer:
             self.monitoring_thread.join(timeout=2)
         logger.info("System monitoring stopped")
     
+    def _epoch_health_check_and_adjust(self, epoch: int, avg_reward: float, avg_loss: float, 
+                                       reward_variance: float, reward_trend: float, loss_trend: float):
+        """
+        Perform health check after each epoch and dynamically adjust hyperparameters.
+        
+        Analyzes training trends and adjusts:
+        - Learning rate (if loss is unstable or reward not improving)
+        - KL penalty (if loss is too high or reward is declining)
+        - Reward weight (if reward is not improving)
+        - Max grad norm (if loss is spiking)
+        - Reward threshold (if variance is too high)
+        - Generation temperature (if exploration is insufficient)
+        """
+        # Skip health check for first epoch (need baseline)
+        if epoch == 0:
+            # Store initial parameter values
+            if not hasattr(self, '_original_params'):
+                self._original_params = {
+                    'learning_rate': self.config.learning_rate,
+                    'kl_penalty': self.config.kl_penalty,
+                    'reward_weight': self.config.reward_weight,
+                    'max_grad_norm': self.config.max_grad_norm,
+                    'reward_threshold': self.config.reward_threshold,
+                    'generation_temperature': self.config.generation_temperature,
+                }
+            return
+        
+        logger.info("\n" + "="*80)
+        logger.info(f"🔍 EPOCH {epoch + 1} HEALTH CHECK")
+        logger.info("="*80)
+        
+        # Get previous epoch metrics for comparison
+        reward_by_epoch = self.training_metrics['reward_by_epoch']
+        loss_by_epoch = self.training_metrics['loss_by_epoch']
+        variance_by_epoch = self.training_metrics['reward_variance_by_epoch']
+        
+        if len(reward_by_epoch) < 2:
+            return
+        
+        # Calculate multi-epoch trends (look at last 2-3 epochs)
+        recent_rewards = reward_by_epoch[-min(3, len(reward_by_epoch)):]
+        recent_losses = loss_by_epoch[-min(3, len(loss_by_epoch)):]
+        recent_variances = variance_by_epoch[-min(3, len(variance_by_epoch)):]
+        
+        # Detect issues
+        issues = []
+        adjustments = {}
+        
+        # Issue 1: Loss is increasing or too high
+        if len(recent_losses) >= 2:
+            loss_increasing = recent_losses[-1] > recent_losses[-2]
+            loss_too_high = avg_loss > 0.5  # Threshold for "too high"
+            loss_spike = len(recent_losses) >= 2 and (recent_losses[-1] - recent_losses[-2]) > 0.2
+            
+            if loss_increasing or loss_too_high or loss_spike:
+                issues.append("Loss increasing/too high")
+                # Reduce learning rate
+                current_lr = self.config.learning_rate
+                new_lr = current_lr * 0.8  # Reduce by 20%
+                new_lr = max(new_lr, 1e-7)  # Don't go below minimum
+                if new_lr != current_lr:
+                    adjustments['learning_rate'] = (current_lr, new_lr)
+                    self.config.learning_rate = new_lr
+                    # Update optimizer learning rate
+                    for param_group in self.optimizer.param_groups:
+                        param_group['lr'] = new_lr
+                
+                # Increase KL penalty if loss is spiking
+                if loss_spike:
+                    current_kl = self.config.kl_penalty
+                    new_kl = min(current_kl * 1.2, 0.3)  # Increase by 20%, cap at 0.3
+                    if new_kl != current_kl:
+                        adjustments['kl_penalty'] = (current_kl, new_kl)
+                        self.config.kl_penalty = new_kl
+                
+                # Tighter gradient clipping if loss is spiking
+                if loss_spike:
+                    current_grad_norm = self.config.max_grad_norm
+                    new_grad_norm = max(current_grad_norm * 0.8, 0.1)  # Reduce by 20%, min 0.1
+                    if new_grad_norm != current_grad_norm:
+                        adjustments['max_grad_norm'] = (current_grad_norm, new_grad_norm)
+                        self.config.max_grad_norm = new_grad_norm
+        
+        # Issue 2: Reward is decreasing or not improving
+        if len(recent_rewards) >= 2:
+            reward_decreasing = recent_rewards[-1] < recent_rewards[-2]
+            reward_stagnant = len(recent_rewards) >= 3 and abs(recent_rewards[-1] - recent_rewards[-3]) < 0.01
+            reward_too_low = avg_reward < 0.3  # Threshold for "too low"
+            
+            if reward_decreasing or (reward_stagnant and reward_too_low):
+                issues.append("Reward decreasing/stagnant")
+                # Increase reward weight if reward is not improving
+                if reward_stagnant or reward_decreasing:
+                    current_rw = self.config.reward_weight
+                    new_rw = min(current_rw * 1.15, 3.0)  # Increase by 15%, cap at 3.0
+                    if new_rw != current_rw:
+                        adjustments['reward_weight'] = (current_rw, new_rw)
+                        self.config.reward_weight = new_rw
+                
+                # Reduce KL penalty if reward is declining (may be too conservative)
+                if reward_decreasing and avg_loss < 0.4:  # Only if loss is reasonable
+                    current_kl = self.config.kl_penalty
+                    new_kl = max(current_kl * 0.9, 0.05)  # Reduce by 10%, min 0.05
+                    if new_kl != current_kl:
+                        adjustments['kl_penalty'] = (current_kl, new_kl)
+                        self.config.kl_penalty = new_kl
+        
+        # Issue 3: High reward variance (inconsistent training)
+        if reward_variance > 0.08:  # Threshold for high variance
+            issues.append("High reward variance (inconsistent)")
+            # Increase reward threshold to filter more low-quality samples
+            current_threshold = self.config.reward_threshold or 0.0
+            new_threshold = min(current_threshold + 0.02, 0.3)  # Increase by 0.02, cap at 0.3
+            if new_threshold != current_threshold:
+                adjustments['reward_threshold'] = (current_threshold, new_threshold)
+                self.config.reward_threshold = new_threshold
+        
+        # Issue 4: Loss is decreasing well but reward not improving (may need more exploration)
+        if loss_trend > 0.05 and reward_trend < 0.01 and avg_loss < 0.3:
+            issues.append("Loss improving but reward stagnant (may need exploration)")
+            # Slightly increase generation temperature for more exploration
+            current_temp = self.config.generation_temperature
+            new_temp = min(current_temp * 1.1, 1.5)  # Increase by 10%, cap at 1.5
+            if new_temp != current_temp:
+                adjustments['generation_temperature'] = (current_temp, new_temp)
+                self.config.generation_temperature = new_temp
+        
+        # Issue 5: Reward improving but loss increasing (may be overfitting)
+        if reward_trend > 0.01 and loss_trend < -0.05:
+            issues.append("Reward improving but loss increasing (potential overfitting)")
+            # Increase KL penalty to prevent drift
+            current_kl = self.config.kl_penalty
+            new_kl = min(current_kl * 1.1, 0.25)  # Increase by 10%, cap at 0.25
+            if new_kl != current_kl:
+                adjustments['kl_penalty'] = (current_kl, new_kl)
+                self.config.kl_penalty = new_kl
+        
+        # Log health check results
+        if issues:
+            logger.warning(f"⚠️  Detected Issues: {', '.join(issues)}")
+        else:
+            logger.info("✅ Training health: Good")
+        
+        # Log current metrics
+        logger.info(f"  Current Reward: {avg_reward:.4f} (trend: {reward_trend:+.4f})")
+        logger.info(f"  Current Loss: {avg_loss:.4f} (trend: {loss_trend:+.4f})")
+        logger.info(f"  Reward Variance: {reward_variance:.4f}")
+        
+        # Log adjustments
+        if adjustments:
+            logger.info("\n🔧 Parameter Adjustments:")
+            for param_name, (old_val, new_val) in adjustments.items():
+                change_pct = ((new_val - old_val) / old_val * 100) if old_val != 0 else 0
+                logger.info(f"  {param_name}: {old_val:.6f} → {new_val:.6f} ({change_pct:+.1f}%)")
+            
+            # Log to TensorBoard
+            if self.writer:
+                for param_name, (old_val, new_val) in adjustments.items():
+                    self.writer.add_scalar(f"HealthCheck/{param_name}", new_val, epoch + 1)
+        else:
+            logger.info("\n✅ No parameter adjustments needed")
+        
+        logger.info("="*80 + "\n")
+    
     def _print_training_summary(self):
         """Print comprehensive training summary with all metrics"""
         logger.info("\n" + "="*80)
@@ -5874,10 +6284,12 @@ class RLAIFTrainer:
         if gen_speeds:
             avg_gen_speed = np.mean(gen_speeds)
             p99_gen_speed = np.percentile(gen_speeds, 99) if len(gen_speeds) > 0 else 0
+            total_gen_tokens = self.training_metrics.get('generation_tokens_total', 0)
             logger.info("\n📊 Generation Performance:")
             logger.info(f"  Average: {avg_gen_speed:.2f} tokens/sec")
             logger.info(f"  P99:     {p99_gen_speed:.2f} tokens/sec")
             logger.info(f"  Samples:  {len(gen_speeds)}")
+            logger.info(f"  Total Tokens Generated: {total_gen_tokens:,}")
         else:
             logger.info("\n📊 Generation Performance: No data")
         
@@ -5885,20 +6297,31 @@ class RLAIFTrainer:
         if backprop_speeds:
             avg_backprop_speed = np.mean(backprop_speeds)
             p99_backprop_speed = np.percentile(backprop_speeds, 99) if len(backprop_speeds) > 0 else 0
+            total_backprop_tokens = self.training_metrics.get('backprop_tokens_total', 0)
             logger.info("\n🔄 Backpropagation Performance:")
             logger.info(f"  Average: {avg_backprop_speed:.2f} tokens/sec")
             logger.info(f"  P99:     {p99_backprop_speed:.2f} tokens/sec")
             logger.info(f"  Samples: {len(backprop_speeds)}")
+            logger.info(f"  Total Tokens Consumed: {total_backprop_tokens:,}")
         else:
             logger.info("\n🔄 Backpropagation Performance: No data")
         
         # API Token Usage
-        total_api_tokens = self.training_metrics['api_tokens_sent']
+        total_api_input_tokens = self.training_metrics['api_tokens_sent']
+        total_api_output_tokens = self.training_metrics['api_tokens_received']
+        total_api_time = self.training_metrics.get('api_time_total', 0.0)
         api_tokens_by_epoch = self.training_metrics['api_tokens_by_epoch']
         avg_tokens_per_epoch = np.mean(api_tokens_by_epoch) if api_tokens_by_epoch else 0
         
+        # Calculate tokens/sec for input and output
+        input_tokens_per_sec = total_api_input_tokens / total_api_time if total_api_time > 0 else 0.0
+        output_tokens_per_sec = total_api_output_tokens / total_api_time if total_api_time > 0 else 0.0
+        
         logger.info("\n🌐 Teacher API Usage:")
-        logger.info(f"  Total Tokens Sent: {total_api_tokens:,}")
+        logger.info(f"  Total Tokens Sent: {total_api_input_tokens:,}")
+        logger.info(f"  Total Tokens Received: {total_api_output_tokens:,}")
+        logger.info(f"  Input Tokens/sec: {input_tokens_per_sec:.2f}")
+        logger.info(f"  Output Tokens/sec: {output_tokens_per_sec:.2f}")
         logger.info(f"  Average per Epoch: {avg_tokens_per_epoch:,.0f}")
         logger.info(f"  Breakdown by Epoch:")
         for i, tokens in enumerate(api_tokens_by_epoch, 1):
@@ -6835,12 +7258,14 @@ def load_config(config_path: str) -> Tuple[RLAIFConfig, dict]:
         logging_steps=to_int(training_cfg.get('logging_steps'), 50),
         save_every_epochs=to_int(training_cfg.get('save_every_epochs'), 1),
         save_every_batches=to_int(training_cfg.get('save_every_batches'), 0),
+        resume_from_checkpoint=training_cfg.get('resume_from_checkpoint') if training_cfg.get('resume_from_checkpoint') not in (None, 'null', 'none', '') else None,
         max_grad_norm=to_float(training_cfg.get('max_grad_norm'), 1.0),
         weight_decay=to_float(training_cfg.get('weight_decay'), 0.01),
         lr_scheduler_type=training_cfg.get('lr_scheduler_type', 'cosine'),
         optimizer=str(training_cfg.get('optimizer', 'adamw') or 'adamw'),
         reward_weight=to_float(rlaif_cfg.get('reward_weight'), 1.0),
         kl_penalty=to_float(rlaif_cfg.get('kl_penalty'), 0.1),
+        reward_threshold=to_float(rlaif_cfg.get('reward_threshold'), None) if rlaif_cfg.get('reward_threshold') is not None else None,
         beta=to_float(rlaif_cfg.get('beta'), 0.1),
         num_samples_per_prompt=to_int(rlaif_cfg.get('num_samples_per_prompt'), 4),
         generation_temperature=to_float(rlaif_cfg.get('generation_temperature'), 0.8),
@@ -6867,6 +7292,7 @@ def load_config(config_path: str) -> Tuple[RLAIFConfig, dict]:
         health_check_enabled=to_bool(logging_cfg.get('health_check_enabled'), True),
         health_check_interval_batches=to_int(logging_cfg.get('health_check_interval_batches'), 5),
         health_check_grace_batches=to_int(logging_cfg.get('health_check_grace_batches'), 3),
+        epoch_health_check_enabled=to_bool(logging_cfg.get('epoch_health_check_enabled'), True),
         health_check_gen_bottleneck_pct=to_float(logging_cfg.get('health_check_gen_bottleneck_pct'), 85.0),
         health_check_gen_target_tps=to_float(logging_cfg.get('health_check_gen_target_tps'), 6.0),
         health_check_fragmentation_enabled=to_bool(logging_cfg.get('health_check_fragmentation_enabled'), True),
