@@ -163,6 +163,60 @@ reward = student_score / (teacher_score + ε)
 ```
 This normalizes rewards relative to teacher performance, ensuring the student learns to match or exceed teacher quality.
 
+### Adaptive Scoring with Rubric Difficulty Components
+
+The system uses an intelligent rubric difficulty analysis module to adapt scoring criteria based on prompt complexity. This ensures that scoring is context-aware and appropriately strict based on what each prompt demands.
+
+#### How It Works
+
+1. **Prompt Analysis**: Before scoring, the system analyzes the prompt using `_rubric_difficulty_components()` to estimate difficulty across four dimensions:
+   - **Correctness** (0.3): Edge cases, error handling, validation, concurrency, parsing
+   - **Code Quality** (0.3): API design, patterns, clean architecture, tests, modularity
+   - **Efficiency** (0.2): Performance constraints, complexity, optimization, large inputs
+   - **Documentation** (0.2): Documentation requirements, comments, examples
+
+2. **Difficulty Detection**: The module uses keyword-based heuristics to detect complexity:
+   - **Correctness indicators**: "edge case", "error handling", "thread-safe", "validate", "parse", etc.
+   - **Quality indicators**: "clean", "design pattern", "API", "modular", "tests", etc.
+   - **Efficiency indicators**: "efficient", "optimize", "performance", "O(", "complexity", etc.
+   - **Documentation indicators**: "document", "docstring", "comments", "explain", "examples", etc.
+
+3. **Adaptive Scoring Criteria**: Based on detected difficulty (0.0-1.0), the scoring prompt adapts:
+   - **High difficulty (>0.7)**: Stricter criteria requiring comprehensive solutions
+   - **Medium difficulty (0.4-0.7)**: Standard criteria with balanced expectations
+   - **Low difficulty (<0.4)**: Basic criteria focused on core functionality
+
+4. **Language Weighting**: Additional complexity multipliers:
+   - **C++**: 1.10x (more incidental complexity)
+   - **Rust**: 1.15x (ownership/lifetimes add complexity)
+   - **Python**: 1.00x (baseline)
+
+#### Example
+
+For a prompt like:
+```
+"Implement a thread-safe queue with error handling and edge case validation"
+```
+
+The system detects:
+- **Correctness demand**: High (0.8+) - detects "thread-safe", "error handling", "edge case", "validate"
+- **Quality demand**: Medium (0.5) - no explicit quality keywords
+- **Efficiency demand**: Low (0.2) - no performance keywords
+- **Documentation demand**: Low (0.1) - no documentation keywords
+
+The scoring prompt will then:
+- Use **strict correctness criteria** requiring thread-safety, error handling, and edge case coverage
+- Use **standard quality criteria** for code structure
+- Use **basic efficiency criteria** (no strict performance requirements)
+- Use **basic documentation criteria** (minimal docs acceptable)
+
+#### Benefits
+
+- **Context-Aware Scoring**: Scoring adapts to what each prompt actually requires
+- **Fairer Evaluation**: Simple prompts aren't penalized for missing advanced features
+- **Stricter for Complex Tasks**: Complex prompts receive appropriately strict evaluation
+- **Better Training Signal**: More accurate rewards lead to better learning
+
 ### Loss Function
 The training loss combines:
 1. **Policy Gradient Loss**: `-log_prob * reward` (maximize high-reward outputs)
@@ -445,7 +499,7 @@ These represent the scoring weights used for evaluation:
 - **`Scoring/Efficiency`**: Efficiency weight (0.2)
 - **`Scoring/Documentation`**: Documentation weight (0.2)
 
-*Note: Currently these are fixed weights. Future versions may track actual criterion scores.*
+**Adaptive Scoring**: The scoring criteria are dynamically adjusted based on prompt difficulty analysis (see [Adaptive Scoring with Rubric Difficulty Components](#adaptive-scoring-with-rubric-difficulty-components)). The weights remain fixed, but the evaluation criteria become stricter or more lenient based on what each prompt demands.
 
 ### System Metrics (`System/`)
 
@@ -1313,6 +1367,8 @@ train_coding_asst/
 
 ### Custom Reward Function
 Modify `TeacherModel.score_code()` to implement custom scoring logic.
+
+**Note**: The default implementation uses adaptive scoring based on rubric difficulty components (see [Adaptive Scoring with Rubric Difficulty Components](#adaptive-scoring-with-rubric-difficulty-components)). If you override `score_code()`, consider integrating `_rubric_difficulty_components()` for context-aware evaluation.
 
 ### Multi-Language Training
 The system supports Python, C++, and Rust. Add more languages by:
