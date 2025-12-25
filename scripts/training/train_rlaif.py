@@ -264,7 +264,8 @@ class RLAIFConfig:
     save_json_summaries: bool = True
     resume_from_checkpoint: Optional[str] = None  # Path to checkpoint directory to resume from
     json_summaries_dir: str = "./logs/json_summaries"
-    baseline_eval_batches: int = 1
+    baseline_eval_batches: int = 8  # Compute baseline over 8 batches (80-160 samples) for stable reference
+    use_rolling_ema_baseline: bool = False  # If True, compute rolling EMA baseline from early epoch data instead of pre-training baseline
     tensorboard_batch_interval: int = 1
     health_check_enabled: bool = True
     health_check_interval_batches: int = 5
@@ -1822,13 +1823,26 @@ class RLAIFTrainer:
     def _compute_baseline_reward(self, train_loader: DataLoader) -> float:
         """Compute a pre-training baseline reward (no weight updates).
         
-        Uses the first N batches (config.logging.baseline_eval_batches) to estimate baseline quality.
+        Uses the first N batches (config.baseline_eval_batches) to estimate baseline quality.
+        CRITICAL: Uses same temperature/sampling settings as training via generate_student_samples.
+        Minimum 5-10 batches (80-160 samples) recommended for stable reference.
         """
         n_batches = int(getattr(self.config, "baseline_eval_batches", 0) or 0)
         if n_batches <= 0:
             return 0.0
+        
+        # Warn if too few batches for stable baseline
+        if n_batches < 5:
+            logger.warning(
+                f"⚠️  baseline_eval_batches={n_batches} is too small for stable reference. "
+                f"Recommend at least 5-10 batches (80-160 samples). "
+                f"Current setting may produce misleading baseline comparisons."
+            )
 
-        logger.info(f"Computing baseline reward on first {n_batches} batch(es) (no training updates)...")
+        logger.info(
+            f"Computing baseline reward on first {n_batches} batch(es) "
+            f"(no training updates, using same temperature={self.config.generation_temperature:.2f} as training)..."
+        )
         all_rewards: List[float] = []
 
         # Snapshot caches to avoid polluting training caches too much
@@ -1845,7 +1859,14 @@ class RLAIFTrainer:
                 if not prompts or not languages:
                     continue
                 try:
-                    samples = self.generate_student_samples(prompts, languages, num_samples=self.config.num_samples_per_prompt, epoch=0)
+                    # CRITICAL: Use same generation settings as training (temperature, num_samples, etc.)
+                    # This ensures baseline is comparable to training rewards
+                    samples = self.generate_student_samples(
+                        prompts, 
+                        languages, 
+                        num_samples=self.config.num_samples_per_prompt, 
+                        epoch=0
+                    )
                     if samples:
                         rewards, _ = self.compute_rewards(samples, save_to_dataset=False)
                         if rewards:
@@ -1861,7 +1882,14 @@ class RLAIFTrainer:
                 pass
 
         baseline = float(np.mean(all_rewards)) if all_rewards else 0.0
-        logger.info(f"Baseline reward: {baseline:.4f} (computed from {len(all_rewards)} samples)")
+        logger.info(
+            f"Baseline reward: {baseline:.4f} (computed from {len(all_rewards)} samples across {n_batches} batches)"
+        )
+        if len(all_rewards) < 80:
+            logger.warning(
+                f"⚠️  Baseline computed from only {len(all_rewards)} samples. "
+                f"Recommend at least 80-160 samples for stable reference."
+            )
         return baseline
     
     def __init__(self, config: RLAIFConfig, config_path: Optional[str] = None):
@@ -1878,6 +1906,8 @@ class RLAIFTrainer:
         self._prev_batch_avg_reward = None
         self._reward_ema = None  # exponential moving average of batch avg reward
         self._advantage_baseline_ema = None  # EMA baseline for advantage normalization
+        self._rolling_baseline_ema = None  # Rolling EMA baseline for use_rolling_ema_baseline mode
+        self._rolling_baseline_samples = []  # Accumulate early epoch rewards for rolling baseline
         self._batch_step = 0  # monotonic batch counter for continuous TensorBoard time series
         self._prev_frag_metrics = {}
         self._last_fragment_gc_batch = -10**9
@@ -1895,6 +1925,10 @@ class RLAIFTrainer:
         self._trend_detection_interval = 3  # Check for trends every N batches (reduced to catch rapid changes)
         self._min_batches_for_trend = 5  # Minimum batches needed before detecting trends (reduced for earlier detection)
         self._last_checkpoint_batch = -1  # Track when checkpoint was saved to be more sensitive to drops
+        
+        # Divergence signal tracking
+        self._nan_detected_this_epoch = False  # Track NaN detection for divergence signals
+        self._epoch_grad_norms = []  # Track gradient norms for divergence detection
         
         # Load model and tokenizer
         logger.info(f"Loading base model: {config.base_model}")
@@ -2456,6 +2490,10 @@ class RLAIFTrainer:
             'epoch_times': [],                # Total time per epoch in seconds
             'training_start_time': None,      # Training start time
             'training_end_time': None,        # Training end time
+            # Divergence signal tracking
+            'grad_norms_by_epoch': [],        # Gradient norms per epoch (for detecting exploding gradients)
+            'nan_detected_by_epoch': [],     # NaN detection flags per epoch
+            'kl_spikes_by_epoch': [],         # KL spike detection per epoch (catastrophic KL divergence)
         }
         
         # Cache statistics
@@ -4438,6 +4476,10 @@ class RLAIFTrainer:
             if nan_params:
                 logger.error(f"Total parameters with NaN/Inf: {len(nan_params)}")
                 logger.error("This suggests the model weights became corrupted during training or loading.")
+                # Track NaN detection for divergence signal
+                if not hasattr(self, '_nan_detected_this_epoch'):
+                    self._nan_detected_this_epoch = False
+                self._nan_detected_this_epoch = True
             
             # Replace NaN/Inf with zeros as fallback
             logits = torch.nan_to_num(logits, nan=0.0, posinf=1e6, neginf=-1e6)
@@ -4557,7 +4599,18 @@ class RLAIFTrainer:
             logger.warning("NaN/Inf in ref_selected_log_probs, replacing with zeros")
             ref_selected_log_probs = torch.nan_to_num(ref_selected_log_probs, nan=0.0, posinf=0.0, neginf=0.0)
         
+        # Compute KL term pre-coefficient (before multiplying by kl_penalty)
+        # This is the raw KL divergence value
+        kl_term_pre_coefficient = (selected_log_probs - ref_selected_log_probs).mean()
+        # Clamp to prevent extreme values (same as in compute_kl_penalty)
+        kl_term_pre_coefficient = torch.clamp(kl_term_pre_coefficient, min=-10.0, max=10.0)
+        if torch.isnan(kl_term_pre_coefficient) or torch.isinf(kl_term_pre_coefficient):
+            kl_term_pre_coefficient = torch.tensor(0.0, device=self.device)
+        
         kl_penalty = self.compute_kl_penalty(selected_log_probs, ref_selected_log_probs)
+        
+        # Count valid tokens in the loss mask
+        valid_token_count = int(attn_mask.sum().item())
         
         # Total loss with validation
         total_loss = policy_loss + kl_penalty
@@ -4625,6 +4678,8 @@ class RLAIFTrainer:
             'loss': total_loss.detach(),
             'policy_loss': policy_loss.detach(),
             'kl_penalty': kl_penalty.detach(),
+            'kl_term_pre_coefficient': kl_term_pre_coefficient.detach(),  # KL term before multiplying by kl_penalty
+            'valid_token_count': valid_token_count,  # Count of valid tokens in loss mask
             'avg_reward': float(avg_reward),
         }
     
@@ -4673,20 +4728,30 @@ class RLAIFTrainer:
         )
 
         # Compute baseline reward once (pre-training) for "gain vs baseline" checkpoint tagging
-        if self.baseline_reward is None and int(getattr(self.config, "baseline_eval_batches", 0) or 0) > 0:
-            try:
-                self.baseline_reward = self._compute_baseline_reward(train_loader)
-                # Persist baseline to output dir for offline reference
+        # OR use rolling EMA baseline from early epoch data
+        use_rolling = getattr(self.config, "use_rolling_ema_baseline", False)
+        if self.baseline_reward is None:
+            if use_rolling:
+                logger.info(
+                    "Using rolling EMA baseline from early epoch data. "
+                    "Baseline will be computed from first epoch rewards (80-160 samples)."
+                )
+                # Baseline will be computed from early epoch data, not pre-training
+                self.baseline_reward = None  # Will be set during first epoch
+            elif int(getattr(self.config, "baseline_eval_batches", 0) or 0) > 0:
                 try:
-                    out_dir = Path(self.config.output_dir)
-                    out_dir.mkdir(parents=True, exist_ok=True)
-                    with open(out_dir / "baseline_reward.json", "w", encoding="utf-8") as f:
-                        json.dump({"baseline_reward": float(self.baseline_reward), "ts_iso": datetime.utcnow().isoformat() + "Z"}, f, indent=2)
-                except Exception:
-                    pass
-            except Exception as e:
-                logger.warning(f"Failed to compute baseline reward: {e}")
-                self.baseline_reward = 0.0
+                    self.baseline_reward = self._compute_baseline_reward(train_loader)
+                    # Persist baseline to output dir for offline reference
+                    try:
+                        out_dir = Path(self.config.output_dir)
+                        out_dir.mkdir(parents=True, exist_ok=True)
+                        with open(out_dir / "baseline_reward.json", "w", encoding="utf-8") as f:
+                            json.dump({"baseline_reward": float(self.baseline_reward), "ts_iso": datetime.utcnow().isoformat() + "Z"}, f, indent=2)
+                    except Exception:
+                        pass
+                except Exception as e:
+                    logger.warning(f"Failed to compute baseline reward: {e}")
+                    self.baseline_reward = 0.0
         
         # Log training configuration
         logger.info(f"Training configuration:")
@@ -4932,6 +4997,13 @@ class RLAIFTrainer:
             epoch_rewards = []
             epoch_best_reward_per_prompt = []  # per-batch: avg(max reward per prompt)
             epoch_losses = []
+            # Track micro-batch metrics for epoch summary (averaging over micro-batches, not just optimizer steps)
+            epoch_micro_batch_metrics = {
+                'policy_loss': [],
+                'kl_term_pre_coefficient': [],
+                'combined_loss': [],
+                'valid_token_count': [],
+            }
             epoch_generated_codes = []  # Track all generated code for diversity analysis
             
             # Track performance metrics per epoch
@@ -4963,6 +5035,9 @@ class RLAIFTrainer:
             # Reset within-epoch reward tracking for trend detection
             self._epoch_reward_history = []
             self._last_trend_check_batch = -1
+            # Reset divergence tracking for new epoch
+            self._nan_detected_this_epoch = False
+            self._epoch_grad_norms = []
             
             # Generation accumulation: generate multiple batches upfront to maintain high generation performance
             # When > 1: generates N batches, scores them, then trains (keeps generation performance high)
@@ -5152,6 +5227,27 @@ class RLAIFTrainer:
                         try:
                             loss_dict = self.train_step(train_batch, rewards_for_training)
                             
+                            # Extract and log per micro-batch metrics
+                            policy_loss_val = float(loss_dict.get("policy_loss", 0.0).detach().cpu()) if torch.is_tensor(loss_dict.get("policy_loss")) else float(loss_dict.get("policy_loss", 0.0))
+                            kl_term_pre_coeff_val = float(loss_dict.get("kl_term_pre_coefficient", 0.0).detach().cpu()) if torch.is_tensor(loss_dict.get("kl_term_pre_coefficient")) else float(loss_dict.get("kl_term_pre_coefficient", 0.0))
+                            combined_loss_val = float(loss_dict.get("loss", 0.0).detach().cpu()) if torch.is_tensor(loss_dict.get("loss")) else float(loss_dict.get("loss", 0.0))
+                            valid_token_count_val = int(loss_dict.get("valid_token_count", 0))
+                            
+                            # Track for epoch summary (average over micro-batches, not just optimizer steps)
+                            epoch_micro_batch_metrics['policy_loss'].append(policy_loss_val)
+                            epoch_micro_batch_metrics['kl_term_pre_coefficient'].append(kl_term_pre_coeff_val)
+                            epoch_micro_batch_metrics['combined_loss'].append(combined_loss_val)
+                            epoch_micro_batch_metrics['valid_token_count'].append(valid_token_count_val)
+                            
+                            # Log per micro-batch
+                            logger.info(
+                                f"Micro-batch {micro_step_in_epoch}: "
+                                f"policy_loss={policy_loss_val:.4f}, "
+                                f"kl_term_pre_coeff={kl_term_pre_coeff_val:.4f}, "
+                                f"combined_loss={combined_loss_val:.4f}, "
+                                f"valid_tokens={valid_token_count_val}"
+                            )
+                            
                             # Gradient accumulation and optimizer step
                             micro_step_in_epoch += 1
                             self._micro_step_in_epoch = int(micro_step_in_epoch)
@@ -5166,7 +5262,12 @@ class RLAIFTrainer:
                                 self._last_loss_scalars = dict(loss_scalars)
                                 epoch_losses.append(float(loss_scalars.get("loss", 0.0)))
                                 
-                                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+                                # Track gradient norm before clipping (for divergence detection)
+                                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+                                if not hasattr(self, '_epoch_grad_norms'):
+                                    self._epoch_grad_norms = []
+                                self._epoch_grad_norms.append(float(grad_norm))
+                                
                                 param_state_before = self._capture_parameter_state()
                                 optimizer.step()
                                 scheduler.step()
@@ -5567,6 +5668,27 @@ class RLAIFTrainer:
                                     pass
 
                             loss_dict = self.train_step(train_batch, rewards_for_training)
+                            
+                            # Extract and log per micro-batch metrics (for per-batch processing path)
+                            policy_loss_val = float(loss_dict.get("policy_loss", 0.0).item()) if torch.is_tensor(loss_dict.get("policy_loss")) else float(loss_dict.get("policy_loss", 0.0))
+                            kl_term_pre_coeff_val = float(loss_dict.get("kl_term_pre_coefficient", 0.0).item()) if torch.is_tensor(loss_dict.get("kl_term_pre_coefficient")) else float(loss_dict.get("kl_term_pre_coefficient", 0.0))
+                            combined_loss_val = float(loss_dict.get("loss", 0.0).item()) if torch.is_tensor(loss_dict.get("loss")) else float(loss_dict.get("loss", 0.0))
+                            valid_token_count_val = int(loss_dict.get("valid_token_count", 0))
+                            
+                            # Track for epoch summary (average over micro-batches, not just optimizer steps)
+                            epoch_micro_batch_metrics['policy_loss'].append(policy_loss_val)
+                            epoch_micro_batch_metrics['kl_term_pre_coefficient'].append(kl_term_pre_coeff_val)
+                            epoch_micro_batch_metrics['combined_loss'].append(combined_loss_val)
+                            epoch_micro_batch_metrics['valid_token_count'].append(valid_token_count_val)
+                            
+                            # Log per micro-batch
+                            logger.info(
+                                f"Micro-batch {micro_step_in_epoch}: "
+                                f"policy_loss={policy_loss_val:.4f}, "
+                                f"kl_term_pre_coeff={kl_term_pre_coeff_val:.4f}, "
+                                f"combined_loss={combined_loss_val:.4f}, "
+                                f"valid_tokens={valid_token_count_val}"
+                            )
                         except RuntimeError as e:
                             # Catch Apple GPU/MPS OOM / Metal command buffer errors and skip batch gracefully.
                             msg = str(e)
@@ -5635,7 +5757,12 @@ class RLAIFTrainer:
                             if not has_gradients:
                                 logger.warning(f"⚠️  No gradients found at micro_step {micro_step_in_epoch}! Model may not be learning.")
 
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+                            # Track gradient norm before clipping (for divergence detection)
+                            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+                            if not hasattr(self, '_epoch_grad_norms'):
+                                self._epoch_grad_norms = []
+                            self._epoch_grad_norms.append(float(grad_norm))
+                            
                             # Capture parameter state before optimizer step to track changes
                             param_state_before = self._capture_parameter_state()
                             optimizer.step()
@@ -5924,6 +6051,42 @@ class RLAIFTrainer:
                         except Exception:
                             best_by_prompt = {}
                         avg_best_per_prompt = float(np.mean(list(best_by_prompt.values()))) if best_by_prompt else None
+
+                        # Update rolling EMA baseline if enabled (from early epoch data)
+                        use_rolling = getattr(self.config, "use_rolling_ema_baseline", False)
+                        if use_rolling and epoch == 0:
+                            # Accumulate rewards from first epoch for rolling baseline
+                            if rewards:
+                                self._rolling_baseline_samples.extend([float(r) for r in rewards])
+                                # Once we have 80-160 samples, compute baseline
+                                if len(self._rolling_baseline_samples) >= 80:
+                                    if self.baseline_reward is None:
+                                        # Compute mean from accumulated samples
+                                        self.baseline_reward = float(np.mean(self._rolling_baseline_samples))
+                                        logger.info(
+                                            f"Rolling baseline computed: {self.baseline_reward:.4f} "
+                                            f"(from {len(self._rolling_baseline_samples)} samples in epoch 0)"
+                                        )
+                                        # Persist baseline
+                                        try:
+                                            out_dir = Path(self.config.output_dir)
+                                            out_dir.mkdir(parents=True, exist_ok=True)
+                                            with open(out_dir / "baseline_reward.json", "w", encoding="utf-8") as f:
+                                                json.dump({
+                                                    "baseline_reward": float(self.baseline_reward),
+                                                    "samples": len(self._rolling_baseline_samples),
+                                                    "method": "rolling_ema_epoch0",
+                                                    "ts_iso": datetime.utcnow().isoformat() + "Z"
+                                                }, f, indent=2)
+                                        except Exception:
+                                            pass
+                                    else:
+                                        # Update rolling EMA baseline
+                                        rolling_alpha = 0.1  # Slow EMA for baseline stability
+                                        self.baseline_reward = (
+                                            (1.0 - rolling_alpha) * self.baseline_reward + 
+                                            rolling_alpha * float(np.mean([float(r) for r in rewards]))
+                                        )
 
                         # Reward gain tracking (vs baseline and vs previous batch)
                         baseline = float(self.baseline_reward) if self.baseline_reward is not None else 0.0
@@ -6362,7 +6525,12 @@ class RLAIFTrainer:
                 has_gradients = any(p.grad is not None for p in self.model.parameters() if p.requires_grad)
                 if has_gradients:
                     logger.info(f"Flushing leftover gradients at epoch end: micro_step_in_epoch={micro_step_in_epoch}, grad_accum={self.config.gradient_accumulation_steps}")
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+                    # Track gradient norm before clipping (for divergence detection)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+                    if not hasattr(self, '_epoch_grad_norms'):
+                        self._epoch_grad_norms = []
+                    self._epoch_grad_norms.append(float(grad_norm))
+                    
                     # Track parameter changes for epoch-end flush
                     param_state_before = self._capture_parameter_state()
                     if param_state_before:
@@ -6438,7 +6606,20 @@ class RLAIFTrainer:
             avg_epoch_best_reward_per_prompt = float(np.mean(epoch_best_reward_per_prompt)) if epoch_best_reward_per_prompt else 0.0
             if np.isnan(avg_epoch_best_reward_per_prompt):
                 avg_epoch_best_reward_per_prompt = 0.0
-            avg_epoch_loss = float(np.mean(epoch_losses)) if epoch_losses else 0.0
+            # Compute epoch averages over micro-batches, not just optimizer steps
+            # This gives a more accurate picture of training progress
+            if epoch_micro_batch_metrics['combined_loss']:
+                avg_epoch_loss = float(np.mean(epoch_micro_batch_metrics['combined_loss']))
+                avg_epoch_policy_loss = float(np.mean(epoch_micro_batch_metrics['policy_loss']))
+                avg_epoch_kl_term_pre_coeff = float(np.mean(epoch_micro_batch_metrics['kl_term_pre_coefficient']))
+                total_valid_tokens = int(sum(epoch_micro_batch_metrics['valid_token_count']))
+            else:
+                # Fallback to optimizer step averages if no micro-batch metrics
+                avg_epoch_loss = float(np.mean(epoch_losses)) if epoch_losses else 0.0
+                avg_epoch_policy_loss = 0.0
+                avg_epoch_kl_term_pre_coeff = 0.0
+                total_valid_tokens = 0
+            
             if np.isnan(avg_epoch_loss):
                 avg_epoch_loss = 0.0
             
@@ -6553,6 +6734,40 @@ class RLAIFTrainer:
             if epoch_total_param_changes is not None:
                 epoch_param_summary_with_total['epoch_total'] = epoch_total_param_changes
             self.training_metrics['parameter_changes_by_epoch'].append(epoch_param_summary_with_total)
+            
+            # Track divergence signals for this epoch
+            # 1. Gradient norms (for detecting exploding gradients)
+            if hasattr(self, '_epoch_grad_norms') and self._epoch_grad_norms:
+                avg_grad_norm = np.mean(self._epoch_grad_norms)
+                max_grad_norm = np.max(self._epoch_grad_norms)
+                self.training_metrics['grad_norms_by_epoch'].append(max_grad_norm)  # Track max for divergence detection
+                del self._epoch_grad_norms  # Clear for next epoch
+            else:
+                self.training_metrics['grad_norms_by_epoch'].append(None)
+            
+            # 2. NaN detection (check if any NaN was detected during epoch)
+            # This is tracked during training steps, so we check if any was detected
+            nan_detected = False
+            if hasattr(self, '_nan_detected_this_epoch'):
+                nan_detected = self._nan_detected_this_epoch
+                self._nan_detected_this_epoch = False  # Reset for next epoch
+            self.training_metrics['nan_detected_by_epoch'].append(nan_detected)
+            
+            # 3. KL spike detection (catastrophic KL divergence)
+            # Check if KL penalty component of loss was unusually high
+            kl_spike = False
+            if len(self.training_metrics['loss_by_epoch']) > 0:
+                # Check if loss contains unusually high KL component
+                # A KL spike would show up as a sudden large increase in loss
+                if len(self.training_metrics['loss_by_epoch']) >= 2:
+                    prev_loss = self.training_metrics['loss_by_epoch'][-2]
+                    current_loss = avg_epoch_loss
+                    if prev_loss is not None and current_loss is not None:
+                        # If loss increased by more than 2.0, it's likely a KL spike
+                        loss_increase = current_loss - prev_loss
+                        if loss_increase > 2.0:
+                            kl_spike = True
+            self.training_metrics['kl_spikes_by_epoch'].append(kl_spike)
             
             # Calculate reward and loss trends (change from previous epoch)
             reward_trend = 0.0
@@ -6827,7 +7042,10 @@ class RLAIFTrainer:
                 f"  Total Time: {epoch_total_time_str} ({epoch_total_time:.1f}s)\n"
                 f"  Average Reward: {avg_epoch_reward_display:.4f} (mean over all sampled completions)\n"
                 f"  Best-of-N Reward: {avg_epoch_best_reward_display:.4f} (avg of per-prompt max; N={self.config.num_samples_per_prompt})\n"
-                f"  Average Loss: {avg_epoch_loss:.4f}\n"
+                f"  Average Loss: {avg_epoch_loss:.4f} (avg over {len(epoch_micro_batch_metrics['combined_loss'])} micro-batches)\n"
+                f"  Average Policy Loss: {avg_epoch_policy_loss:.4f}\n"
+                f"  Average KL Term (pre-coeff): {avg_epoch_kl_term_pre_coeff:.4f}\n"
+                f"  Total Valid Tokens: {total_valid_tokens:,}\n"
                 f"  Total Samples: {len(epoch_rewards)}\n"
                 f"  Trainable Parameters: {trainable_str} ({trainable_percentage:.2f}% of {total_params:,} total)\n"
                 f"  TeacherGenCalls: {epoch_teacher_gen_calls:,} calls, {epoch_teacher_gen_cache_hits:,} cache hits ({teacher_gen_cache_hit_rate:.1f}% hit rate)\n"
@@ -7645,6 +7863,12 @@ class RLAIFTrainer:
         """
         Adjust config parameters to compensate for downward reward trend.
         
+        CRITICAL: When reward drops, we need to:
+        - DECREASE temperature (reduce variance/errors)
+        - INCREASE KL penalty (tighten constraint, prevent drift)
+        - DECREASE reward_weight (reduce noise amplification)
+        - Keep LR stable or slightly decrease (not aggressively)
+        
         Args:
             trend_info: Dictionary with trend information from _detect_reward_trend_during_epoch
             
@@ -7655,52 +7879,101 @@ class RLAIFTrainer:
         severity = trend_info.get('severity', 'moderate')
         total_drop = trend_info.get('total_drop', 0.0)
         
+        # Hard caps to prevent dangerous values and over-tightening
+        # CRITICAL: With only 1-2 optimizer steps per epoch, controller must not keep shrinking signal
+        TEMP_MAX = 0.9  # Maximum temperature for code generation (hard bound)
+        TEMP_MIN = 0.7  # Minimum temperature (floor 0.7 for code tasks - 0.53 is too deterministic)
+        REWARD_WEIGHT_MAX = 1.5  # Maximum reward weight
+        REWARD_WEIGHT_MIN = 0.8  # Minimum reward weight (floor 0.8-1.0 to maintain learning signal)
+        KL_PENALTY_MIN = 0.10  # Minimum KL penalty to maintain constraint
+        KL_PENALTY_MAX = 0.20  # Maximum KL penalty (ceiling 0.2-0.3 until actual KL metrics confirmed)
+        LR_MIN = 1e-6  # Minimum learning rate
+        
         # Determine adjustment magnitude based on severity
+        # Updated to match requirements: temp down 5-10%, KL up 5-10%, reward_weight unchanged (or down if variance high)
         if severity == "severe":
-            lr_reduction = 0.20  # 20% reduction (increased from 15%)
-            reward_weight_increase = 0.25  # 25% increase (increased from 20%)
-            kl_reduction = 0.15  # 15% reduction (increased from 10%)
+            temp_reduction = 0.10  # 10% reduction (reduce variance)
+            kl_increase = 0.10  # 10% increase (tighten constraint, capped at 10%)
         elif severity == "moderate":
-            lr_reduction = 0.12  # 12% reduction (increased from 10%)
-            reward_weight_increase = 0.18  # 18% increase (increased from 15%)
-            kl_reduction = 0.08  # 8% reduction (increased from 5%)
+            temp_reduction = 0.08  # 8% reduction
+            kl_increase = 0.08  # 8% increase
         else:  # mild
-            lr_reduction = 0.08  # 8% reduction
-            reward_weight_increase = 0.12  # 12% increase
-            kl_reduction = 0.05  # 5% reduction
+            temp_reduction = 0.05  # 5% reduction
+            kl_increase = 0.05  # 5% increase
         
-        # Adjust learning rate (reduce to stabilize)
-        current_lr = self.config.learning_rate
-        new_lr = max(current_lr * (1.0 - lr_reduction), 1e-7)  # Don't go below minimum
-        if abs(new_lr - current_lr) > 1e-9:
-            adjustments['learning_rate'] = (current_lr, new_lr)
-            self.config.learning_rate = new_lr
-            # Update optimizer learning rate immediately
-            if hasattr(self, 'optimizer') and self.optimizer is not None:
-                for param_group in self.optimizer.param_groups:
-                    param_group['lr'] = new_lr
+        # CRITICAL: DECREASE temperature (reduce variance and errors)
+        # Temperature down by 5-10% with floor ~0.7, hard cap at 0.9
+        current_temp = self.config.generation_temperature
+        # Ensure current temp is clamped to 0.9 (in case it was set higher elsewhere)
+        current_temp = min(current_temp, TEMP_MAX)
+        new_temp = max(current_temp * (1.0 - temp_reduction), TEMP_MIN)
+        new_temp = min(new_temp, TEMP_MAX)  # Apply hard cap at 0.9
+        if abs(new_temp - current_temp) > 1e-6:
+            adjustments['generation_temperature'] = (current_temp, new_temp)
+            self.config.generation_temperature = new_temp
+            logger.warning(f"⚠️  Reducing temperature: {current_temp:.4f} → {new_temp:.4f} (reduce variance)")
         
-        # Increase reward weight (strengthen reward signal)
-        current_rw = self.config.reward_weight
-        new_rw = min(current_rw * (1.0 + reward_weight_increase), 3.0)  # Cap at 3.0
-        if abs(new_rw - current_rw) > 1e-6:
-            adjustments['reward_weight'] = (current_rw, new_rw)
-            self.config.reward_weight = new_rw
-        
-        # Reduce KL penalty (allow more exploration when reward is declining)
+        # CRITICAL: INCREASE KL penalty (tighten constraint, prevent drift)
+        # KL up by 5-10% (ceiling at KL_PENALTY_MAX)
         current_kl = self.config.kl_penalty
-        new_kl = max(current_kl * (1.0 - kl_reduction), 0.05)  # Don't go below 0.05
+        new_kl = min(current_kl * (1.0 + kl_increase), KL_PENALTY_MAX)  # Apply hard cap
+        new_kl = max(new_kl, KL_PENALTY_MIN)  # Don't go below minimum
         if abs(new_kl - current_kl) > 1e-6:
             adjustments['kl_penalty'] = (current_kl, new_kl)
             self.config.kl_penalty = new_kl
+            logger.warning(f"⚠️  Increasing KL penalty: {current_kl:.4f} → {new_kl:.4f} (tighten constraint)")
         
-        # If drop is very severe, also adjust generation temperature
-        if total_drop > 0.15:
-            current_temp = self.config.generation_temperature
-            new_temp = min(current_temp * 1.1, 1.5)  # Increase by 10%, cap at 1.5
-            if abs(new_temp - current_temp) > 1e-6:
-                adjustments['generation_temperature'] = (current_temp, new_temp)
-                self.config.generation_temperature = new_temp
+        # CRITICAL: reward_weight unchanged (or down slightly if variance is high)
+        # Check if variance is high to decide whether to reduce reward_weight
+        # Get recent reward variance from training metrics
+        high_variance = False
+        if len(self.training_metrics.get('reward_variance_by_epoch', [])) > 0:
+            recent_variances = self.training_metrics['reward_variance_by_epoch'][-3:]  # Last 3 epochs
+            if recent_variances:
+                avg_variance = np.mean([v for v in recent_variances if v is not None])
+                high_variance = avg_variance > 0.08  # Threshold for high variance
+        
+        if high_variance:
+            # Only reduce reward_weight slightly if variance is high
+            current_rw = self.config.reward_weight
+            reward_weight_reduction = 0.05  # 5% reduction if variance is high
+            new_rw = max(current_rw * (1.0 - reward_weight_reduction), REWARD_WEIGHT_MIN)  # Enforce floor
+            new_rw = min(new_rw, REWARD_WEIGHT_MAX)  # Apply hard cap
+            if abs(new_rw - current_rw) > 1e-6:
+                adjustments['reward_weight'] = (current_rw, new_rw)
+                self.config.reward_weight = new_rw
+                logger.warning(f"⚠️  Reducing reward weight (high variance): {current_rw:.4f} → {new_rw:.4f} (floor: {REWARD_WEIGHT_MIN})")
+        # else: reward_weight unchanged
+        
+        # CRITICAL: Enforce hard bounds on all parameters to prevent over-tightening
+        # Clamp temperature to [0.7, 0.9]
+        if self.config.generation_temperature < TEMP_MIN:
+            logger.warning(f"⚠️  Temperature below floor ({self.config.generation_temperature:.4f} < {TEMP_MIN}), clamping to {TEMP_MIN}")
+            self.config.generation_temperature = TEMP_MIN
+        elif self.config.generation_temperature > TEMP_MAX:
+            logger.warning(f"⚠️  Temperature above ceiling ({self.config.generation_temperature:.4f} > {TEMP_MAX}), clamping to {TEMP_MAX}")
+            self.config.generation_temperature = TEMP_MAX
+        
+        # Clamp reward_weight to [0.8, 1.5]
+        if self.config.reward_weight < REWARD_WEIGHT_MIN:
+            logger.warning(f"⚠️  Reward weight below floor ({self.config.reward_weight:.4f} < {REWARD_WEIGHT_MIN}), clamping to {REWARD_WEIGHT_MIN}")
+            self.config.reward_weight = REWARD_WEIGHT_MIN
+        elif self.config.reward_weight > REWARD_WEIGHT_MAX:
+            logger.warning(f"⚠️  Reward weight above ceiling ({self.config.reward_weight:.4f} > {REWARD_WEIGHT_MAX}), clamping to {REWARD_WEIGHT_MAX}")
+            self.config.reward_weight = REWARD_WEIGHT_MAX
+        
+        # Clamp KL penalty to [0.10, 0.20]
+        if self.config.kl_penalty < KL_PENALTY_MIN:
+            logger.warning(f"⚠️  KL penalty below floor ({self.config.kl_penalty:.4f} < {KL_PENALTY_MIN}), clamping to {KL_PENALTY_MIN}")
+            self.config.kl_penalty = KL_PENALTY_MIN
+        elif self.config.kl_penalty > KL_PENALTY_MAX:
+            logger.warning(f"⚠️  KL penalty above ceiling ({self.config.kl_penalty:.4f} > {KL_PENALTY_MAX}), clamping to {KL_PENALTY_MAX}")
+            self.config.kl_penalty = KL_PENALTY_MAX
+        
+        # CRITICAL: LR unchanged (or down slightly only if instability metrics indicate it)
+        # Do NOT adjust LR based on reward trends alone - this can freeze learning
+        # LR adjustments should only happen on divergence signals (NaNs, exploding norms, catastrophic KL spike)
+        # which are detected in the epoch health check, not here
         
         return adjustments
     
@@ -7842,54 +8115,15 @@ class RLAIFTrainer:
                 else:
                     issues.append("Loss too high")
                 
-                # Adjust learning rate based on severity and volatility
-                # Check cooldown
-                if self._param_adjustment_cooldown.get('learning_rate', 0) <= epoch:
-                    current_lr = self.config.learning_rate
-                    lr_ema = self._param_ema.get('learning_rate', current_lr)
-                    
-                    # More aggressive reduction if loss is volatile
-                    volatility_multiplier = 1.0
-                    if loss_volatility > 0.3:  # High volatility
-                        volatility_multiplier = 0.8  # 20% more aggressive
-                    
-                    if loss_spike:
-                        # Aggressive reduction for spikes
-                        target_lr = current_lr * 0.7 * volatility_multiplier  # Reduce by 30% (or more if volatile)
-                    elif loss_increasing and loss_too_high:
-                        # Moderate reduction for increasing high loss
-                        target_lr = current_lr * 0.8 * volatility_multiplier  # Reduce by 20%
-                    elif loss_increasing:
-                        # Small reduction for increasing loss
-                        target_lr = current_lr * 0.9 * volatility_multiplier  # Reduce by 10%
-                    elif loss_too_high and not loss_improving:
-                        # Loss is high but not improving - reduce LR
-                        target_lr = current_lr * 0.85 * volatility_multiplier  # Reduce by 15%
-                    elif loss_volatility > 0.25:  # High volatility even if loss is improving
-                        # Reduce LR to stabilize training
-                        target_lr = current_lr * 0.9 * volatility_multiplier  # Reduce by 10%
-                    else:
-                        # Loss is high but improving - gentle reduction or none
-                        target_lr = current_lr * 0.95  # Reduce by 5% or keep same
-                    
-                    # Use EMA for smoother adjustments (conservative)
-                    ema_alpha = 0.3  # 30% weight on new value, 70% on EMA
-                    new_lr = ema_alpha * target_lr + (1.0 - ema_alpha) * lr_ema
-                    new_lr = max(new_lr, 1e-7)  # Don't go below minimum
-                    
-                    if abs(new_lr - current_lr) > 1e-9:  # Only adjust if meaningful change
-                        adjustments['learning_rate'] = (current_lr, new_lr)
-                        self.config.learning_rate = new_lr
-                        self._param_ema['learning_rate'] = new_lr
-                        self._param_adjustment_cooldown['learning_rate'] = epoch + cooldown_epochs
-                        # Update optimizer learning rate
-                        for param_group in self.optimizer.param_groups:
-                            param_group['lr'] = new_lr
+                # CRITICAL: Do NOT adjust LR based on loss trends alone
+                # LR should only be adjusted on clear divergence signals (NaNs, exploding norms, catastrophic KL spike)
+                # Keep LR fixed for at least an epoch unless divergence is detected
                 
                 # Increase KL penalty if loss is spiking
                 if loss_spike:
                     current_kl = self.config.kl_penalty
-                    new_kl = min(current_kl * 1.2, 0.3)  # Increase by 20%, cap at 0.3
+                    KL_PENALTY_MAX = 0.20  # Ceiling 0.2-0.3 until actual KL metrics confirmed
+                    new_kl = min(current_kl * 1.2, KL_PENALTY_MAX)  # Increase by 20%, cap at 0.2
                     if new_kl != current_kl:
                         adjustments['kl_penalty'] = (current_kl, new_kl)
                         self.config.kl_penalty = new_kl
@@ -7937,10 +8171,11 @@ class RLAIFTrainer:
                         if self._param_adjustment_cooldown.get('reward_weight', 0) <= epoch:
                             rw_ema = self._param_ema.get('reward_weight', current_rw)
                             # Reduce reward weight to prevent over-optimization
-                            target_rw = max(current_rw * 0.85, 1.0)  # Reduce by 15%, min 1.0
+                            REWARD_WEIGHT_MIN = 0.8  # Hard floor to maintain learning signal
+                            target_rw = max(current_rw * 0.85, REWARD_WEIGHT_MIN)  # Reduce by 15%, enforce floor
                             ema_alpha = 0.3
                             new_rw = ema_alpha * target_rw + (1.0 - ema_alpha) * rw_ema
-                            new_rw = max(new_rw, 1.0)  # Min 1.0
+                            new_rw = max(new_rw, REWARD_WEIGHT_MIN)  # Enforce floor
                             if abs(new_rw - current_rw) > 1e-6:
                                 adjustments['reward_weight'] = (current_rw, new_rw)
                                 self.config.reward_weight = new_rw
@@ -7953,10 +8188,11 @@ class RLAIFTrainer:
                         current_kl = self.config.kl_penalty
                         kl_ema = self._param_ema.get('kl_penalty', current_kl)
                         # More aggressive increase when reward is declining
-                        target_kl = min(current_kl * 1.25, 0.3)  # Increase by 25%, cap at 0.3
+                        KL_PENALTY_MAX = 0.20  # Ceiling 0.2-0.3 until actual KL metrics confirmed
+                        target_kl = min(current_kl * 1.25, KL_PENALTY_MAX)  # Increase by 25%, cap at 0.2
                         ema_alpha = 0.3
                         new_kl = ema_alpha * target_kl + (1.0 - ema_alpha) * kl_ema
-                        new_kl = min(new_kl, 0.3)  # Cap at 0.3
+                        new_kl = min(new_kl, KL_PENALTY_MAX)  # Cap at 0.2
                         if abs(new_kl - current_kl) > 1e-6:
                             adjustments['kl_penalty'] = (current_kl, new_kl)
                             self.config.kl_penalty = new_kl
@@ -7964,63 +8200,48 @@ class RLAIFTrainer:
                             self._param_adjustment_cooldown['kl_penalty'] = epoch + cooldown_epochs
                             logger.warning(f"⚠️  Increasing kl_penalty from {current_kl:.3f} to {new_kl:.3f} to prevent model drift")
                     
-                    # Reduce learning rate if reward is declining (may be learning too fast)
-                    if self._param_adjustment_cooldown.get('learning_rate', 0) <= epoch:
-                        current_lr = self.config.learning_rate
-                        lr_ema = self._param_ema.get('learning_rate', current_lr)
-                        # Reduce LR to slow down potentially harmful updates
-                        target_lr = current_lr * 0.85  # Reduce by 15%
-                        ema_alpha = 0.3
-                        new_lr = ema_alpha * target_lr + (1.0 - ema_alpha) * lr_ema
-                        new_lr = max(new_lr, 1e-7)  # Don't go below minimum
-                        if abs(new_lr - current_lr) > 1e-9:
-                            adjustments['learning_rate'] = (current_lr, new_lr)
-                            self.config.learning_rate = new_lr
-                            self._param_ema['learning_rate'] = new_lr
-                            self._param_adjustment_cooldown['learning_rate'] = epoch + cooldown_epochs
-                            # Update optimizer learning rate
-                            for param_group in self.optimizer.param_groups:
-                                param_group['lr'] = new_lr
-                            logger.warning(f"⚠️  Reducing learning_rate from {current_lr:.9f} to {new_lr:.9f} due to reward decline")
+                    # CRITICAL: Do NOT adjust LR based on reward decline alone
+                    # LR should only be adjusted on clear divergence signals (NaNs, exploding norms, catastrophic KL spike)
+                    # Keep LR fixed for at least an epoch unless divergence is detected
                 
                 # Normal case: reward decreasing but not consistently
+                # CRITICAL: Do NOT increase reward_weight when reward is declining - this amplifies noise
+                # Instead, keep it stable or slightly decrease it
                 elif reward_stagnant or reward_decreasing:
-                    # Increase reward weight if reward is not improving (with EMA and cooldown)
-                    if self._param_adjustment_cooldown.get('reward_weight', 0) <= epoch:
-                        current_rw = self.config.reward_weight
-                        rw_ema = self._param_ema.get('reward_weight', current_rw)
-                        
-                        # More conservative increase (10% instead of 15%)
-                        target_rw = min(current_rw * 1.10, 3.0)  # Increase by 10%, cap at 3.0
-                        
-                        # Use EMA for smoother adjustments
-                        ema_alpha = 0.3
-                        new_rw = ema_alpha * target_rw + (1.0 - ema_alpha) * rw_ema
-                        new_rw = min(new_rw, 3.0)  # Cap at 3.0
-                        
-                        if abs(new_rw - current_rw) > 1e-6:
-                            adjustments['reward_weight'] = (current_rw, new_rw)
-                            self.config.reward_weight = new_rw
-                            self._param_ema['reward_weight'] = new_rw
-                            self._param_adjustment_cooldown['reward_weight'] = epoch + cooldown_epochs
+                    # Keep reward_weight stable - increasing it would amplify noise
+                    # Only adjust if it's already too high or too low
+                    REWARD_WEIGHT_MAX = 1.5  # Hard cap
+                    REWARD_WEIGHT_MIN = 0.8  # Hard floor (maintain learning signal)
+                    current_rw = self.config.reward_weight
+                    if current_rw > REWARD_WEIGHT_MAX:
+                        if self._param_adjustment_cooldown.get('reward_weight', 0) <= epoch:
+                            rw_ema = self._param_ema.get('reward_weight', current_rw)
+                            # Reduce if too high
+                            target_rw = max(current_rw * 0.95, REWARD_WEIGHT_MIN)  # Reduce by 5%, enforce floor
+                            ema_alpha = 0.3
+                            new_rw = ema_alpha * target_rw + (1.0 - ema_alpha) * rw_ema
+                            new_rw = min(new_rw, REWARD_WEIGHT_MAX)  # Apply hard cap
+                            if abs(new_rw - current_rw) > 1e-6:
+                                adjustments['reward_weight'] = (current_rw, new_rw)
+                                self.config.reward_weight = new_rw
+                                self._param_ema['reward_weight'] = new_rw
+                                self._param_adjustment_cooldown['reward_weight'] = epoch + cooldown_epochs
+                                logger.warning(f"⚠️  Reducing reward_weight (was above cap): {current_rw:.3f} → {new_rw:.3f}")
+                    elif current_rw < REWARD_WEIGHT_MIN:
+                        # Clamp if below floor (prevent over-tightening)
+                        logger.warning(f"⚠️  Reward weight below floor ({current_rw:.3f} < {REWARD_WEIGHT_MIN}), clamping to {REWARD_WEIGHT_MIN}")
+                        self.config.reward_weight = REWARD_WEIGHT_MIN
                 
-                # Reduce KL penalty if reward is declining (may be too conservative)
-                # Only reduce if loss is reasonable AND not too high AND not consistently declining
+                # CRITICAL: Do NOT reduce KL penalty when reward is declining - this loosens constraints
+                # Keep KL penalty stable or increase it to prevent drift
+                # Only reduce if reward is improving AND loss is reasonable
                 if reward_decreasing and not reward_consistently_declining and avg_loss < 0.4 and not loss_too_high_for_kl_reduction:
-                    if self._param_adjustment_cooldown.get('kl_penalty', 0) <= epoch:
-                        current_kl = self.config.kl_penalty
-                        kl_ema = self._param_ema.get('kl_penalty', current_kl)
-                        target_kl = max(current_kl * 0.9, 0.05)  # Reduce by 10%, min 0.05
-                        ema_alpha = 0.3
-                        new_kl = ema_alpha * target_kl + (1.0 - ema_alpha) * kl_ema
-                        new_kl = max(new_kl, 0.05)  # Min 0.05
-                        if abs(new_kl - current_kl) > 1e-6:
-                            adjustments['kl_penalty'] = (current_kl, new_kl)
-                            self.config.kl_penalty = new_kl
-                            self._param_ema['kl_penalty'] = new_kl
-                            self._param_adjustment_cooldown['kl_penalty'] = epoch + cooldown_epochs
+                    # Keep KL penalty stable - do not reduce it when reward is declining
+                    # Reducing KL would allow more drift, which is counterproductive
+                    pass
         
         # Issue 3: High reward variance (inconsistent training)
+        # CRITICAL: When variance is high, we should DECREASE temperature, not increase it
         if reward_variance > 0.08:  # Threshold for high variance
             issues.append("High reward variance (inconsistent)")
             # Increase reward threshold to filter more low-quality samples
@@ -8029,16 +8250,27 @@ class RLAIFTrainer:
             if new_threshold != current_threshold:
                 adjustments['reward_threshold'] = (current_threshold, new_threshold)
                 self.config.reward_threshold = new_threshold
-        
-        # Issue 4: Loss is decreasing well but reward not improving (may need more exploration)
-        if loss_trend > 0.05 and reward_trend < 0.01 and avg_loss < 0.3:
-            issues.append("Loss improving but reward stagnant (may need exploration)")
-            # Slightly increase generation temperature for more exploration
+            
+            # CRITICAL: DECREASE temperature when variance is high (reduce noise)
+            TEMP_MAX = 0.9  # Hard cap for code generation
+            TEMP_MIN = 0.7  # Floor ~0.7 for code tasks
             current_temp = self.config.generation_temperature
-            new_temp = min(current_temp * 1.1, 1.5)  # Increase by 10%, cap at 1.5
-            if new_temp != current_temp:
+            # Ensure current temp is clamped to 0.9
+            current_temp = min(current_temp, TEMP_MAX)
+            new_temp = max(current_temp * 0.95, TEMP_MIN)  # Reduce by 5%
+            new_temp = min(new_temp, TEMP_MAX)  # Apply hard cap at 0.9
+            if abs(new_temp - current_temp) > 1e-6:
                 adjustments['generation_temperature'] = (current_temp, new_temp)
                 self.config.generation_temperature = new_temp
+                logger.warning(f"⚠️  Reducing temperature due to high variance: {current_temp:.4f} → {new_temp:.4f}")
+        
+        # Issue 4: Loss is decreasing well but reward not improving
+        # CRITICAL: Do NOT increase temperature here - high variance is already a problem
+        # Instead, we should keep temperature stable or slightly decrease it
+        if loss_trend > 0.05 and reward_trend < 0.01 and avg_loss < 0.3:
+            issues.append("Loss improving but reward stagnant")
+            # Keep temperature stable - do not increase it (would worsen variance)
+            # If we need more exploration, it should come from num_samples_per_prompt, not temperature
         
         # Issue 5: Reward improving but loss increasing (may be overfitting)
         # Note: loss_trend < -0.05 means loss is DECREASING (good), loss_trend > 0.05 means loss is INCREASING (bad)
@@ -8048,17 +8280,82 @@ class RLAIFTrainer:
             if self._param_adjustment_cooldown.get('kl_penalty', 0) <= epoch:
                 current_kl = self.config.kl_penalty
                 kl_ema = self._param_ema.get('kl_penalty', current_kl)
-                target_kl = min(current_kl * 1.1, 0.25)  # Increase by 10%, cap at 0.25
+                KL_PENALTY_MAX = 0.20  # Ceiling 0.2-0.3 until actual KL metrics confirmed
+                target_kl = min(current_kl * 1.1, KL_PENALTY_MAX)  # Increase by 10%, cap at 0.2
                 ema_alpha = 0.3
                 new_kl = ema_alpha * target_kl + (1.0 - ema_alpha) * kl_ema
-                new_kl = min(new_kl, 0.25)  # Cap at 0.25
+                new_kl = min(new_kl, KL_PENALTY_MAX)  # Cap at 0.2
                 if abs(new_kl - current_kl) > 1e-6:
                     adjustments['kl_penalty'] = (current_kl, new_kl)
                     self.config.kl_penalty = new_kl
                     self._param_ema['kl_penalty'] = new_kl
                     self._param_adjustment_cooldown['kl_penalty'] = epoch + cooldown_epochs
         
-        # Issue 6: Reward declining AND gain from baseline negative (model getting worse)
+        # Issue 6: Divergence signals - ONLY adjust LR on these clear signals
+        # Check for divergence signals: NaNs, exploding gradients, catastrophic KL spikes
+        divergence_detected = False
+        divergence_reason = []
+        
+        # Check for NaN detection
+        nan_detected = False
+        if len(self.training_metrics.get('nan_detected_by_epoch', [])) > 0:
+            nan_detected = any(self.training_metrics['nan_detected_by_epoch'][-3:])  # Check last 3 epochs
+            if nan_detected:
+                divergence_detected = True
+                divergence_reason.append("NaN detected")
+        
+        # Check for exploding gradients (grad norm > 10x max_grad_norm)
+        exploding_grads = False
+        if len(self.training_metrics.get('grad_norms_by_epoch', [])) > 0:
+            recent_grad_norms = self.training_metrics['grad_norms_by_epoch'][-3:]  # Last 3 epochs
+            if recent_grad_norms:
+                max_grad_norm = self.config.max_grad_norm
+                exploding_threshold = max_grad_norm * 10.0  # 10x the clipping threshold
+                if any(gn is not None and gn > exploding_threshold for gn in recent_grad_norms):
+                    exploding_grads = True
+                    divergence_detected = True
+                    divergence_reason.append("Exploding gradients")
+        
+        # Check for catastrophic KL spike (KL > 5.0 or sudden jump > 2.0)
+        kl_spike = False
+        if len(self.training_metrics.get('kl_spikes_by_epoch', [])) > 0:
+            kl_spike = any(self.training_metrics['kl_spikes_by_epoch'][-3:])  # Check last 3 epochs
+            if kl_spike:
+                divergence_detected = True
+                divergence_reason.append("Catastrophic KL spike")
+        
+        # ONLY adjust LR if divergence is detected
+        if divergence_detected:
+            issues.append(f"⚠️  CRITICAL: Divergence detected ({', '.join(divergence_reason)})")
+            logger.warning(f"⚠️  Divergence signals detected: {', '.join(divergence_reason)}")
+            
+            # Adjust LR with small steps (-5% max) and enforce floor (>= 5e-5 for LoRA)
+            if self._param_adjustment_cooldown.get('learning_rate', 0) <= epoch:
+                current_lr = self.config.learning_rate
+                lr_ema = self._param_ema.get('learning_rate', current_lr)
+                
+                # Small reduction: -5% max
+                target_lr = current_lr * 0.95  # Reduce by 5%
+                
+                # Use EMA for smoother adjustments
+                ema_alpha = 0.3
+                new_lr = ema_alpha * target_lr + (1.0 - ema_alpha) * lr_ema
+                
+                # Enforce floor: >= 5e-5 for LoRA
+                LR_FLOOR = 5e-5
+                new_lr = max(new_lr, LR_FLOOR)
+                
+                if abs(new_lr - current_lr) > 1e-9:
+                    adjustments['learning_rate'] = (current_lr, new_lr)
+                    self.config.learning_rate = new_lr
+                    self._param_ema['learning_rate'] = new_lr
+                    self._param_adjustment_cooldown['learning_rate'] = epoch + cooldown_epochs
+                    for param_group in self.optimizer.param_groups:
+                        param_group['lr'] = new_lr
+                    logger.warning(f"⚠️  CRITICAL: Reducing LR due to divergence: {current_lr:.9f} → {new_lr:.9f} (floor: {LR_FLOOR:.9f})")
+        
+        # Issue 7: Reward declining AND gain from baseline negative (model getting worse)
+        # Note: Do NOT adjust LR here - only adjust other parameters
         if self.baseline_reward is not None and len(recent_rewards) >= 2:
             current_gain = avg_reward - self.baseline_reward
             prev_gain = recent_rewards[-2] - self.baseline_reward if len(recent_rewards) >= 2 else 0.0
@@ -8090,10 +8387,11 @@ class RLAIFTrainer:
                 if self._param_adjustment_cooldown.get('kl_penalty', 0) <= epoch:
                     current_kl = self.config.kl_penalty
                     kl_ema = self._param_ema.get('kl_penalty', current_kl)
-                    target_kl = min(current_kl * 1.5, 0.3)  # Increase by 50%, cap at 0.3
+                    KL_PENALTY_MAX = 0.20  # Ceiling 0.2-0.3 until actual KL metrics confirmed
+                    target_kl = min(current_kl * 1.5, KL_PENALTY_MAX)  # Increase by 50%, cap at 0.2
                     ema_alpha = 0.4
                     new_kl = ema_alpha * target_kl + (1.0 - ema_alpha) * kl_ema
-                    new_kl = min(new_kl, 0.3)
+                    new_kl = min(new_kl, KL_PENALTY_MAX)
                     if abs(new_kl - current_kl) > 1e-6:
                         adjustments['kl_penalty'] = (current_kl, new_kl)
                         self.config.kl_penalty = new_kl
@@ -8101,22 +8399,9 @@ class RLAIFTrainer:
                         self._param_adjustment_cooldown['kl_penalty'] = epoch + cooldown_epochs
                         logger.warning(f"⚠️  CRITICAL: Increasing kl_penalty from {current_kl:.3f} to {new_kl:.3f}")
                 
-                # 3. Reduce learning rate more aggressively
-                if self._param_adjustment_cooldown.get('learning_rate', 0) <= epoch:
-                    current_lr = self.config.learning_rate
-                    lr_ema = self._param_ema.get('learning_rate', current_lr)
-                    target_lr = current_lr * 0.7  # Reduce by 30%
-                    ema_alpha = 0.4
-                    new_lr = ema_alpha * target_lr + (1.0 - ema_alpha) * lr_ema
-                    new_lr = max(new_lr, 1e-7)
-                    if abs(new_lr - current_lr) > 1e-9:
-                        adjustments['learning_rate'] = (current_lr, new_lr)
-                        self.config.learning_rate = new_lr
-                        self._param_ema['learning_rate'] = new_lr
-                        self._param_adjustment_cooldown['learning_rate'] = epoch + cooldown_epochs
-                        for param_group in self.optimizer.param_groups:
-                            param_group['lr'] = new_lr
-                        logger.warning(f"⚠️  CRITICAL: Reducing learning_rate from {current_lr:.9f} to {new_lr:.9f}")
+                # CRITICAL: Do NOT adjust LR based on reward decline alone
+                # LR should only be adjusted on clear divergence signals (NaNs, exploding norms, catastrophic KL spike)
+                # Keep LR fixed for at least an epoch unless divergence is detected
         
         # Log health check results
         if issues:
@@ -9257,7 +9542,7 @@ def load_config(config_path: str) -> Tuple[RLAIFConfig, dict]:
         prompt_context_chars=to_int(rlaif_cfg.get('prompt_context_chars'), 200),
         move_rubric_to_system_prompt=to_bool(rlaif_cfg.get('move_rubric_to_system_prompt'), True),
         use_frozen_reference_for_kl=to_bool(rlaif_cfg.get('use_frozen_reference_for_kl'), True),
-        generation_temperature=to_float(rlaif_cfg.get('generation_temperature'), 0.8),
+        generation_temperature=min(to_float(rlaif_cfg.get('generation_temperature'), 0.8), 0.9),  # Clamp to ≤ 0.9 for code tasks
         curriculum_learning=to_bool(rlaif_cfg.get('curriculum_learning'), False),
         curriculum_mix_difficulty=to_bool(rlaif_cfg.get('curriculum_mix_difficulty'), True),
         curriculum_num_buckets=to_int(rlaif_cfg.get('curriculum_num_buckets'), 8),
@@ -9276,7 +9561,8 @@ def load_config(config_path: str) -> Tuple[RLAIFConfig, dict]:
         log_level=logging_cfg.get('log_level', 'INFO'),
         save_json_summaries=to_bool(logging_cfg.get('save_json_summaries'), True),
         json_summaries_dir=logging_cfg.get('json_summaries_dir', './logs/json_summaries'),
-        baseline_eval_batches=to_int(logging_cfg.get('baseline_eval_batches'), 1),
+        baseline_eval_batches=to_int(logging_cfg.get('baseline_eval_batches'), 8),
+        use_rolling_ema_baseline=to_bool(logging_cfg.get('use_rolling_ema_baseline'), False),
         tensorboard_batch_interval=to_int(logging_cfg.get('tensorboard_batch_interval'), 1),
         health_check_enabled=to_bool(logging_cfg.get('health_check_enabled'), True),
         health_check_interval_batches=to_int(logging_cfg.get('health_check_interval_batches'), 5),

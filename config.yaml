@@ -17,29 +17,29 @@ training:
   resume_from_checkpoint: null
   num_epochs: 7
   batch_size: 4
-  gradient_accumulation_steps: 50
+  gradient_accumulation_steps: 10
   generation_accumulation_batches: 1
-  learning_rate: 6.400000000000001e-05
+  learning_rate: 7.130391339062498e-05
   optimizer: adamw
   warmup_steps: 300
   save_steps: 500
   save_every_epochs: 1
   save_every_batches: 0
   eval_steps: 250
-  logging_steps: 50
+  logging_steps: 10
   max_grad_norm: 1.0
   weight_decay: 0.0
   lr_scheduler_type: cosine
   save_total_limit: 3
 rlaif:
-  reward_weight: 1.5625
-  kl_penalty: 0.108375
+  reward_weight: 0.8
+  kl_penalty: 0.2
   reward_threshold: 0.0
   beta: 0.1
   top_k: 50
   top_p: 0.95
   num_samples_per_prompt: 4
-  generation_temperature: 1.0285000000000002
+  generation_temperature: 0.7
   curriculum_learning: true
   reward_bonuses: false
   use_advantage_normalization: true
@@ -79,7 +79,7 @@ logging:
   log_level: INFO
   save_json_summaries: true
   json_summaries_dir: ./logs/json_summaries
-  baseline_eval_batches: 1
+  baseline_eval_batches: 8
   tensorboard_batch_interval: 1
   monitoring_interval_s: 5
   system_monitor_step_mode: batch
