@@ -28,7 +28,7 @@ This dataset was generated during the fine-tuning of a Qwen model for code gener
 
 ## Dataset Structure
 
-- **Training Set**: 2800 examples
+- **Training Set**: 1400 examples
 - **Validation Set**: 0 examples
 - **Evaluation Set**: 0 examples
 
@@ -71,9 +71,9 @@ with open('datasets/train.jsonl', 'r') as f:
 
 - **Base Model**: Qwen/Qwen2.5-Coder-3B-Instruct
 - **Teacher Model**: anthropic/claude-3-5-haiku-20241022
-- **Training Steps**: 21
+- **Training Steps**: 38
 - **Languages**: Python, C++, Rust
-- **Average Reward**: 0.1867
+- **Average Reward**: 0.3169
 
 ## Scoring Methodology
 
