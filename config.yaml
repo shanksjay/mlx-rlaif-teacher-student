@@ -10,40 +10,46 @@ teacher:
   provider: anthropic
   model_name: claude-3-5-haiku-20241022
   api_key_env: ANTHROPIC_API_KEY
-  temperature: 0.7
+  temperature: 0.0  # Temperature for scoring (generation uses this value but scoring is hardcoded to 0.0)
   max_tokens: 512
+  teacher_score_cache_max_age_seconds: 14400  # Cache TTL: 4 hours (14400s) to reduce cache misses during baseline + early epochs. Increase to 28800 (8h) or 86400 (24h) if needed.
 training:
   output_dir: ./checkpoints
   resume_from_checkpoint: null
   num_epochs: 7
   batch_size: 4
-  gradient_accumulation_steps: 10
+  gradient_accumulation_steps: 2   # was 10
   generation_accumulation_batches: 1
-  learning_rate: 7.130391339062498e-05
+  learning_rate: 3.0e-5            # see LR notes below
   optimizer: adamw
-  warmup_steps: 300
+  warmup_steps: 8  # Set to 5-10 (or ~0.05-0.1 of total steps) for LoRA
   save_steps: 500
   save_every_epochs: 1
   save_every_batches: 0
   eval_steps: 250
-  logging_steps: 10
+  logging_steps: 2                 # align with optimizer steps
   max_grad_norm: 1.0
   weight_decay: 0.0
   lr_scheduler_type: cosine
   save_total_limit: 3
 rlaif:
-  reward_weight: 0.8
-  kl_penalty: 0.2
-  reward_threshold: 0.0
+  reward_weight: 1.2
+  kl_penalty: 0.10
+  adaptive_kl_enabled: true  # Enable adaptive KL controller
+  target_kl: 0.075  # Target KL divergence (0.05-0.10 for code tasks)
+  kl_gain: 0.1  # Gain factor for adaptive KL controller (k in exp(k*(observed_kl - target_kl)))
+  reward_threshold: 0.02  # Filter low-quality samples (was 0.0)
   beta: 0.1
   top_k: 50
-  top_p: 0.95
-  num_samples_per_prompt: 4
-  generation_temperature: 0.7
+  top_p: 0.9  # Reduced from 0.95 to reduce variance and raise mean reward
+  num_samples_per_prompt: 2  # Reduced from 4 to 2 while stabilizing; increase again once mean rises
+  top_samples_per_prompt: 1  # Train on top-1 or top-2 samples per prompt (increases signal-to-noise)
+  generation_temperature: 0.55  # Start at 0.55; if variance persists, go to 0.50
   curriculum_learning: true
   reward_bonuses: false
   use_advantage_normalization: true
-  advantage_baseline_ema_alpha: 0.9
+  advantage_baseline_type: per_prompt  # Use per-prompt group baseline (mean reward across N samples for the prompt)
+  advantage_baseline_ema_alpha: 0.8
   use_frozen_reference_for_kl: true
   use_tiered_scoring: true
   heuristic_score_threshold: 0.3
@@ -79,7 +85,7 @@ logging:
   log_level: INFO
   save_json_summaries: true
   json_summaries_dir: ./logs/json_summaries
-  baseline_eval_batches: 8
+  baseline_eval_batches: 15  # 15 batches × 8 samples/batch (batch_size=4 × num_samples_per_prompt=2) = 120 completions (within 80-160 target range)
   tensorboard_batch_interval: 1
   monitoring_interval_s: 5
   system_monitor_step_mode: batch
@@ -87,7 +93,7 @@ logging:
   health_check_interval_batches: 5
   health_check_grace_batches: 3
   epoch_health_check_enabled: true
-  within_epoch_trend_detection_enabled: true
+  within_epoch_trend_detection_enabled: false
   health_check_gen_bottleneck_pct: 85
   health_check_gen_target_tps: 6.0
   health_check_fragmentation_enabled: true
@@ -103,7 +109,7 @@ hardware:
   dataloader_num_workers: 4
   mps_allocator_warmup_gb: 0.0
   save_mlx_format: true
-  mlx_quantization: q8_bit
+  mlx_quantization: q4_bit  # Match the deployed MLX model (q4) for speed - was q8_bit which caused mismatch
   use_mlx_for_generation: true
   require_mlx_for_generation: true
   allow_4bit_on_mps: false
@@ -111,7 +117,7 @@ hardware:
   mlx_metal_cache_limit_gb: 1.0
   use_mlx_generation_worker: true
   lora_mlx_sync_enabled: true
-  lora_mlx_sync_every_optimizer_steps: 1
+  lora_mlx_sync_every_optimizer_steps: 10  # Sync every 8-10 optimizer steps (reduces overhead significantly)
   mlx_generation_worker_timeout_s: 240
   mlx_model_path: ./mlx_model/q4
   use_unsloth: false

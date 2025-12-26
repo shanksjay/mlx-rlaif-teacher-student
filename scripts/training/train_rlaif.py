@@ -13,6 +13,7 @@ import json
 import yaml
 import logging
 import argparse
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional
 from dataclasses import dataclass, field
@@ -74,6 +75,107 @@ torch_inductor_logger.setLevel(logging.ERROR)  # Only show errors, suppress warn
 # Prompt difficulty (rubric-aligned) helpers
 # -------------------------
 import re
+
+
+def _enhance_prompt_with_constraints(
+    prompt: str, 
+    language: str,
+    difficulty: Optional[dict] = None
+) -> str:
+    """Enhance prompt with hard constraints, tests, and examples
+    
+    Adds:
+    - Function signature requirements
+    - Required complexity constraints
+    - Explicit edge cases
+    - Required examples
+    - Lightweight tests (3-6 asserts)
+    
+    Args:
+        prompt: Original prompt text
+        language: Programming language
+        difficulty: Optional difficulty components dict (from _rubric_difficulty_components)
+    
+    Returns:
+        Enhanced prompt with constraints and tests
+    """
+    if difficulty is None:
+        difficulty = _rubric_difficulty_components(prompt, language)
+    
+    enhanced_parts = [prompt]
+    
+    # Add constraints section based on difficulty
+    rubric_demand = difficulty.get('rubric_demand', 0.5)
+    correctness = difficulty.get('correctness', 0.5)
+    efficiency = difficulty.get('efficiency', 0.5)
+    
+    constraints = []
+    
+    # Function signature requirement (if not already specified)
+    if "def " not in prompt and "fn " not in prompt and "function" not in prompt.lower():
+        if language == "python":
+            constraints.append("- Provide a complete function signature with type hints")
+        elif language == "cpp":
+            constraints.append("- Provide a complete function signature with parameter types")
+        elif language == "rust":
+            constraints.append("- Provide a complete function signature with parameter types")
+    
+    # Complexity requirements
+    if efficiency > 0.4:
+        if efficiency > 0.7:
+            constraints.append("- Time complexity: O(n log n) or better required")
+        else:
+            constraints.append("- Optimize for time complexity")
+    
+    if rubric_demand > 0.6:
+        constraints.append("- Handle all edge cases explicitly")
+        constraints.append("- Include input validation")
+    
+    # Edge cases (based on correctness demand)
+    if correctness > 0.5:
+        edge_cases = []
+        if "array" in prompt.lower() or "list" in prompt.lower():
+            edge_cases.append("empty input")
+        if "string" in prompt.lower() or "text" in prompt.lower():
+            edge_cases.append("empty string")
+            edge_cases.append("single character")
+        if "number" in prompt.lower() or "int" in prompt.lower() or "float" in prompt.lower():
+            edge_cases.append("zero")
+            edge_cases.append("negative numbers")
+        
+        if edge_cases:
+            constraints.append(f"- Explicitly handle edge cases: {', '.join(edge_cases)}")
+    
+    # Add constraints section if any constraints
+    if constraints:
+        enhanced_parts.append("\nCONSTRAINTS:")
+        for constraint in constraints:
+            enhanced_parts.append(f"  {constraint}")
+    
+    # Add examples section (for medium+ difficulty)
+    if rubric_demand > 0.4:
+        enhanced_parts.append("\nREQUIRED EXAMPLES:")
+        if language == "python":
+            enhanced_parts.append("  Include at least 2-3 example inputs and expected outputs")
+        else:
+            enhanced_parts.append("  Include at least 2-3 example usage cases")
+    
+    # Add lightweight tests (3-6 asserts)
+    if rubric_demand > 0.3:
+        enhanced_parts.append("\nLIGHTWEIGHT TESTS:")
+        enhanced_parts.append("  Include 3-6 assert statements that verify correctness:")
+        if language == "python":
+            enhanced_parts.append("    assert function_name(input1) == expected_output1")
+            enhanced_parts.append("    assert function_name(input2) == expected_output2")
+            enhanced_parts.append("    assert function_name(edge_case) == expected_edge_output")
+        elif language == "cpp":
+            enhanced_parts.append("    assert(function_name(input1) == expected_output1);")
+            enhanced_parts.append("    assert(function_name(input2) == expected_output2);")
+        elif language == "rust":
+            enhanced_parts.append("    assert_eq!(function_name(input1), expected_output1);")
+            enhanced_parts.append("    assert_eq!(function_name(input2), expected_output2);")
+    
+    return "\n".join(enhanced_parts)
 
 
 def _rubric_difficulty_components(prompt: str, language: str) -> dict[str, float]:
@@ -247,7 +349,12 @@ class RLAIFConfig:
     mixed_precision: str
     tensorboard_dir: str
     log_level: str
+    adaptive_kl_enabled: bool = False  # Enable adaptive KL controller
+    target_kl: float = 0.075  # Target KL divergence (0.05-0.10 for code tasks)
+    kl_gain: float = 0.1  # Gain factor for adaptive KL controller (k in exp(k*(observed_kl - target_kl)))
+    top_samples_per_prompt: int = 1  # Train on top-1 or top-2 samples per prompt (increases signal-to-noise)
     use_advantage_normalization: bool = True  # Enable baseline subtraction + advantage whitening to reduce gradient variance
+    advantage_baseline_type: str = "per_prompt"  # Baseline type: 'per_prompt' (group by prompt) or 'difficulty_bucket' (group by rubric_demand buckets)
     advantage_baseline_ema_alpha: float = 0.9  # EMA decay factor for baseline (0.9 = 90% old, 10% new)
     # Teacher token optimization
     use_tiered_scoring: bool = True  # Use heuristic filter before teacher scoring to reduce API calls
@@ -1192,6 +1299,141 @@ class RLAIFTrainer:
             logger.warning(f"Error capturing parameter state: {e}")
         return state
 
+    def _debug_gradients_and_optimizer(self, optimizer, scheduler, step: int) -> None:
+        """Comprehensive debugging of gradients and optimizer before step()
+        
+        Logs:
+        - Gradient statistics (max|grad|, mean|grad|, count of None grads) for LoRA params
+        - Effective LR from scheduler
+        - Verifies optimizer is attached to actual LoRA tensors (not copies)
+        """
+        # Get LoRA parameters (parameters with 'lora' in name)
+        lora_params = []
+        all_trainable_params = []
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                all_trainable_params.append((name, param))
+                if 'lora' in name.lower():
+                    lora_params.append((name, param))
+        
+        # Gradient statistics for LoRA params
+        lora_grads = []
+        lora_none_count = 0
+        for name, param in lora_params:
+            if param.grad is None:
+                lora_none_count += 1
+            else:
+                grad_abs = param.grad.abs()
+                lora_grads.append(grad_abs.max().item())
+        
+        # Gradient statistics for all trainable params
+        all_grads = []
+        all_none_count = 0
+        for name, param in all_trainable_params:
+            if param.grad is None:
+                all_none_count += 1
+            else:
+                grad_abs = param.grad.abs()
+                all_grads.append(grad_abs.max().item())
+        
+        # Log gradient statistics
+        if lora_grads:
+            max_lora_grad = max(lora_grads)
+            mean_lora_grad = sum(lora_grads) / len(lora_grads)
+            logger.info(
+                f"[Step {step}] LoRA Gradients: max|grad|={max_lora_grad:.2e}, "
+                f"mean|grad|={mean_lora_grad:.2e}, None_count={lora_none_count}/{len(lora_params)}"
+            )
+        else:
+            logger.warning(f"[Step {step}] No LoRA gradients found! ({len(lora_params)} LoRA params)")
+        
+        if all_grads:
+            max_all_grad = max(all_grads)
+            mean_all_grad = sum(all_grads) / len(all_grads)
+            logger.info(
+                f"[Step {step}] All Trainable Gradients: max|grad|={max_all_grad:.2e}, "
+                f"mean|grad|={mean_all_grad:.2e}, None_count={all_none_count}/{len(all_trainable_params)}"
+            )
+        else:
+            logger.warning(f"[Step {step}] No gradients found for any trainable parameters!")
+        
+        # Log effective LR from scheduler (before step - may be 0 at step 0 during warmup)
+        try:
+            if scheduler is not None:
+                if hasattr(scheduler, 'get_last_lr'):
+                    last_lr = scheduler.get_last_lr()
+                    if isinstance(last_lr, list):
+                        effective_lr = last_lr[0] if last_lr else 0.0
+                    else:
+                        effective_lr = float(last_lr)
+                elif hasattr(scheduler, 'get_lr'):
+                    lr_list = scheduler.get_lr()
+                    effective_lr = lr_list[0] if lr_list else 0.0
+                else:
+                    effective_lr = getattr(scheduler, 'last_lr', [0.0])[0] if hasattr(scheduler, 'last_lr') else 0.0
+                
+                # Check if we're in warmup at step 0 (LR starts at 0 by design for warmup schedules)
+                warmup_steps = getattr(self.config, 'warmup_steps', 0)
+                is_warmup_step_0 = (step == 0 and warmup_steps > 0)
+                is_in_warmup = (step < warmup_steps) if warmup_steps > 0 else False
+                
+                if is_warmup_step_0:
+                    logger.info(f"[Step {step}] Effective LR (before step): {effective_lr:.2e} (Warmup step 0; LR starts at 0 by schedule)")
+                elif is_in_warmup:
+                    logger.info(f"[Step {step}] Effective LR (before step): {effective_lr:.2e} (Warmup: {step}/{warmup_steps})")
+                else:
+                    logger.info(f"[Step {step}] Effective LR (before step): {effective_lr:.2e}")
+                    
+                    # Only warn if we're past warmup and LR is still 0 (this indicates a problem)
+                    if (effective_lr == 0.0 or effective_lr < 1e-10) and step > warmup_steps:
+                        logger.warning(f"⚠️  [Step {step}] Effective LR is ~0! Scheduler may be misconfigured or finished.")
+        except Exception as e:
+            logger.warning(f"[Step {step}] Could not get effective LR: {e}")
+        
+        # Verify optimizer is attached to actual LoRA tensors
+        optimizer_param_ids = set()
+        for param_group in optimizer.param_groups:
+            for param in param_group['params']:
+                optimizer_param_ids.add(id(param))
+        
+        lora_in_optimizer = 0
+        lora_not_in_optimizer = []
+        lora_param_ids = []
+        for name, param in lora_params:
+            param_id = id(param)
+            lora_param_ids.append((name, param_id))
+            if param_id in optimizer_param_ids:
+                lora_in_optimizer += 1
+            else:
+                lora_not_in_optimizer.append(name)
+        
+        logger.info(
+            f"[Step {step}] Optimizer attachment: {lora_in_optimizer}/{len(lora_params)} LoRA params in optimizer"
+        )
+        
+        # Fail fast if no LoRA parameters are attached to optimizer (0/N case)
+        # This prevents wasting hours training with no parameter updates
+        if lora_in_optimizer == 0 and len(lora_params) > 0:
+            raise RuntimeError(
+                f"Optimizer is not attached to LoRA parameters (0/{len(lora_params)}). "
+                "This usually means the model parameters were replaced (e.g., rollback/load) "
+                "without rebuilding the optimizer. Training cannot proceed without parameter updates."
+            )
+        
+        if lora_not_in_optimizer:
+            logger.warning(
+                f"[Step {step}] ⚠️  {len(lora_not_in_optimizer)} LoRA params NOT in optimizer: "
+                f"{lora_not_in_optimizer[:3]}{'...' if len(lora_not_in_optimizer) > 3 else ''}"
+            )
+        
+        # Print a few parameter object IDs for verification
+        if lora_params:
+            logger.debug(f"[Step {step}] Sample LoRA param IDs (first 3):")
+            for name, param in lora_params[:3]:
+                param_id = id(param)
+                in_optimizer = "✓" if param_id in optimizer_param_ids else "✗"
+                logger.debug(f"  {name}: id={param_id}, in_optimizer={in_optimizer}")
+
     def _compute_parameter_changes(self, before_state: Dict[str, torch.Tensor], after_state: Dict[str, torch.Tensor]) -> Dict[str, float]:
         """Compute statistics about parameter changes between two states.
         
@@ -1908,6 +2150,8 @@ class RLAIFTrainer:
         self._advantage_baseline_ema = None  # EMA baseline for advantage normalization
         self._rolling_baseline_ema = None  # Rolling EMA baseline for use_rolling_ema_baseline mode
         self._rolling_baseline_samples = []  # Accumulate early epoch rewards for rolling baseline
+        self._observed_kl_ema = None  # EMA of observed KL divergence for adaptive KL controller
+        self._kl_penalty_initial = None  # Store initial kl_penalty value
         self._batch_step = 0  # monotonic batch counter for continuous TensorBoard time series
         self._prev_frag_metrics = {}
         self._last_fragment_gc_batch = -10**9
@@ -2434,7 +2678,9 @@ class RLAIFTrainer:
         from collections import OrderedDict
         self.teacher_score_cache = OrderedDict()  # LRU cache: key -> (score, timestamp)
         self.teacher_score_cache_max_size = int(getattr(config, 'teacher_score_cache_max_size', 10000) or 10000)
-        self.teacher_score_cache_max_age_seconds = float(getattr(config, 'teacher_score_cache_max_age_seconds', 3600) or 3600)  # 1 hour default
+        # Default cache TTL: 4 hours (14400s) to reduce cache misses during baseline + early epochs
+        # Can be increased further if needed (e.g., 8 hours = 28800s, 24 hours = 86400s)
+        self.teacher_score_cache_max_age_seconds = float(getattr(config, 'teacher_score_cache_max_age_seconds', 14400) or 14400)  # 4 hours default (was 1 hour)
         self.executor = ThreadPoolExecutor(max_workers=min(4, os.cpu_count() or 4))  # Concurrent API calls (reduced for M5)
         self.use_batch_generation = True  # Batch student generation
         self.generation_warmup_done = False  # Track if generation has been warmed up
@@ -2858,6 +3104,8 @@ class RLAIFTrainer:
     def _generate_prompt_variation(self, base_prompt: str, language: str, sample_idx: int, num_samples: int, epoch: int = 0, nonce: int = 0) -> str:
         """Generate a prompt variation to increase code diversity
         
+        Enhances prompts with constraints, tests, and examples based on difficulty.
+        
         Args:
             base_prompt: The original prompt
             language: Programming language
@@ -2865,7 +3113,7 @@ class RLAIFTrainer:
             num_samples: Total number of samples per prompt
             
         Returns:
-            Varied prompt string
+            Varied prompt string with constraints and tests
         """
         import random
         import hashlib
@@ -2874,6 +3122,10 @@ class RLAIFTrainer:
         seed_material = f"{epoch}:{nonce}:{sample_idx}:{num_samples}:{language}:{base_prompt}".encode("utf-8")
         seed = int(hashlib.md5(seed_material).hexdigest()[:8], 16)
         rng = random.Random(seed)
+
+        # Enhance prompt with constraints, tests, and examples
+        difficulty = _rubric_difficulty_components(base_prompt, language)
+        enhanced_prompt = _enhance_prompt_with_constraints(base_prompt, language, difficulty)
 
         # Different prompt templates for diversity (expanded for more variety)
         templates = [
@@ -2893,19 +3145,9 @@ class RLAIFTrainer:
         template_idx = (sample_idx + rng.randint(0, len(templates) - 1)) % len(templates)
         template = templates[template_idx]
         
-        # Add more diverse variations to the prompt text itself
-        prompt_variations = [
-            base_prompt,
-            base_prompt + " Make sure the code is efficient.",
-            base_prompt + " Include proper error handling.",
-            base_prompt + " Add comments for clarity.",
-            base_prompt + " Optimize for performance.",
-            base_prompt + " Use best practices.",
-            base_prompt + " Make it readable and maintainable.",
-            base_prompt + " Consider edge cases.",
-            base_prompt + " Write production-ready code.",
-            base_prompt + " Focus on code quality.",
-        ]
+        # Use enhanced prompt (with constraints and tests) instead of base prompt
+        # The enhanced prompt already includes constraints, tests, and examples based on difficulty
+        varied_prompt = enhanced_prompt
         
         # Epoch-level style directives to force diversity even if decoding is low-entropy
         style_directives = [
@@ -2922,11 +3164,7 @@ class RLAIFTrainer:
         ]
         style_idx = (epoch + sample_idx + nonce) % len(style_directives)
 
-        # Use different prompt variation based on sample index (deterministic randomization)
-        variation_idx = (sample_idx + rng.randint(0, len(prompt_variations) - 1)) % len(prompt_variations)
-        varied_prompt = prompt_variations[variation_idx]
-
-        # Add an epoch “salt” so the same prompt yields different completions across epochs.
+        # Add an epoch "salt" so the same prompt yields different completions across epochs.
         #
         # Important performance note (Apple Silicon / MLX):
         # Prompt *prefill* cost is a big chunk of total time. Keep this salt short so we don't
@@ -2934,7 +3172,7 @@ class RLAIFTrainer:
         #
         # We still inject diversity via:
         # - template randomization
-        # - prompt variation text
+        # - enhanced prompt with constraints and tests
         # - (optionally) sampling on retries
         epoch_salt = f"\n\n[Var e{epoch + 1} n{nonce}] {style_directives[style_idx]}\n"
 
@@ -3179,6 +3417,8 @@ class RLAIFTrainer:
                     except Exception:
                         pass
 
+                # Compute difficulty for difficulty-bucket baselining
+                difficulty = _rubric_difficulty_components(prompt, language)
                 samples.append({
                     'prompt': prompt,
                     'language': language,
@@ -3193,16 +3433,20 @@ class RLAIFTrainer:
                     'output_tokens': 0,
                     'code_hash': code_hash,
                     'prompt_key': prompt_key,
+                    'rubric_demand': float(difficulty.get('rubric_demand', 0.5)),  # For difficulty-bucket baselining
                 })
             except Exception as e:
                 logger.warning(f"MLX generation failed for prompt: {e}")
                 # Fall back to empty code
                 formatted_prompt = f"Write high-quality {language} code:\n\n{prompt}\n\nCode:"
+                # Compute difficulty for difficulty-bucket baselining
+                difficulty = _rubric_difficulty_components(prompt, language)
                 samples.append({
                     'prompt': prompt,
                     'language': language,
                     'code': '',
                     'full_prompt': formatted_prompt,
+                    'rubric_demand': float(difficulty.get('rubric_demand', 0.5)),  # For difficulty-bucket baselining
                 })
         
         return samples
@@ -3408,19 +3652,33 @@ class RLAIFTrainer:
                                 skip_special_tokens=True
                             )
                             
+                            # Compute difficulty for difficulty-bucket baselining
+                            difficulty = _rubric_difficulty_components(prompt, language)
                             samples.append({
                                 'prompt': prompt,
                                 'language': language,
                                 'code': generated_text,
                                 # Keep prompt used; tokenize later only for selected samples.
                                 'full_prompt': all_formatted_prompts[i * batch_size + j],
+                                'rubric_demand': float(difficulty.get('rubric_demand', 0.5)),  # For difficulty-bucket baselining
                             })
         
         return samples
     
     def _get_teacher_code_cached(self, prompt: str, language: str) -> str:
-        """Get teacher code with caching"""
-        cache_key = f"{prompt}:{language}"
+        """Get teacher code with caching using hash-based keys (like student scoring)
+        
+        Uses hash-based cache keys to:
+        - Reduce memory usage (hash vs full prompt string)
+        - Avoid cache misses from prompt formatting changes
+        - Ensure cache keys are stable across epochs
+        """
+        import hashlib
+        # Use hash-based cache key (same approach as student scoring)
+        # This ensures cache hits even if prompt formatting/enhancement changes
+        prompt_hash = hashlib.md5(prompt.encode()).hexdigest()[:12]
+        cache_key = f"TEACHER_GEN:{prompt_hash}:{language}"
+        
         if cache_key not in self.teacher_cache:
             self.teacher_cache[cache_key] = self.teacher.generate(prompt, language)
             # teacher reference generation call
@@ -3756,15 +4014,39 @@ class RLAIFTrainer:
                     checkpoint_path = Path(resume_from).resolve()
                     if checkpoint_path.exists() and (checkpoint_path / "adapter_model.safetensors").exists():
                         logger.info(f"Resuming from checkpoint: {checkpoint_path}")
-                        # Load adapter directly from checkpoint (this will apply LoRA config from checkpoint)
-                        # PeftModel.from_pretrained automatically loads and enables the adapter
-                        # Suppress warnings about missing adapter keys (e.g., _orig_mod keys from different model structure)
+                        
+                        # CRITICAL: Load adapter weights into existing model to preserve parameter object identity
+                        # This keeps optimizer param references intact (optimizer will be created later in train() method)
+                        from peft import set_peft_model_state_dict
+                        from safetensors.torch import load_file
                         import warnings
+                        
+                        # Load adapter state dict from checkpoint
+                        adapter_path = checkpoint_path / "adapter_model.safetensors"
+                        if adapter_path.exists():
+                            logger.info("Loading adapter weights from safetensors...")
+                            adapter_state_dict = load_file(str(adapter_path))
+                        else:
+                            # Fallback to standard PyTorch format
+                            adapter_path = checkpoint_path / "adapter_model.bin"
+                            if adapter_path.exists():
+                                logger.info("Loading adapter weights from .bin file...")
+                                adapter_state_dict = torch.load(str(adapter_path), map_location=self.device)
+                            else:
+                                raise FileNotFoundError(
+                                    f"Adapter weights not found in checkpoint: {checkpoint_path}. "
+                                    f"Expected adapter_model.safetensors or adapter_model.bin"
+                                )
+                        
+                        # Load adapter weights into existing model (preserves parameter object identity)
+                        # Suppress warnings about missing adapter keys (e.g., _orig_mod keys from different model structure)
                         with warnings.catch_warnings():
                             warnings.filterwarnings("ignore", message=".*missing adapter keys.*", category=UserWarning)
                             warnings.filterwarnings("ignore", message=".*Already found a `peft_config`.*", category=UserWarning)
-                            self.model = PeftModel.from_pretrained(self.model, str(checkpoint_path))
-                        logger.info("✓ Loaded LoRA adapters from checkpoint")
+                            set_peft_model_state_dict(self.model, adapter_state_dict)
+                        
+                        self.model.to(self.device)
+                        logger.info("✓ Loaded LoRA adapters from checkpoint (weights loaded in-place, parameter objects preserved)")
                         
                         # Enable training mode
                         self.model.train()
@@ -3779,6 +4061,9 @@ class RLAIFTrainer:
                         
                         if trainable_count > 0:
                             logger.info(f"Enabled {trainable_count} LoRA parameters for training")
+                        
+                        # NOTE: Optimizer and scheduler will be created in train() method with the correct parameter objects
+                        # Since we loaded weights in-place, parameter objects are preserved and optimizer will attach correctly
                         
                         # Verify adapter is loaded (check peft_config, not active_adapters which may raise error)
                         if hasattr(self.model, 'peft_config') and self.model.peft_config:
@@ -4025,12 +4310,23 @@ class RLAIFTrainer:
         logger.info(f"LoRA→MLX sync complete at global_step={global_step} (dt={dt:.1f}s, quant={quant})")
     
     def _apply_curriculum_learning(self, dataset: CodeDataset) -> CodeDataset:
-        """Apply curriculum learning: sort prompts by difficulty (start easy, increase difficulty)"""
-        # Simple heuristic: shorter prompts are easier, longer prompts are harder
-        # In a more sophisticated implementation, we could use prompt complexity metrics
+        """Apply curriculum learning: sort prompts by objective difficulty (rubric_demand)
         
-        # Sort by prompt length (shorter = easier)
-        sorted_data = sorted(dataset.data, key=lambda x: len(x.get('prompt', '')))
+        Uses objective difficulty metrics (rubric_demand) instead of prompt length
+        to ensure proper curriculum progression based on actual complexity.
+        """
+        # Compute objective difficulty for each prompt
+        prompt_difficulties = []
+        for item in dataset.data:
+            prompt = item.get('prompt', '')
+            language = item.get('language', 'python')
+            difficulty = _rubric_difficulty_components(prompt, language)
+            # Use composite difficulty: rubric_demand weighted by language
+            composite_difficulty = difficulty['rubric_demand'] * difficulty.get('lang_weight', 1.0)
+            prompt_difficulties.append((item, composite_difficulty))
+        
+        # Sort by objective difficulty (easiest first)
+        sorted_data = [item for item, _ in sorted(prompt_difficulties, key=lambda x: x[1])]
         
         # Create new dataset with sorted data (don't load from file, just copy structure)
         curriculum_dataset = CodeDataset.__new__(CodeDataset)  # Create instance without calling __init__
@@ -4038,33 +4334,338 @@ class RLAIFTrainer:
         curriculum_dataset.max_length = dataset.max_length
         curriculum_dataset.data = sorted_data  # Set data directly without loading from file
         
-        logger.info(f"Applied curriculum learning: sorted {len(sorted_data)} samples by difficulty (shortest first)")
+        # Log difficulty distribution
+        difficulties = [d for _, d in sorted(prompt_difficulties, key=lambda x: x[1])]
+        if difficulties:
+            min_diff = min(difficulties)
+            max_diff = max(difficulties)
+            avg_diff = sum(difficulties) / len(difficulties)
+            logger.info(
+                f"Applied curriculum learning: sorted {len(sorted_data)} samples by objective difficulty "
+                f"(min={min_diff:.3f}, max={max_diff:.3f}, avg={avg_diff:.3f})"
+            )
         return curriculum_dataset
     
-    def compute_kl_penalty(self, log_probs: torch.Tensor, ref_log_probs: torch.Tensor) -> torch.Tensor:
-        """Compute KL divergence penalty with NaN/inf protection"""
-        # Check for NaN or Inf values
-        if torch.isnan(log_probs).any() or torch.isinf(log_probs).any():
-            logger.warning("NaN/Inf detected in log_probs, using zero KL penalty")
-            return torch.tensor(0.0, device=log_probs.device)
-        if torch.isnan(ref_log_probs).any() or torch.isinf(ref_log_probs).any():
-            logger.warning("NaN/Inf detected in ref_log_probs, using zero KL penalty")
-            return torch.tensor(0.0, device=log_probs.device)
+    def compute_tokenwise_categorical_kl(
+        self, 
+        policy_logits: torch.Tensor, 
+        ref_logits: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Compute tokenwise categorical KL divergence: KL(P||Q) = sum_v P(v) * log(P(v) / Q(v))
         
-        # Compute KL divergence: KL(P||Q) = sum(P * log(P/Q)) = sum(P * (log_P - log_Q))
-        # Here we use: kl = log_probs - ref_log_probs (difference in log probabilities)
-        kl = log_probs - ref_log_probs
+        Args:
+            policy_logits: Policy model logits [B, T, V]
+            ref_logits: Reference model logits [B, T, V]
+            attention_mask: Optional attention mask [B, T] to mask out padding tokens
+        
+        Returns:
+            KL divergence per token [B, T], averaged over vocabulary
+        """
+        # Convert logits to log probabilities using log_softmax
+        policy_log_probs = torch.nn.functional.log_softmax(policy_logits, dim=-1)  # [B, T, V]
+        ref_log_probs = torch.nn.functional.log_softmax(ref_logits, dim=-1)  # [B, T, V]
+        
+        # Convert to probabilities for KL computation
+        policy_probs = torch.nn.functional.softmax(policy_logits, dim=-1)  # [B, T, V]
+        
+        # Compute KL(P||Q) = sum_v P(v) * (log P(v) - log Q(v))
+        # = sum_v P(v) * log P(v) - sum_v P(v) * log Q(v)
+        kl_per_token = torch.sum(
+            policy_probs * (policy_log_probs - ref_log_probs),
+            dim=-1
+        )  # [B, T]
+        
+        # Mask out padding tokens if attention mask provided
+        if attention_mask is not None:
+            # Ensure mask matches sequence length
+            if attention_mask.shape[1] != kl_per_token.shape[1]:
+                # Truncate or pad mask to match
+                seq_len = kl_per_token.shape[1]
+                if attention_mask.shape[1] > seq_len:
+                    attention_mask = attention_mask[:, :seq_len]
+                else:
+                    padding = torch.zeros(
+                        attention_mask.shape[0], 
+                        seq_len - attention_mask.shape[1],
+                        device=attention_mask.device,
+                        dtype=attention_mask.dtype
+                    )
+                    attention_mask = torch.cat([attention_mask, padding], dim=1)
+            
+            kl_per_token = kl_per_token * attention_mask
+        
+        return kl_per_token
+    
+    def compute_kl_penalty(
+        self, 
+        policy_logits: torch.Tensor, 
+        ref_logits: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Compute KL divergence penalty using tokenwise categorical KL
+        
+        Args:
+            policy_logits: Policy model logits [B, T, V]
+            ref_logits: Reference model logits [B, T, V]
+            attention_mask: Optional attention mask [B, T] to mask out padding tokens
+        
+        Returns:
+            KL penalty tensor (scalar)
+        """
+        # Check for NaN or Inf values
+        if torch.isnan(policy_logits).any() or torch.isinf(policy_logits).any():
+            logger.warning("NaN/Inf detected in policy_logits, using zero KL penalty")
+            return torch.tensor(0.0, device=policy_logits.device)
+        if torch.isnan(ref_logits).any() or torch.isinf(ref_logits).any():
+            logger.warning("NaN/Inf detected in ref_logits, using zero KL penalty")
+            return torch.tensor(0.0, device=ref_logits.device)
+        
+        # Compute tokenwise categorical KL divergence
+        kl_per_token = self.compute_tokenwise_categorical_kl(
+            policy_logits, ref_logits, attention_mask
+        )  # [B, T]
+        
+        # Average over valid tokens (masked if attention_mask provided)
+        if attention_mask is not None:
+            valid_tokens = attention_mask.sum()
+            if valid_tokens > 0:
+                kl_mean = (kl_per_token * attention_mask).sum() / valid_tokens
+            else:
+                kl_mean = torch.tensor(0.0, device=kl_per_token.device)
+        else:
+            kl_mean = kl_per_token.mean()
         
         # Clamp to prevent extreme values
-        kl = torch.clamp(kl, min=-10.0, max=10.0)
+        kl_mean = torch.clamp(kl_mean, min=-10.0, max=10.0)
         
         # Check result for NaN/Inf
-        kl_mean = kl.mean()
         if torch.isnan(kl_mean) or torch.isinf(kl_mean):
             logger.warning("NaN/Inf in KL penalty computation, using zero")
-            return torch.tensor(0.0, device=log_probs.device)
+            return torch.tensor(0.0, device=policy_logits.device)
         
         return self.config.kl_penalty * kl_mean
+    
+    def _update_adaptive_kl_penalty(self, observed_kl: float) -> None:
+        """Update KL penalty using adaptive controller: kl_penalty *= exp(k * (observed_kl - target_kl))
+        
+        This maintains the observed KL divergence near the target by adjusting the penalty:
+        - If observed_kl > target_kl: increase penalty (reduce KL)
+        - If observed_kl < target_kl: decrease penalty (allow more exploration)
+        
+        Args:
+            observed_kl: Observed KL divergence from current training step
+        """
+        if not getattr(self.config, 'adaptive_kl_enabled', False):
+            return
+        
+        # Store initial kl_penalty on first call
+        if self._kl_penalty_initial is None:
+            self._kl_penalty_initial = self.config.kl_penalty
+        
+        # Update EMA of observed KL for stability
+        kl_ema_alpha = 0.9  # EMA decay factor
+        if self._observed_kl_ema is None:
+            self._observed_kl_ema = observed_kl
+        else:
+            self._observed_kl_ema = kl_ema_alpha * self._observed_kl_ema + (1.0 - kl_ema_alpha) * observed_kl
+        
+        # Use EMA for more stable updates
+        smoothed_kl = self._observed_kl_ema
+        
+        # Get target and gain from config
+        target_kl = getattr(self.config, 'target_kl', 0.075)
+        kl_gain = getattr(self.config, 'kl_gain', 0.1)
+        
+        # Compute update: kl_penalty *= exp(k * (observed_kl - target_kl))
+        kl_error = smoothed_kl - target_kl
+        update_factor = np.exp(kl_gain * kl_error)
+        
+        # Apply update
+        old_kl_penalty = self.config.kl_penalty
+        new_kl_penalty = old_kl_penalty * update_factor
+        
+        # Clamp to reasonable bounds (0.01 to 1.0) to prevent extreme values
+        kl_penalty_min = 0.01
+        kl_penalty_max = 1.0
+        new_kl_penalty = max(kl_penalty_min, min(kl_penalty_max, new_kl_penalty))
+        
+        # Update config
+        self.config.kl_penalty = new_kl_penalty
+        
+        # Log update (only if significant change to avoid log spam)
+        if abs(new_kl_penalty - old_kl_penalty) > 0.001:
+            logger.debug(
+                f"Adaptive KL: observed_kl={smoothed_kl:.4f}, target_kl={target_kl:.4f}, "
+                f"kl_penalty {old_kl_penalty:.4f} -> {new_kl_penalty:.4f} "
+                f"(factor={update_factor:.4f})"
+            )
+    
+    def _get_difficulty_bucket(self, rubric_demand: float) -> str:
+        """Get difficulty bucket string for a given rubric_demand value.
+        
+        Buckets: 'low' (<0.3), 'medium' (0.3-0.7), 'high' (>=0.7)
+        """
+        if rubric_demand < 0.3:
+            return "low"
+        elif rubric_demand < 0.7:
+            return "medium"
+        else:
+            return "high"
+    
+    def _compute_per_prompt_advantages(
+        self, 
+        samples: List[Dict], 
+        rewards: List[float],
+        use_median: bool = False
+    ) -> List[float]:
+        """Compute per-prompt centered advantages: a_i = r_i - mean(r_group)
+        
+        Step 1 of robust advantage computation pipeline:
+        1. Per-prompt centering (this method): a_i = r_i - mean(r_group)
+        2. Batch robust scaling (MAD) + soft clip (tanh): handled by _whiten_advantages()
+        
+        When multiple samples are generated per prompt, this normalizes rewards
+        relative to the mean (or median) reward for that prompt or difficulty bucket,
+        removing prompt difficulty effects.
+        
+        Args:
+            samples: List of sample dicts, each should have a 'prompt' and optionally 'rubric_demand' key
+            rewards: List of rewards corresponding to samples
+            use_median: If True, use median instead of mean for baseline (not recommended - use mean for per-prompt)
+        
+        Returns:
+            List of per-prompt centered advantages: a_i = r_i - mean(r_group)
+        """
+        if not samples or not rewards or len(samples) != len(rewards):
+            return rewards
+        
+        # Determine baseline type from config
+        baseline_type = getattr(self.config, 'advantage_baseline_type', 'per_prompt')
+        if baseline_type not in ['per_prompt', 'difficulty_bucket']:
+            logger.warning(f"Unknown advantage_baseline_type '{baseline_type}', defaulting to 'per_prompt'")
+            baseline_type = 'per_prompt'
+        
+        if baseline_type == 'difficulty_bucket':
+            # Group samples by difficulty bucket
+            bucket_to_rewards: Dict[str, List[tuple[int, float]]] = {}
+            for idx, sample in enumerate(samples):
+                # Get rubric_demand from sample if available, otherwise compute it
+                rubric_demand = sample.get('rubric_demand')
+                if rubric_demand is None:
+                    prompt = sample.get('prompt', '')
+                    language = sample.get('language', 'python')
+                    difficulty = _rubric_difficulty_components(prompt, language)
+                    rubric_demand = difficulty.get('rubric_demand', 0.5)
+                
+                bucket = self._get_difficulty_bucket(float(rubric_demand))
+                if bucket not in bucket_to_rewards:
+                    bucket_to_rewards[bucket] = []
+                bucket_to_rewards[bucket].append((idx, rewards[idx]))
+            
+            # Compute per-bucket baselines
+            bucket_baselines: Dict[str, float] = {}
+            for bucket, reward_list in bucket_to_rewards.items():
+                reward_values = [r for _, r in reward_list]
+                if use_median:
+                    bucket_baselines[bucket] = float(np.median(reward_values))
+                else:
+                    bucket_baselines[bucket] = float(np.mean(reward_values))
+            
+            # Compute advantages: A_i = r_i - baseline(bucket_i)
+            advantages = list(rewards)  # Start with original rewards
+            for bucket, reward_list in bucket_to_rewards.items():
+                baseline = bucket_baselines[bucket]
+                for idx, reward in reward_list:
+                    advantages[idx] = reward - baseline
+            
+            logger.debug(f"Difficulty-bucket baselines: {bucket_baselines}")
+            return advantages
+        
+        else:  # baseline_type == 'per_prompt'
+            # Group samples by prompt
+            prompt_to_rewards: Dict[str, List[tuple[int, float]]] = {}
+            for idx, sample in enumerate(samples):
+                prompt = sample.get('prompt')
+                if prompt is None:
+                    continue
+                if prompt not in prompt_to_rewards:
+                    prompt_to_rewards[prompt] = []
+                prompt_to_rewards[prompt].append((idx, rewards[idx]))
+            
+            # Compute per-prompt baselines
+            prompt_baselines: Dict[str, float] = {}
+            for prompt, reward_list in prompt_to_rewards.items():
+                reward_values = [r for _, r in reward_list]
+                if use_median:
+                    # Use median as baseline (more robust to outliers)
+                    prompt_baselines[prompt] = float(np.median(reward_values))
+                else:
+                    # Use mean as baseline (standard approach)
+                    prompt_baselines[prompt] = float(np.mean(reward_values))
+            
+            # Compute advantages: A_i = r_i - baseline(prompt_i)
+            advantages = list(rewards)  # Start with original rewards
+            for prompt, reward_list in prompt_to_rewards.items():
+                baseline = prompt_baselines[prompt]
+                for idx, reward in reward_list:
+                    advantages[idx] = reward - baseline
+            
+            return advantages
+    
+    def _whiten_advantages(self, advantages: List[float], eps: float = 1e-8) -> List[float]:
+        """Robust batch scaling with MAD and soft clipping for stable advantage computation.
+        
+        Implements:
+        1. Batch robust scaling using MAD (Median Absolute Deviation):
+           - s = 1.4826 * median(|a - median(a)|) + eps
+           - z = a / s
+        2. Soft clip using tanh:
+           - adv = tanh(z / 2.5)
+        
+        This approach is stable even when:
+        - Teacher scoring sometimes spikes
+        - Batch is small
+        - Reward distribution shifts after rollback
+        
+        Args:
+            advantages: List of advantages (already per-prompt centered: a_i = r_i - mean(r_group))
+            eps: Small constant to avoid division by zero
+        
+        Returns:
+            Robustly scaled and soft-clipped advantages
+        """
+        if not advantages:
+            return advantages
+        
+        adv_array = np.array(advantages, dtype=np.float32)
+        
+        # Step 1: Batch robust scaling using MAD (Median Absolute Deviation)
+        # MAD is more robust to outliers than standard deviation
+        adv_median = float(np.median(adv_array))
+        abs_deviations = np.abs(adv_array - adv_median)
+        mad = float(np.median(abs_deviations))
+        
+        # Scale factor: 1.4826 makes MAD equivalent to std for normal distributions
+        # This provides robust scaling that handles outliers gracefully
+        scale = 1.4826 * mad + eps
+        
+        if scale > eps:
+            # Robustly scaled advantages
+            z = adv_array / scale
+        else:
+            # If scale is too small (all advantages are identical), just use raw values
+            # This prevents division by near-zero
+            z = adv_array
+        
+        # Step 2: Soft clip using tanh to prevent extreme advantages from dominating
+        # tanh(z / 2.5) provides smooth clipping that:
+        # - Preserves gradient signal (unlike hard clipping)
+        # - Prevents outliers from dominating the policy gradient
+        # - Maintains stability even with reward spikes
+        clipped_advantages = np.tanh(z / 2.5)
+        
+        return clipped_advantages.tolist()
     
     def _create_training_batch_from_samples(self, samples: List[Dict], original_prompts: List[str]) -> Dict:
         """Create training batch from generated samples
@@ -4086,28 +4687,49 @@ class RLAIFTrainer:
         batch_attention_masks = []
         batch_rewards: List[float] = []
         
+        # Get number of top samples to use per prompt
+        top_n = getattr(self.config, 'top_samples_per_prompt', 1)
+        top_n = max(1, min(2, int(top_n)))  # Clamp to 1 or 2
+        
         for i, prompt in enumerate(original_prompts):
-            # Pick a sample for this prompt.
-            # If rewards are available, prefer the highest-reward sample for a stronger learning signal.
+            # Pick top N samples for this prompt (top-1 or top-2).
+            # If rewards are available, prefer the highest-reward samples for a stronger learning signal.
             idxs = samples_by_prompt.get(prompt, [])
-            sample = None
+            selected_samples = []
+            selected_rewards = []
+            
             if idxs:
-                best_idx = idxs[0]
                 if hasattr(self, "_latest_batch_rewards") and self._latest_batch_rewards is not None:
                     try:
-                        best_idx = max(idxs, key=lambda j: float(self._latest_batch_rewards[j]) if j < len(self._latest_batch_rewards) else -1.0)
+                        # Sort indices by reward (highest first) and take top N
+                        sorted_idxs = sorted(
+                            idxs, 
+                            key=lambda j: float(self._latest_batch_rewards[j]) if j < len(self._latest_batch_rewards) else -1.0,
+                            reverse=True
+                        )
+                        top_idxs = sorted_idxs[:top_n]
                     except Exception:
-                        best_idx = idxs[0]
+                        top_idxs = idxs[:top_n]
+                else:
+                    top_idxs = idxs[:top_n]
+                
+                for best_idx in top_idxs:
                 sample = samples[best_idx]
-            if sample is not None:
-                # Reward aligned to the *selected* sample for this prompt (critical for learning signal quality).
+                    selected_samples.append((sample, best_idx))
+                    
+                    # Reward aligned to the *selected* sample for this prompt
                 rr = 0.5
                 try:
                     if hasattr(self, "_latest_batch_rewards") and self._latest_batch_rewards is not None and best_idx < len(self._latest_batch_rewards):
                         rr = float(self._latest_batch_rewards[best_idx])
                 except Exception:
                     rr = 0.5
-                batch_rewards.append(rr)
+                    selected_rewards.append(rr)
+            
+            # Add selected samples to batch
+            if selected_samples:
+                for idx, (sample, best_idx) in enumerate(selected_samples):
+                    batch_rewards.append(selected_rewards[idx])
 
                 if 'input_ids' in sample and 'attention_mask' in sample:
                     batch_input_ids.append(sample['input_ids'])
@@ -4212,6 +4834,7 @@ class RLAIFTrainer:
         # Initialize variables to avoid "referenced before assignment" errors
         ref_outputs = None
         ref_log_probs = None
+        ref_logits_for_kl = None  # Reference logits for tokenwise categorical KL
         
         # Move to device with non_blocking for faster transfer
         input_ids = batch['input_ids'].to(self.device, non_blocking=True)
@@ -4284,13 +4907,17 @@ class RLAIFTrainer:
             # Compute reference token log-probs without building [B, T, V] log_probs.
             # This is the optimal caching strategy: we cache only the final logits (~156MB)
             # rather than all intermediate activations (~2.4GB) which can't be reused anyway.
-            ref_logits_trunc = ref_outputs.logits[:, :-1, :]
+            ref_logits_trunc = ref_outputs.logits[:, :-1, :]  # [B, T-1, V]
             ref_token_logits = ref_logits_trunc.gather(2, input_ids[:, 1:].unsqueeze(-1)).squeeze(-1)
             ref_log_z = torch.logsumexp(ref_logits_trunc, dim=-1)
             ref_selected_log_probs = ref_token_logits - ref_log_z
             
+            # Store reference logits for tokenwise categorical KL computation
+            # We need the full logits for proper KL divergence, not just selected token log probs
+            ref_logits_for_kl = ref_logits_trunc.clone()  # [B, T-1, V]
+            
             # Delete reference outputs immediately to free memory
-            # Note: We keep ref_selected_log_probs (~156MB) which is already cached optimally
+            # Note: We keep ref_selected_log_probs and ref_logits_for_kl
             del ref_outputs
         
         # Re-enable gradient checkpointing for training
@@ -4496,7 +5123,7 @@ class RLAIFTrainer:
         
         # Compute policy gradient loss
         # Select log probs for generated tokens without building full [B, T, V] log_probs.
-        logits_trunc = logits[:, :-1, :]
+        logits_trunc = logits[:, :-1, :]  # [B, T-1, V]
         token_logits = logits_trunc.gather(2, input_ids[:, 1:].unsqueeze(-1)).squeeze(-1)
         log_z = torch.logsumexp(logits_trunc, dim=-1)
         selected_log_probs = token_logits - log_z
@@ -4513,36 +5140,36 @@ class RLAIFTrainer:
         
         # Apply advantage normalization BEFORE expanding to sequence length
         # This ensures we normalize per-sample rewards correctly
-        if getattr(self.config, 'use_advantage_normalization', True):
-            # Step 1: Baseline subtraction (reduce variance by centering rewards)
+        # NOTE: Per-prompt normalization should already be applied before best-of-N selection.
+        # This step applies additional batch-level normalization if needed.
+        use_advantage_normalization = getattr(self.config, 'use_advantage_normalization', None)
+        if use_advantage_normalization is None:
+            # Explicitly check if config has this attribute - no silent fallback
+            raise ValueError(
+                "use_advantage_normalization must be explicitly set in config. "
+                "No silent fallback allowed."
+            )
+        
+        if use_advantage_normalization:
+            # At this point, rewards should already have per-prompt normalization applied
+            # (done before best-of-N selection). We apply additional batch-level normalization
+            # to ensure zero mean and unit variance across the batch.
+            
             # Compute per-sample mean (before expansion)
             per_sample_rewards = reward_tensor.squeeze(1) if reward_tensor.shape[1] == 1 else reward_tensor.mean(dim=1)
-            batch_mean_reward = per_sample_rewards.mean().item()
             
-            # Update EMA baseline
-            ema_alpha = getattr(self.config, 'advantage_baseline_ema_alpha', 0.9)
-            if self._advantage_baseline_ema is None:
-                self._advantage_baseline_ema = batch_mean_reward
-            else:
-                self._advantage_baseline_ema = ema_alpha * self._advantage_baseline_ema + (1.0 - ema_alpha) * batch_mean_reward
+            # Step 1: Center advantages (ensure zero mean)
+            adv_mean = per_sample_rewards.mean()
+            advantage_per_sample = per_sample_rewards - adv_mean
             
-            # Subtract baseline to get advantage (per-sample)
-            baseline = self._advantage_baseline_ema
-            advantage_per_sample = per_sample_rewards - baseline
-            
-            # Step 2: Advantage whitening (normalize to unit variance)
-            # Compute mean and std across samples in this batch
-            adv_mean = advantage_per_sample.mean()
+            # Step 2: Whitening (normalize to unit variance)
             adv_std = advantage_per_sample.std()
-            
-            # Whitening: (adv - mean(adv)) / (std(adv) + eps)
-            # This centers the advantage at 0 and scales to unit variance
             eps = 1e-8
             if adv_std > eps:
-                advantage_normalized_per_sample = (advantage_per_sample - adv_mean) / (adv_std + eps)
+                advantage_normalized_per_sample = (advantage_per_sample - advantage_per_sample.mean()) / (adv_std + eps)
             else:
                 # If std is too small, just use centered advantage
-                advantage_normalized_per_sample = advantage_per_sample - adv_mean
+                advantage_normalized_per_sample = advantage_per_sample
             
             # Expand normalized advantage to match reward_tensor shape
             if reward_tensor.shape[1] == 1:
@@ -4551,7 +5178,7 @@ class RLAIFTrainer:
                 # If already expanded, expand the normalized version
                 reward_tensor = advantage_normalized_per_sample.unsqueeze(1).expand_as(reward_tensor)
             
-            logger.debug(f"Advantage normalization: baseline={baseline:.4f}, batch_mean={batch_mean_reward:.4f}, adv_std={adv_std:.4f}, adv_mean={adv_mean:.4f}")
+            logger.debug(f"Batch-level advantage normalization: adv_mean={adv_mean:.4f}, adv_std={adv_std:.4f}")
         # else: reward_tensor remains as original (raw rewards)
         
         # Expand to match selected_log_probs shape
@@ -4571,7 +5198,7 @@ class RLAIFTrainer:
             reward_tensor = reward_tensor.expand(-1, selected_log_probs.shape[1])
         
         # Ensure attention_mask is valid
-        attn_mask = attention_mask[:, 1:]
+        attn_mask = attention_mask[:, 1:]  # [B, T-1]
         if attn_mask.shape != selected_log_probs.shape:
             logger.warning(f"Attention mask shape mismatch: {attn_mask.shape} vs {selected_log_probs.shape}")
             # Adjust attention mask
@@ -4594,20 +5221,36 @@ class RLAIFTrainer:
             logger.warning("NaN/Inf in policy_loss, using zero")
             policy_loss = torch.tensor(0.0, device=self.device)
         
-        # Validate ref_selected_log_probs
-        if torch.isnan(ref_selected_log_probs).any() or torch.isinf(ref_selected_log_probs).any():
-            logger.warning("NaN/Inf in ref_selected_log_probs, replacing with zeros")
-            ref_selected_log_probs = torch.nan_to_num(ref_selected_log_probs, nan=0.0, posinf=0.0, neginf=0.0)
+        # Compute tokenwise categorical KL divergence using full logits
+        # This is the proper KL divergence: KL(P||Q) = sum_v P(v) * log(P(v) / Q(v))
+        # where P is policy model distribution and Q is reference model distribution
+        if ref_logits_for_kl is not None:
+            kl_divergence = self.compute_tokenwise_categorical_kl(
+                logits_trunc,  # Policy model logits [B, T-1, V]
+                ref_logits_for_kl,  # Reference model logits [B, T-1, V]
+                attn_mask  # Attention mask [B, T-1]
+            )  # Returns [B, T-1]
+            
+            # Average KL divergence over valid tokens
+            if attn_mask.sum() > 0:
+                kl_divergence_mean = (kl_divergence * attn_mask).sum() / attn_mask.sum()
+            else:
+                kl_divergence_mean = torch.tensor(0.0, device=self.device)
+            
+            # Clamp to prevent extreme values
+            kl_divergence_mean = torch.clamp(kl_divergence_mean, min=-10.0, max=10.0)
+            if torch.isnan(kl_divergence_mean) or torch.isinf(kl_divergence_mean):
+                kl_divergence_mean = torch.tensor(0.0, device=self.device)
+        else:
+            # Fallback: use old method if ref_logits_for_kl is not available
+            logger.warning("ref_logits_for_kl not available, falling back to log prob difference for KL")
+            kl_divergence_mean = (selected_log_probs - ref_selected_log_probs).mean()
+            kl_divergence_mean = torch.clamp(kl_divergence_mean, min=-10.0, max=10.0)
+            if torch.isnan(kl_divergence_mean) or torch.isinf(kl_divergence_mean):
+                kl_divergence_mean = torch.tensor(0.0, device=self.device)
         
-        # Compute KL term pre-coefficient (before multiplying by kl_penalty)
-        # This is the raw KL divergence value
-        kl_term_pre_coefficient = (selected_log_probs - ref_selected_log_probs).mean()
-        # Clamp to prevent extreme values (same as in compute_kl_penalty)
-        kl_term_pre_coefficient = torch.clamp(kl_term_pre_coefficient, min=-10.0, max=10.0)
-        if torch.isnan(kl_term_pre_coefficient) or torch.isinf(kl_term_pre_coefficient):
-            kl_term_pre_coefficient = torch.tensor(0.0, device=self.device)
-        
-        kl_penalty = self.compute_kl_penalty(selected_log_probs, ref_selected_log_probs)
+        # Compute KL penalty (KL divergence scaled by kl_penalty coefficient)
+        kl_penalty = self.config.kl_penalty * kl_divergence_mean
         
         # Count valid tokens in the loss mask
         valid_token_count = int(attn_mask.sum().item())
@@ -4666,8 +5309,9 @@ class RLAIFTrainer:
         
         # Clear intermediate tensors to free memory (optimization for M5)
         # Delete in order to free memory immediately
-        # Note: ref_outputs was already deleted earlier (line 1535) to free memory immediately
-        del logits, selected_log_probs, ref_selected_log_probs, outputs
+        # Note: ref_outputs was already deleted earlier, but we keep ref_logits_for_kl for KL computation
+        # Delete ref_logits_for_kl after KL computation to free memory
+        del logits, selected_log_probs, ref_selected_log_probs, outputs, ref_logits_for_kl
         
         # Calculate average reward safely (handle empty list)
         avg_reward = np.mean(rewards) if rewards and len(rewards) > 0 else 0.0
@@ -4678,10 +5322,85 @@ class RLAIFTrainer:
             'loss': total_loss.detach(),
             'policy_loss': policy_loss.detach(),
             'kl_penalty': kl_penalty.detach(),
-            'kl_term_pre_coefficient': kl_term_pre_coefficient.detach(),  # KL term before multiplying by kl_penalty
+            'kl_divergence': kl_divergence_mean.detach(),  # Tokenwise categorical KL divergence (separate from penalty)
             'valid_token_count': valid_token_count,  # Count of valid tokens in loss mask
             'avg_reward': float(avg_reward),
         }
+    
+    def _rebuild_optimizer_and_scheduler(self, train_loader):
+        """Rebuild optimizer and scheduler after model parameters are replaced (e.g., rollback/checkpoint load)
+        
+        This is necessary because when model parameters are replaced (new objects), the optimizer
+        still holds references to the old parameter objects, causing 0/N attachment.
+        
+        Args:
+            train_loader: Training data loader (needed to calculate total_steps)
+        """
+        opt_name = str(getattr(self.config, "optimizer", "adamw") or "adamw").strip().lower()
+        if opt_name not in {"adamw", "adafactor"}:
+            logger.warning(f"Unknown optimizer={opt_name!r}; falling back to adamw")
+            opt_name = "adamw"
+        
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        if not trainable_params:
+            raise RuntimeError("No trainable parameters found after checkpoint load/rollback.")
+        
+        if opt_name == "adafactor":
+            try:
+                from transformers.optimization import Adafactor
+            except Exception as e:
+                raise RuntimeError(
+                    "Optimizer 'adafactor' requested but transformers.optimization.Adafactor import failed. "
+                    f"Error: {type(e).__name__}: {e}"
+                )
+            self.optimizer = Adafactor(
+                trainable_params,
+                lr=float(self.config.learning_rate),
+                relative_step=False,
+                scale_parameter=False,
+                warmup_init=False,
+                weight_decay=float(self.config.weight_decay),
+            )
+            logger.info("Rebuilt optimizer: Adafactor")
+        else:
+            self.optimizer = torch.optim.AdamW(
+                trainable_params,
+                lr=self.config.learning_rate,
+                weight_decay=self.config.weight_decay,
+            )
+            logger.info("Rebuilt optimizer: AdamW")
+        
+        # Calculate total steps in optimizer-step units (accounting for gradient accumulation)
+        grad_accum = self.config.gradient_accumulation_steps
+        steps_per_epoch = (len(train_loader) + grad_accum - 1) // grad_accum
+        total_steps = steps_per_epoch * self.config.num_epochs
+        
+        from transformers import get_scheduler
+        self.scheduler = get_scheduler(
+            self.config.lr_scheduler_type,
+            optimizer=self.optimizer,
+            num_warmup_steps=self.config.warmup_steps,
+            num_training_steps=total_steps,
+        )
+        logger.info(f"Rebuilt scheduler: {self.config.lr_scheduler_type} (total_steps={total_steps})")
+        
+        # Verify optimizer attachment to new parameters
+        optimizer_param_ids = set()
+        for param_group in self.optimizer.param_groups:
+            for param in param_group['params']:
+                optimizer_param_ids.add(id(param))
+        
+        lora_params = [(name, param) for name, param in self.model.named_parameters() 
+                       if param.requires_grad and 'lora' in name.lower()]
+        lora_in_optimizer = sum(1 for _, param in lora_params if id(param) in optimizer_param_ids)
+        
+        if lora_in_optimizer == 0 and len(lora_params) > 0:
+            raise RuntimeError(
+                f"CRITICAL: After rebuild, optimizer is still not attached to LoRA parameters "
+                f"(0/{len(lora_params)}). This indicates a bug in _rebuild_optimizer_and_scheduler."
+            )
+        
+        logger.info(f"✓ Verified optimizer attachment after rebuild: {lora_in_optimizer}/{len(lora_params)} LoRA params")
     
     def train(self, train_dataset: CodeDataset, eval_dataset: Optional[CodeDataset] = None):
         """Main training loop"""
@@ -4822,13 +5541,29 @@ class RLAIFTrainer:
         self.optimizer = optimizer
         
         # Setup scheduler
-        total_steps = len(train_loader) * self.config.num_epochs
+        # Calculate total steps in optimizer-step units (accounting for gradient accumulation)
+        # Each optimizer step processes gradient_accumulation_steps micro-batches
+        grad_accum = self.config.gradient_accumulation_steps
+        # Use integer division with ceiling: (len + grad_accum - 1) // grad_accum
+        # This correctly converts batch steps to optimizer steps
+        steps_per_epoch = (len(train_loader) + grad_accum - 1) // grad_accum
+        total_steps = steps_per_epoch * self.config.num_epochs
+        
+        logger.info(
+            f"Scheduler setup: train_loader={len(train_loader)} batches, "
+            f"grad_accum={grad_accum}, steps_per_epoch={steps_per_epoch}, "
+            f"total_steps={total_steps} (optimizer steps)"
+        )
+        
         scheduler = get_scheduler(
             self.config.lr_scheduler_type,
             optimizer=optimizer,
             num_warmup_steps=self.config.warmup_steps,
             num_training_steps=total_steps
         )
+        
+        # Store scheduler as instance variable for consistency
+        self.scheduler = scheduler
         
         # Initialize gradient accumulation memory tracking baseline
         # This will be reset after each optimizer step (zero_grad)
@@ -4888,12 +5623,37 @@ class RLAIFTrainer:
                                 checkpoint_path = Path(best_checkpoint_path)
                                 if checkpoint_path.exists() and (checkpoint_path / "adapter_model.safetensors").exists():
                                     logger.info(f"Loading best checkpoint from: {checkpoint_path}")
-                                    # Reload adapter from best checkpoint
+                                    
+                                    # CRITICAL: Load adapter weights into existing model to preserve parameter object identity
+                                    # This keeps optimizer param references intact and avoids needing to rebuild optimizer
+                                    from peft import set_peft_model_state_dict
+                                    from safetensors.torch import load_file
+                                    
+                                    # Load adapter state dict from checkpoint
+                                    adapter_path = checkpoint_path / "adapter_model.safetensors"
+                                    if adapter_path.exists():
+                                        logger.info("Loading adapter weights from safetensors...")
+                                        adapter_state_dict = load_file(str(adapter_path))
+                                    else:
+                                        # Fallback to standard PyTorch format
+                                        adapter_path = checkpoint_path / "adapter_model.bin"
+                                        if adapter_path.exists():
+                                            logger.info("Loading adapter weights from .bin file...")
+                                            adapter_state_dict = torch.load(str(adapter_path), map_location=self.device)
+                                        else:
+                                            raise FileNotFoundError(
+                                                f"Adapter weights not found in checkpoint: {checkpoint_path}. "
+                                                f"Expected adapter_model.safetensors or adapter_model.bin"
+                                            )
+                                    
+                                    # Load adapter weights into existing model (preserves parameter object identity)
                                     # Suppress warnings about missing adapter keys (e.g., _orig_mod keys from different model structure)
                                     with warnings.catch_warnings():
                                         warnings.filterwarnings("ignore", message=".*missing adapter keys.*", category=UserWarning)
                                         warnings.filterwarnings("ignore", message=".*Already found a `peft_config`.*", category=UserWarning)
-                                        self.model = PeftModel.from_pretrained(self.model, str(checkpoint_path))
+                                        set_peft_model_state_dict(self.model, adapter_state_dict)
+                                    
+                                    # Ensure model is in training mode
                                     self.model.train()
                                     
                                     # Re-enable training mode for all LoRA parameters
@@ -4904,14 +5664,46 @@ class RLAIFTrainer:
                                     
                                     logger.info(f"✓ Rolled back to best checkpoint (epoch {best_checkpoint_epoch + 1}, reward: {best_reward:.4f})")
                                     
-                                    # Reset optimizer state to match checkpoint (optional but recommended)
-                                    # Note: We don't reload optimizer state here as it's complex, but the model weights are restored
-                                    logger.info("⚠️  Note: Optimizer state not restored. Training will continue with current optimizer state.")
+                                    # HARD ASSERTION: Verify optimizer attachment after rollback to prevent silent training
+                                    # Since we loaded weights in-place, parameter objects should be unchanged and optimizer should still be attached
+                                    optimizer_param_ids = set()
+                                    for param_group in self.optimizer.param_groups:
+                                        for param in param_group['params']:
+                                            optimizer_param_ids.add(id(param))
+                                    
+                                    lora_params = [(name, param) for name, param in self.model.named_parameters() 
+                                                   if param.requires_grad and 'lora' in name.lower()]
+                                    lora_in_optimizer = sum(1 for _, param in lora_params if id(param) in optimizer_param_ids)
+                                    
+                                    # Expected: should have all LoRA params attached (since we preserved parameter objects)
+                                    expected_min_attachment = max(1, int(len(lora_params) * 0.95))  # At least 95% attached
+                                    
+                                    if lora_in_optimizer == 0:
+                                        raise RuntimeError(
+                                            f"CRITICAL: Optimizer does not reference any active LoRA params after rollback "
+                                            f"(0/{len(lora_params)}). This should not happen when loading weights in-place. "
+                                            f"Possible causes: (1) Parameter objects changed unexpectedly, "
+                                            f"(2) Optimizer was not properly initialized. Action: Check model/optimizer setup."
+                                        )
+                                    elif lora_in_optimizer < expected_min_attachment:
+                                        raise RuntimeError(
+                                            f"CRITICAL: Optimizer attachment is too low after rollback "
+                                            f"({lora_in_optimizer}/{len(lora_params)}, expected at least {expected_min_attachment}). "
+                                            f"This indicates parameter objects changed unexpectedly during weight loading. "
+                                            f"Training cannot proceed safely - some parameters will not be updated."
+                                        )
+                                    
+                                    logger.info(
+                                        f"✓ Hard assertion passed: Optimizer attachment verified after rollback "
+                                        f"({lora_in_optimizer}/{len(lora_params)} LoRA params attached, parameter objects preserved)"
+                                    )
                                 else:
                                     logger.error(f"Best checkpoint not found at {checkpoint_path}. Cannot rollback.")
                             except Exception as e:
                                 logger.error(f"Failed to rollback to best checkpoint: {e}")
-                                logger.warning("Continuing training with current model state.")
+                                import traceback
+                                logger.error(f"Rollback error traceback:\n{traceback.format_exc()}")
+                                raise  # Re-raise to prevent training with detached optimizer
 
             # If using a sampler that depends on epoch (e.g., curriculum bucket shuffling), advance it here.
             try:
@@ -5000,7 +5792,7 @@ class RLAIFTrainer:
             # Track micro-batch metrics for epoch summary (averaging over micro-batches, not just optimizer steps)
             epoch_micro_batch_metrics = {
                 'policy_loss': [],
-                'kl_term_pre_coefficient': [],
+                'kl_divergence': [],
                 'combined_loss': [],
                 'valid_token_count': [],
             }
@@ -5182,6 +5974,28 @@ class RLAIFTrainer:
                     samples_by_prompt[prompt].append(sample)
                     rewards_by_prompt[prompt].append(reward)
                 
+                # Apply per-prompt advantage normalization if enabled (BEFORE best-of-N selection)
+                if getattr(self.config, 'use_advantage_normalization', True):
+                    # Flatten samples and rewards for normalization
+                    all_samples_flat = []
+                    all_rewards_flat = []
+                    for prompt in samples_by_prompt.keys():
+                        all_samples_flat.extend(samples_by_prompt[prompt])
+                        all_rewards_flat.extend(rewards_by_prompt[prompt])
+                    
+                    # Compute per-prompt advantages
+                    advantages_flat = self._compute_per_prompt_advantages(all_samples_flat, all_rewards_flat, use_median=False)
+                    
+                    # Optionally whiten across all accumulated samples
+                    advantages_flat = self._whiten_advantages(advantages_flat)
+                    
+                    # Update rewards_by_prompt with normalized advantages
+                    idx = 0
+                    for prompt in samples_by_prompt.keys():
+                        num_samples = len(samples_by_prompt[prompt])
+                        rewards_by_prompt[prompt] = advantages_flat[idx:idx + num_samples]
+                        idx += num_samples
+                
                 # Create training batches from accumulated samples
                 prompt_list = list(samples_by_prompt.keys())
                 training_batch_size = self.config.batch_size
@@ -5191,19 +6005,34 @@ class RLAIFTrainer:
                     train_batch_samples = []
                     train_batch_rewards = []
                     
+                    # Get number of top samples to use per prompt
+                    top_n = getattr(self.config, 'top_samples_per_prompt', 1)
+                    top_n = max(1, min(2, int(top_n)))  # Clamp to 1 or 2
+                    
+                    # Expand prompts list to match number of samples (if top_n > 1)
+                    expanded_prompts = []
                     for prompt in train_batch_prompts:
-                        # Select best sample per prompt (best-of-N)
+                        # Select top N samples per prompt (top-1 or top-2) using normalized advantages
                         prompt_samples = samples_by_prompt[prompt]
                         prompt_rewards = rewards_by_prompt[prompt]
                         if prompt_samples and prompt_rewards:
-                            best_idx = max(range(len(prompt_rewards)), key=lambda i: float(prompt_rewards[i]) if i < len(prompt_rewards) else -1.0)
-                            train_batch_samples.append(prompt_samples[best_idx])
-                            train_batch_rewards.append(prompt_rewards[best_idx])
+                            # Sort by reward (highest first) and take top N
+                            sorted_indices = sorted(
+                                range(len(prompt_rewards)),
+                                key=lambda i: float(prompt_rewards[i]) if i < len(prompt_rewards) else -1.0,
+                                reverse=True
+                            )
+                            top_indices = sorted_indices[:top_n]
+                            
+                            for idx in top_indices:
+                                train_batch_samples.append(prompt_samples[idx])
+                                train_batch_rewards.append(prompt_rewards[idx])
+                                expanded_prompts.append(prompt)  # Add prompt for each selected sample
                     
                     if train_batch_samples and train_batch_rewards:
                         # Create training batch
                         self._latest_batch_rewards = train_batch_rewards
-                        train_batch = self._create_training_batch_from_samples(train_batch_samples, train_batch_prompts)
+                        train_batch = self._create_training_batch_from_samples(train_batch_samples, expanded_prompts)
                         
                         # Apply reward threshold filtering
                         reward_threshold = getattr(self.config, 'reward_threshold', None)
@@ -5212,16 +6041,26 @@ class RLAIFTrainer:
                         
                         if reward_threshold is not None and reward_threshold > 0.0:
                             filtered_indices = [i for i, r in enumerate(rewards_for_training) if r >= reward_threshold]
+                            
+                            # Handle the "all filtered" case explicitly: skip the optimizer step
+                            if len(filtered_indices) == 0:
+                                logger.debug(
+                                    f"Skipping training batch: all {original_batch_size} samples filtered "
+                                    f"(reward threshold={reward_threshold:.3f})"
+                                )
+                                continue  # Skip if all filtered
+                            
+                            # Otherwise: filter both train_batch and rewards_for_training consistently
                             if len(filtered_indices) < original_batch_size:
-                                if 'input_ids' in train_batch and len(filtered_indices) > 0:
+                                # Filter batch tensors unconditionally (we know filtered_indices is not empty)
+                                if 'input_ids' in train_batch:
                                     train_batch['input_ids'] = train_batch['input_ids'][filtered_indices]
                                     train_batch['attention_mask'] = train_batch['attention_mask'][filtered_indices]
                                     if 'prompt' in train_batch:
                                         train_batch['prompt'] = [train_batch['prompt'][i] for i in filtered_indices]
+                                
+                                # Filter rewards to match filtered tensors
                                 rewards_for_training = [rewards_for_training[i] for i in filtered_indices]
-                            
-                            if len(filtered_indices) == 0:
-                                continue  # Skip if all filtered
                         
                         # Training step
                         try:
@@ -5229,13 +6068,17 @@ class RLAIFTrainer:
                             
                             # Extract and log per micro-batch metrics
                             policy_loss_val = float(loss_dict.get("policy_loss", 0.0).detach().cpu()) if torch.is_tensor(loss_dict.get("policy_loss")) else float(loss_dict.get("policy_loss", 0.0))
-                            kl_term_pre_coeff_val = float(loss_dict.get("kl_term_pre_coefficient", 0.0).detach().cpu()) if torch.is_tensor(loss_dict.get("kl_term_pre_coefficient")) else float(loss_dict.get("kl_term_pre_coefficient", 0.0))
+                            kl_divergence_val = float(loss_dict.get("kl_divergence", 0.0).detach().cpu()) if torch.is_tensor(loss_dict.get("kl_divergence")) else float(loss_dict.get("kl_divergence", 0.0))
+                            
+                            # Update adaptive KL penalty based on observed KL divergence
+                            if kl_divergence_val is not None and not (np.isnan(kl_divergence_val) or np.isinf(kl_divergence_val)):
+                                self._update_adaptive_kl_penalty(kl_divergence_val)
                             combined_loss_val = float(loss_dict.get("loss", 0.0).detach().cpu()) if torch.is_tensor(loss_dict.get("loss")) else float(loss_dict.get("loss", 0.0))
                             valid_token_count_val = int(loss_dict.get("valid_token_count", 0))
                             
                             # Track for epoch summary (average over micro-batches, not just optimizer steps)
                             epoch_micro_batch_metrics['policy_loss'].append(policy_loss_val)
-                            epoch_micro_batch_metrics['kl_term_pre_coefficient'].append(kl_term_pre_coeff_val)
+                            epoch_micro_batch_metrics['kl_divergence'].append(kl_divergence_val)
                             epoch_micro_batch_metrics['combined_loss'].append(combined_loss_val)
                             epoch_micro_batch_metrics['valid_token_count'].append(valid_token_count_val)
                             
@@ -5243,7 +6086,7 @@ class RLAIFTrainer:
                             logger.info(
                                 f"Micro-batch {micro_step_in_epoch}: "
                                 f"policy_loss={policy_loss_val:.4f}, "
-                                f"kl_term_pre_coeff={kl_term_pre_coeff_val:.4f}, "
+                                f"kl_divergence={kl_divergence_val:.4f}, "
                                 f"combined_loss={combined_loss_val:.4f}, "
                                 f"valid_tokens={valid_token_count_val}"
                             )
@@ -5268,13 +6111,86 @@ class RLAIFTrainer:
                                     self._epoch_grad_norms = []
                                 self._epoch_grad_norms.append(float(grad_norm))
                                 
+                                # Comprehensive gradient and optimizer debugging before step
+                                self._debug_gradients_and_optimizer(self.optimizer, self.scheduler, global_step)
+                                
                                 param_state_before = self._capture_parameter_state()
-                                optimizer.step()
-                                scheduler.step()
+                                
+                                # Sanity test: verify parameters change (run at step 1 or 2, or when LR > 0)
+                                should_run_sanity = (
+                                    not hasattr(self, '_sanity_test_done') and
+                                    global_step >= 1  # Run at step 1 or 2, not step 0
+                                )
+                                
+                                # Check if LR > 0 (gate on non-zero learning rate)
+                                if should_run_sanity:
+                                    try:
+                                        if hasattr(self.scheduler, 'get_last_lr'):
+                                            current_lr = self.scheduler.get_last_lr()[0] if self.scheduler.get_last_lr() else 0.0
+                                        elif hasattr(self.scheduler, 'get_lr'):
+                                            current_lr = self.scheduler.get_lr()[0] if self.scheduler.get_lr() else 0.0
+                                        else:
+                                            current_lr = getattr(self.scheduler, 'last_lr', [0.0])[0] if hasattr(self.scheduler, 'last_lr') else 0.0
+                                        
+                                        if current_lr <= 0:
+                                            logger.debug(f"[Step {global_step}] Skipping sanity test: LR={current_lr:.2e} (will retry when LR > 0)")
+                                            should_run_sanity = False
+                                    except Exception:
+                                        # If we can't get LR, proceed anyway (better to test than skip)
+                                        pass
+                                
+                                if should_run_sanity:
+                                    logger.info(f"[Step {global_step}] Running sanity test to verify parameter updates...")
+                                    sanity_state_before = {}
+                                    for name, param in self.model.named_parameters():
+                                        if param.requires_grad and 'lora' in name.lower():
+                                            sanity_state_before[name] = param.data.clone().detach()
+                                    
+                                    self.optimizer.step()
+                                    self.scheduler.step()
+                                    
+                                    max_change = 0.0
+                                    changed_count = 0
+                                    for name, param in self.model.named_parameters():
+                                        if param.requires_grad and 'lora' in name.lower() and name in sanity_state_before:
+                                            change = (param.data - sanity_state_before[name]).abs().max().item()
+                                            if change > max_change:
+                                                max_change = change
+                                            if change > 0:
+                                                changed_count += 1
+                                    
+                                    if max_change > 0:
+                                        logger.info(
+                                            f"[Step {global_step}] ✓ Sanity test PASSED: max_change={max_change:.2e}, "
+                                            f"{changed_count} LoRA params changed"
+                                        )
+                                    else:
+                                        logger.error(
+                                            f"[Step {global_step}] ✗ Sanity test FAILED: No parameter changes! "
+                                            f"max_change={max_change:.2e}"
+                                        )
+                                    
+                                    self._sanity_test_done = True
+                                else:
+                                    self.optimizer.step()
+                                    self.scheduler.step()
+                                    
+                                    # Log effective LR after scheduler step (this is the LR that was actually used)
+                                    try:
+                                        if hasattr(self.scheduler, 'get_last_lr'):
+                                            lr_after = self.scheduler.get_last_lr()[0] if self.scheduler.get_last_lr() else 0.0
+                                        elif hasattr(self.scheduler, 'get_lr'):
+                                            lr_after = self.scheduler.get_lr()[0] if self.scheduler.get_lr() else 0.0
+                                        else:
+                                            lr_after = getattr(self.scheduler, 'last_lr', [0.0])[0] if hasattr(self.scheduler, 'last_lr') else 0.0
+                                        if global_step <= 10 or global_step % 10 == 0:  # Log first 10 steps and then every 10
+                                            logger.info(f"[Step {global_step}] Effective LR (after step): {lr_after:.2e}")
+                                    except Exception:
+                                        pass  # Don't fail on LR logging
                                 param_state_after = self._capture_parameter_state()
                                 param_changes = self._compute_parameter_changes(param_state_before, param_state_after)
                                 epoch_param_changes.append(param_changes)
-                                optimizer.zero_grad(set_to_none=True)
+                                self.optimizer.zero_grad(set_to_none=True)
                                 
                                 global_step += 1
                         except Exception as e:
@@ -5584,8 +6500,21 @@ class RLAIFTrainer:
                     # Only train if we have rewards and samples
                     if rewards and len(rewards) > 0 and samples and len(samples) > 0:
                         train_skipped_reason = "ran"
-                        # Store rewards so `_create_training_batch_from_samples` can pick the best sample per prompt.
-                        # (We keep it ephemeral to avoid threading complexity.)
+                        
+                        # Apply per-prompt advantage normalization if enabled
+                        # This should happen BEFORE best-of-N selection so we select based on normalized advantages
+                        if getattr(self.config, 'use_advantage_normalization', True):
+                            # Step 1: Compute per-prompt advantages (A_i = r_i - mean(r for same prompt))
+                            advantages = self._compute_per_prompt_advantages(samples, rewards, use_median=False)
+                            
+                            # Step 2: Optionally whiten across batch (normalize to zero mean, unit variance)
+                            # This further reduces gradient variance
+                            advantages = self._whiten_advantages(advantages)
+                            
+                            # Use normalized advantages for best-of-N selection
+                            self._latest_batch_rewards = advantages
+                        else:
+                            # Store original rewards if normalization disabled
                         self._latest_batch_rewards = rewards
 
                         # Reconstruct batch from generated samples (with full sequences: prompt + generated code)
@@ -5609,31 +6538,7 @@ class RLAIFTrainer:
                             # Filter samples with reward >= threshold
                             filtered_indices = [i for i, r in enumerate(rewards_for_training) if r >= reward_threshold]
                             
-                            if len(filtered_indices) < original_batch_size:
-                                # Filter the batch to only include high-reward samples
-                                filtered_count = original_batch_size - len(filtered_indices)
-                                logger.debug(
-                                    f"Reward threshold filtering: {filtered_count}/{original_batch_size} samples filtered "
-                                    f"(threshold={reward_threshold:.3f}, kept={len(filtered_indices)})"
-                                )
-                                
-                                # Filter batch tensors
-                                if 'input_ids' in train_batch and len(filtered_indices) > 0:
-                                    train_batch['input_ids'] = train_batch['input_ids'][filtered_indices]
-                                    train_batch['attention_mask'] = train_batch['attention_mask'][filtered_indices]
-                                    if 'prompt' in train_batch:
-                                        train_batch['prompt'] = [train_batch['prompt'][i] for i in filtered_indices]
-                                
-                                # Filter rewards
-                                rewards_for_training = [rewards_for_training[i] for i in filtered_indices]
-                                
-                                # Track filtering stats
-                                if not hasattr(self, '_reward_filtering_stats'):
-                                    self._reward_filtering_stats = {'total_filtered': 0, 'total_samples': 0}
-                                self._reward_filtering_stats['total_filtered'] += filtered_count
-                                self._reward_filtering_stats['total_samples'] += original_batch_size
-                            
-                            # Skip training if all samples were filtered
+                            # Handle the "all filtered" case explicitly: skip the optimizer step
                             if len(filtered_indices) == 0:
                                 logger.debug(
                                     f"Skipping training batch: all {original_batch_size} samples filtered "
@@ -5645,6 +6550,32 @@ class RLAIFTrainer:
                                 micro_step_in_epoch += 1
                                 self._micro_step_in_epoch = int(micro_step_in_epoch)
                                 # Skip to next batch iteration
+                                continue
+                            
+                            # Otherwise: filter both train_batch and rewards_for_training consistently
+                            if len(filtered_indices) < original_batch_size:
+                                # Filter the batch to only include high-reward samples
+                                filtered_count = original_batch_size - len(filtered_indices)
+                                logger.debug(
+                                    f"Reward threshold filtering: {filtered_count}/{original_batch_size} samples filtered "
+                                    f"(threshold={reward_threshold:.3f}, kept={len(filtered_indices)})"
+                                )
+                                
+                                # Filter batch tensors unconditionally (we know filtered_indices is not empty)
+                                if 'input_ids' in train_batch:
+                                    train_batch['input_ids'] = train_batch['input_ids'][filtered_indices]
+                                    train_batch['attention_mask'] = train_batch['attention_mask'][filtered_indices]
+                                    if 'prompt' in train_batch:
+                                        train_batch['prompt'] = [train_batch['prompt'][i] for i in filtered_indices]
+                                
+                                # Filter rewards to match filtered tensors
+                                rewards_for_training = [rewards_for_training[i] for i in filtered_indices]
+                                
+                                # Track filtering stats
+                                if not hasattr(self, '_reward_filtering_stats'):
+                                    self._reward_filtering_stats = {'total_filtered': 0, 'total_samples': 0}
+                                self._reward_filtering_stats['total_filtered'] += filtered_count
+                                self._reward_filtering_stats['total_samples'] += original_batch_size
                                 continue
                         
                         # Proceed with training if we have samples after filtering
@@ -5671,13 +6602,17 @@ class RLAIFTrainer:
                             
                             # Extract and log per micro-batch metrics (for per-batch processing path)
                             policy_loss_val = float(loss_dict.get("policy_loss", 0.0).item()) if torch.is_tensor(loss_dict.get("policy_loss")) else float(loss_dict.get("policy_loss", 0.0))
-                            kl_term_pre_coeff_val = float(loss_dict.get("kl_term_pre_coefficient", 0.0).item()) if torch.is_tensor(loss_dict.get("kl_term_pre_coefficient")) else float(loss_dict.get("kl_term_pre_coefficient", 0.0))
+                            kl_divergence_val = float(loss_dict.get("kl_divergence", 0.0).item()) if torch.is_tensor(loss_dict.get("kl_divergence")) else float(loss_dict.get("kl_divergence", 0.0))
+                            
+                            # Update adaptive KL penalty based on observed KL divergence
+                            if kl_divergence_val is not None and not (np.isnan(kl_divergence_val) or np.isinf(kl_divergence_val)):
+                                self._update_adaptive_kl_penalty(kl_divergence_val)
                             combined_loss_val = float(loss_dict.get("loss", 0.0).item()) if torch.is_tensor(loss_dict.get("loss")) else float(loss_dict.get("loss", 0.0))
                             valid_token_count_val = int(loss_dict.get("valid_token_count", 0))
                             
                             # Track for epoch summary (average over micro-batches, not just optimizer steps)
                             epoch_micro_batch_metrics['policy_loss'].append(policy_loss_val)
-                            epoch_micro_batch_metrics['kl_term_pre_coefficient'].append(kl_term_pre_coeff_val)
+                            epoch_micro_batch_metrics['kl_divergence'].append(kl_divergence_val)
                             epoch_micro_batch_metrics['combined_loss'].append(combined_loss_val)
                             epoch_micro_batch_metrics['valid_token_count'].append(valid_token_count_val)
                             
@@ -5685,7 +6620,7 @@ class RLAIFTrainer:
                             logger.info(
                                 f"Micro-batch {micro_step_in_epoch}: "
                                 f"policy_loss={policy_loss_val:.4f}, "
-                                f"kl_term_pre_coeff={kl_term_pre_coeff_val:.4f}, "
+                                f"kl_divergence={kl_divergence_val:.4f}, "
                                 f"combined_loss={combined_loss_val:.4f}, "
                                 f"valid_tokens={valid_token_count_val}"
                             )
@@ -5763,15 +6698,102 @@ class RLAIFTrainer:
                                 self._epoch_grad_norms = []
                             self._epoch_grad_norms.append(float(grad_norm))
                             
+                            # Comprehensive gradient and optimizer debugging before step
+                            self._debug_gradients_and_optimizer(optimizer, scheduler, global_step)
+                            
                             # Capture parameter state before optimizer step to track changes
                             param_state_before = self._capture_parameter_state()
-                            optimizer.step()
-                            scheduler.step()
+                            
+                            # Sanity test: verify parameters change (run at step 1 or 2, or when LR > 0)
+                            should_run_sanity = (
+                                not hasattr(self, '_sanity_test_done') and
+                                global_step >= 1  # Run at step 1 or 2, not step 0
+                            )
+                            
+                            # Check if LR > 0 (gate on non-zero learning rate)
+                            if should_run_sanity:
+                                try:
+                                    if hasattr(self.scheduler, 'get_last_lr'):
+                                        current_lr = self.scheduler.get_last_lr()[0] if self.scheduler.get_last_lr() else 0.0
+                                    elif hasattr(self.scheduler, 'get_lr'):
+                                        current_lr = self.scheduler.get_lr()[0] if self.scheduler.get_lr() else 0.0
+                                    else:
+                                        current_lr = getattr(self.scheduler, 'last_lr', [0.0])[0] if hasattr(self.scheduler, 'last_lr') else 0.0
+                                    
+                                    if current_lr <= 0:
+                                        logger.debug(f"[Step {global_step}] Skipping sanity test: LR={current_lr:.2e} (will retry when LR > 0)")
+                                        should_run_sanity = False
+                                except Exception:
+                                    # If we can't get LR, proceed anyway (better to test than skip)
+                                    pass
+                            
+                            if should_run_sanity:
+                                logger.info(f"[Step {global_step}] Running sanity test to verify parameter updates...")
+                                # Temporarily capture state for sanity test
+                                sanity_state_before = {}
+                                for name, param in self.model.named_parameters():
+                                    if param.requires_grad and 'lora' in name.lower():
+                                        sanity_state_before[name] = param.data.clone().detach()
+                                
+                                self.optimizer.step()
+                                self.scheduler.step()
+                                
+                                # Log effective LR after scheduler step (this is the LR that was actually used)
+                                try:
+                                    if hasattr(self.scheduler, 'get_last_lr'):
+                                        lr_after = self.scheduler.get_last_lr()[0] if self.scheduler.get_last_lr() else 0.0
+                                    elif hasattr(self.scheduler, 'get_lr'):
+                                        lr_after = self.scheduler.get_lr()[0] if self.scheduler.get_lr() else 0.0
+                                    else:
+                                        lr_after = getattr(self.scheduler, 'last_lr', [0.0])[0] if hasattr(self.scheduler, 'last_lr') else 0.0
+                                    logger.info(f"[Step {global_step}] Effective LR (after step): {lr_after:.2e}")
+                                except Exception:
+                                    pass  # Don't fail on LR logging
+                                
+                                # Check if parameters changed
+                                max_change = 0.0
+                                changed_count = 0
+                                for name, param in self.model.named_parameters():
+                                    if param.requires_grad and 'lora' in name.lower() and name in sanity_state_before:
+                                        change = (param.data - sanity_state_before[name]).abs().max().item()
+                                        if change > max_change:
+                                            max_change = change
+                                        if change > 0:
+                                            changed_count += 1
+                                
+                                if max_change > 0:
+                                    logger.info(
+                                        f"[Step {global_step}] ✓ Sanity test PASSED: max_change={max_change:.2e}, "
+                                        f"{changed_count} LoRA params changed"
+                                    )
+                                else:
+                                    logger.error(
+                                        f"[Step {global_step}] ✗ Sanity test FAILED: No parameter changes! "
+                                        f"max_change={max_change:.2e}"
+                                    )
+                                
+                                self._sanity_test_done = True
+                            else:
+                                self.optimizer.step()
+                                self.scheduler.step()
+                                
+                                # Log effective LR after scheduler step (this is the LR that was actually used)
+                                try:
+                                    if hasattr(scheduler, 'get_last_lr'):
+                                        lr_after = scheduler.get_last_lr()[0] if scheduler.get_last_lr() else 0.0
+                                    elif hasattr(scheduler, 'get_lr'):
+                                        lr_after = scheduler.get_lr()[0] if scheduler.get_lr() else 0.0
+                                    else:
+                                        lr_after = getattr(scheduler, 'last_lr', [0.0])[0] if hasattr(scheduler, 'last_lr') else 0.0
+                                    if global_step <= 10 or global_step % 10 == 0:  # Log first 10 steps and then every 10
+                                        logger.info(f"[Step {global_step}] Effective LR (after step): {lr_after:.2e}")
+                                except Exception:
+                                    pass  # Don't fail on LR logging
                             # Capture parameter state after optimizer step and compute changes
                             param_state_after = self._capture_parameter_state()
                             param_changes = self._compute_parameter_changes(param_state_before, param_state_after)
                             epoch_param_changes.append(param_changes)
-                            optimizer.zero_grad(set_to_none=True)
+                            self.optimizer.zero_grad(set_to_none=True)
                             # Reset gradient accumulation memory tracking after zero_grad
                             # This marks the start of a new accumulation cycle
                             if torch.backends.mps.is_available():
@@ -6401,6 +7423,11 @@ class RLAIFTrainer:
                                 kl_penalty_val = _ls.get("kl_penalty")
                                 kl_penalty_val = float(kl_penalty_val) if kl_penalty_val is not None else 0.0
                                 self.writer.add_scalar("Batch/Functional/Loss_KL", kl_penalty_val, bs)
+                                
+                                # Log KL divergence separately (tokenwise categorical KL)
+                                kl_divergence_val = _ls.get("kl_divergence")
+                                kl_divergence_val = float(kl_divergence_val) if kl_divergence_val is not None else 0.0
+                                self.writer.add_scalar("Batch/Functional/KL_Divergence", kl_divergence_val, bs)
                             
                                 # Code diversity with batch
                                 self.writer.add_scalar("Batch/Functional/Diversity_Ratio", float(diversity_ratio), bs)
@@ -6531,22 +7558,97 @@ class RLAIFTrainer:
                         self._epoch_grad_norms = []
                     self._epoch_grad_norms.append(float(grad_norm))
                     
+                    # Comprehensive gradient and optimizer debugging before step
+                    self._debug_gradients_and_optimizer(optimizer, scheduler, global_step)
+                    
                     # Track parameter changes for epoch-end flush
                     param_state_before = self._capture_parameter_state()
                     if param_state_before:
                         logger.debug(f"Captured {len(param_state_before)} parameters before optimizer step")
-                    optimizer.step()
-                    scheduler.step()
+                    
+                    # Sanity test: verify parameters change (run at step 1 or 2, or when LR > 0)
+                    should_run_sanity = (
+                        not hasattr(self, '_sanity_test_done') and
+                        global_step >= 1  # Run at step 1 or 2, not step 0
+                    )
+                    
+                    # Check if LR > 0 (gate on non-zero learning rate)
+                    if should_run_sanity:
+                        try:
+                            if hasattr(scheduler, 'get_last_lr'):
+                                current_lr = scheduler.get_last_lr()[0] if scheduler.get_last_lr() else 0.0
+                            elif hasattr(scheduler, 'get_lr'):
+                                current_lr = scheduler.get_lr()[0] if scheduler.get_lr() else 0.0
+                            else:
+                                current_lr = getattr(scheduler, 'last_lr', [0.0])[0] if hasattr(scheduler, 'last_lr') else 0.0
+                            
+                            if current_lr <= 0:
+                                logger.debug(f"[Step {global_step}] Skipping sanity test: LR={current_lr:.2e} (will retry when LR > 0)")
+                                should_run_sanity = False
+                        except Exception:
+                            # If we can't get LR, proceed anyway (better to test than skip)
+                            pass
+                    
+                    if should_run_sanity:
+                        logger.info(f"[Step {global_step}] Running sanity test to verify parameter updates...")
+                        sanity_state_before = {}
+                        for name, param in self.model.named_parameters():
+                            if param.requires_grad and 'lora' in name.lower():
+                                sanity_state_before[name] = param.data.clone().detach()
+                        
+                        self.optimizer.step()
+                        self.scheduler.step()
+                        
+                        max_change = 0.0
+                        changed_count = 0
+                        for name, param in self.model.named_parameters():
+                            if param.requires_grad and 'lora' in name.lower() and name in sanity_state_before:
+                                change = (param.data - sanity_state_before[name]).abs().max().item()
+                                if change > max_change:
+                                    max_change = change
+                                if change > 0:
+                                    changed_count += 1
+                        
+                        if max_change > 0:
+                            logger.info(
+                                f"[Step {global_step}] ✓ Sanity test PASSED: max_change={max_change:.2e}, "
+                                f"{changed_count} LoRA params changed"
+                            )
+                        else:
+                            logger.error(
+                                f"[Step {global_step}] ✗ Sanity test FAILED: No parameter changes! "
+                                f"max_change={max_change:.2e}"
+                            )
+                        
+                        self._sanity_test_done = True
+                    else:
+                        self.optimizer.step()
+                        self.scheduler.step()
+                        
+                        # Log effective LR after scheduler step (this is the LR that was actually used)
+                        try:
+                            if hasattr(self.scheduler, 'get_last_lr'):
+                                lr_after = self.scheduler.get_last_lr()[0] if self.scheduler.get_last_lr() else 0.0
+                            elif hasattr(self.scheduler, 'get_lr'):
+                                lr_after = self.scheduler.get_lr()[0] if self.scheduler.get_lr() else 0.0
+                            else:
+                                lr_after = getattr(self.scheduler, 'last_lr', [0.0])[0] if hasattr(self.scheduler, 'last_lr') else 0.0
+                            if global_step <= 10 or global_step % 10 == 0:  # Log first 10 steps and then every 10
+                                logger.info(f"[Step {global_step}] Effective LR (after step): {lr_after:.2e}")
+                        except Exception:
+                            pass  # Don't fail on LR logging
                     param_state_after = self._capture_parameter_state()
                     if param_state_after:
                         logger.debug(f"Captured {len(param_state_after)} parameters after optimizer step")
                     param_changes = self._compute_parameter_changes(param_state_before, param_state_after)
-                    if param_changes.get('mean_abs_change', 0.0) > 0:
+                    # Always append parameter changes (even if zero) to track optimizer steps
+                    # This ensures num_updates accurately reflects the number of optimizer steps
                         epoch_param_changes.append(param_changes)
+                    if param_changes.get('mean_abs_change', 0.0) > 0:
                         logger.info(f"Parameter changes recorded: mean_abs={param_changes.get('mean_abs_change', 0.0):.2e}, max_abs={param_changes.get('max_abs_change', 0.0):.2e}")
                     else:
-                        logger.warning(f"No parameter changes detected after optimizer step (mean_abs={param_changes.get('mean_abs_change', 0.0):.2e})")
-                    optimizer.zero_grad(set_to_none=True)
+                        logger.warning(f"No parameter changes detected after optimizer step (mean_abs={param_changes.get('mean_abs_change', 0.0):.2e}) - this may indicate a problem")
+                    self.optimizer.zero_grad(set_to_none=True)
                     global_step += 1
                 else:
                     logger.warning(f"No gradients to flush at epoch end: micro_step_in_epoch={micro_step_in_epoch}")
@@ -6611,13 +7713,13 @@ class RLAIFTrainer:
             if epoch_micro_batch_metrics['combined_loss']:
                 avg_epoch_loss = float(np.mean(epoch_micro_batch_metrics['combined_loss']))
                 avg_epoch_policy_loss = float(np.mean(epoch_micro_batch_metrics['policy_loss']))
-                avg_epoch_kl_term_pre_coeff = float(np.mean(epoch_micro_batch_metrics['kl_term_pre_coefficient']))
+                avg_epoch_kl_divergence = float(np.mean(epoch_micro_batch_metrics['kl_divergence']))
                 total_valid_tokens = int(sum(epoch_micro_batch_metrics['valid_token_count']))
             else:
                 # Fallback to optimizer step averages if no micro-batch metrics
                 avg_epoch_loss = float(np.mean(epoch_losses)) if epoch_losses else 0.0
                 avg_epoch_policy_loss = 0.0
-                avg_epoch_kl_term_pre_coeff = 0.0
+                avg_epoch_kl_divergence = 0.0
                 total_valid_tokens = 0
             
             if np.isnan(avg_epoch_loss):
@@ -6986,7 +8088,7 @@ class RLAIFTrainer:
                 trainable_str = f"{trainable_params:,}"
             
             # Compute aggregate parameter change statistics for this epoch
-            epoch_param_summary = {}
+            # Always create a summary dict, even if no steps were recorded (to show num_updates=0)
             if epoch_param_changes:
                 # Aggregate statistics across all optimizer steps in this epoch
                 all_mean_abs_changes = [pc.get('mean_abs_change', 0.0) for pc in epoch_param_changes if pc.get('mean_abs_change', 0.0) > 0]
@@ -7000,6 +8102,15 @@ class RLAIFTrainer:
                     'max_abs_change': float(np.max(all_max_abs_changes)) if all_max_abs_changes else 0.0,
                     'mean_relative_change': float(np.mean(all_relative_changes)) if all_relative_changes else 0.0,
                     'total_norm_change': float(np.sum(all_norm_changes)) if all_norm_changes else 0.0,
+                }
+            else:
+                # No optimizer steps recorded - create empty summary to show num_updates=0
+                epoch_param_summary = {
+                    'num_updates': 0,
+                    'mean_abs_change': 0.0,
+                    'max_abs_change': 0.0,
+                    'mean_relative_change': 0.0,
+                    'total_norm_change': 0.0,
                 }
                 
                 # Get most changed layers (aggregate across all steps)
@@ -7044,7 +8155,7 @@ class RLAIFTrainer:
                 f"  Best-of-N Reward: {avg_epoch_best_reward_display:.4f} (avg of per-prompt max; N={self.config.num_samples_per_prompt})\n"
                 f"  Average Loss: {avg_epoch_loss:.4f} (avg over {len(epoch_micro_batch_metrics['combined_loss'])} micro-batches)\n"
                 f"  Average Policy Loss: {avg_epoch_policy_loss:.4f}\n"
-                f"  Average KL Term (pre-coeff): {avg_epoch_kl_term_pre_coeff:.4f}\n"
+                f"  Average KL Divergence: {avg_epoch_kl_divergence:.4f}\n"
                 f"  Total Valid Tokens: {total_valid_tokens:,}\n"
                 f"  Total Samples: {len(epoch_rewards)}\n"
                 f"  Trainable Parameters: {trainable_str} ({trainable_percentage:.2f}% of {total_params:,} total)\n"
@@ -7881,8 +8992,8 @@ class RLAIFTrainer:
         
         # Hard caps to prevent dangerous values and over-tightening
         # CRITICAL: With only 1-2 optimizer steps per epoch, controller must not keep shrinking signal
-        TEMP_MAX = 0.9  # Maximum temperature for code generation (hard bound)
-        TEMP_MIN = 0.7  # Minimum temperature (floor 0.7 for code tasks - 0.53 is too deterministic)
+        TEMP_MAX = 0.8  # Maximum temperature for code generation (hard bound, reduced from 0.9)
+        TEMP_MIN = 0.3  # Minimum temperature (lowered from 0.4 to allow proper reduction; was 0.7 which caused inversion bug)
         REWARD_WEIGHT_MAX = 1.5  # Maximum reward weight
         REWARD_WEIGHT_MIN = 0.8  # Minimum reward weight (floor 0.8-1.0 to maintain learning signal)
         KL_PENALTY_MIN = 0.10  # Minimum KL penalty to maintain constraint
@@ -7902,16 +9013,22 @@ class RLAIFTrainer:
             kl_increase = 0.05  # 5% increase
         
         # CRITICAL: DECREASE temperature (reduce variance and errors)
-        # Temperature down by 5-10% with floor ~0.7, hard cap at 0.9
-        current_temp = self.config.generation_temperature
-        # Ensure current temp is clamped to 0.9 (in case it was set higher elsewhere)
-        current_temp = min(current_temp, TEMP_MAX)
-        new_temp = max(current_temp * (1.0 - temp_reduction), TEMP_MIN)
-        new_temp = min(new_temp, TEMP_MAX)  # Apply hard cap at 0.9
-        if abs(new_temp - current_temp) > 1e-6:
+        # Temperature down by 5-10% with floor 0.3, hard cap at 0.8
+        # Option A: Never increase temperature in a "reduce" path
+        current_temp = float(self.config.generation_temperature)
+        current_temp = min(current_temp, TEMP_MAX)  # Clamp to max first
+        
+        proposed = current_temp * (1.0 - temp_reduction)
+        new_temp = max(proposed, TEMP_MIN)
+        new_temp = min(new_temp, TEMP_MAX)  # Apply hard cap at 0.8
+        
+        # Do not apply if it doesn't actually reduce (prevents inversion bug)
+        if new_temp < current_temp - 1e-6:
             adjustments['generation_temperature'] = (current_temp, new_temp)
             self.config.generation_temperature = new_temp
             logger.warning(f"⚠️  Reducing temperature: {current_temp:.4f} → {new_temp:.4f} (reduce variance)")
+        else:
+            logger.debug(f"Skipping temperature reduction: would not actually reduce (current={current_temp:.4f}, proposed={new_temp:.4f})")
         
         # CRITICAL: INCREASE KL penalty (tighten constraint, prevent drift)
         # KL up by 5-10% (ceiling at KL_PENALTY_MAX)
@@ -7946,7 +9063,7 @@ class RLAIFTrainer:
         # else: reward_weight unchanged
         
         # CRITICAL: Enforce hard bounds on all parameters to prevent over-tightening
-        # Clamp temperature to [0.7, 0.9]
+        # Clamp temperature to [0.3, 0.8]
         if self.config.generation_temperature < TEMP_MIN:
             logger.warning(f"⚠️  Temperature below floor ({self.config.generation_temperature:.4f} < {TEMP_MIN}), clamping to {TEMP_MIN}")
             self.config.generation_temperature = TEMP_MIN
@@ -8242,27 +9359,58 @@ class RLAIFTrainer:
         
         # Issue 3: High reward variance (inconsistent training)
         # CRITICAL: When variance is high, we should DECREASE temperature, not increase it
-        if reward_variance > 0.08:  # Threshold for high variance
+        # Check both conditions: (best_of_n - mean) >= 0.25 OR reward_std >= 0.30
+        best_of_n = None
+        if len(self.training_metrics.get('best_reward_by_epoch', [])) > 0:
+            best_of_n = self.training_metrics['best_reward_by_epoch'][-1]
+        
+        reward_std = np.sqrt(reward_variance) if reward_variance > 0 else 0.0
+        
+        high_variance_condition = False
+        if best_of_n is not None and (best_of_n - avg_reward) >= 0.25:
+            high_variance_condition = True
+            issues.append(f"High sample variance (Best-of-N - Mean >= 0.25: {best_of_n:.3f} - {avg_reward:.3f} = {best_of_n - avg_reward:.3f})")
+        elif reward_std >= 0.30:
+            high_variance_condition = True
+            issues.append(f"High reward variance (std >= 0.30: {reward_std:.3f})")
+        elif reward_variance > 0.08:  # Legacy threshold for backward compatibility
+            high_variance_condition = True
             issues.append("High reward variance (inconsistent)")
-            # Increase reward threshold to filter more low-quality samples
+        
+        if high_variance_condition:
+            # Only increase reward threshold if mean reward is safely above baseline
+            # Don't raise it blindly when mean is near baseline - this reduces usable signal
             current_threshold = self.config.reward_threshold or 0.0
+            baseline = self.baseline_reward if self.baseline_reward is not None else 0.0
+            # Only raise threshold if mean reward is at least 0.05 above baseline
+            if avg_reward > (baseline + 0.05):
             new_threshold = min(current_threshold + 0.02, 0.3)  # Increase by 0.02, cap at 0.3
             if new_threshold != current_threshold:
                 adjustments['reward_threshold'] = (current_threshold, new_threshold)
                 self.config.reward_threshold = new_threshold
+                    logger.info(f"⚠️  Increasing reward threshold: {current_threshold:.4f} → {new_threshold:.4f} (mean reward {avg_reward:.4f} safely above baseline {baseline:.4f})")
+            else:
+                logger.debug(f"Skipping reward threshold increase: mean reward {avg_reward:.4f} too close to baseline {baseline:.4f}")
             
             # CRITICAL: DECREASE temperature when variance is high (reduce noise)
-            TEMP_MAX = 0.9  # Hard cap for code generation
-            TEMP_MIN = 0.7  # Floor ~0.7 for code tasks
-            current_temp = self.config.generation_temperature
-            # Ensure current temp is clamped to 0.9
-            current_temp = min(current_temp, TEMP_MAX)
-            new_temp = max(current_temp * 0.95, TEMP_MIN)  # Reduce by 5%
-            new_temp = min(new_temp, TEMP_MAX)  # Apply hard cap at 0.9
-            if abs(new_temp - current_temp) > 1e-6:
+            # Rule: temp = max(temp - 0.1, 0.3), clamp to [0.3, 0.8]
+            # Option A: Never increase temperature in a "reduce" path
+            TEMP_MAX = 0.8  # Hard cap for code generation (reduced from 0.9)
+            TEMP_MIN = 0.3  # Floor 0.3 (lowered to allow proper reduction; was 0.7 which caused inversion bug)
+            current_temp = float(self.config.generation_temperature)
+            current_temp = min(current_temp, TEMP_MAX)  # Clamp to max first
+            
+            proposed = current_temp - 0.1
+            new_temp = max(proposed, TEMP_MIN)
+            new_temp = min(new_temp, TEMP_MAX)  # Apply hard cap at 0.8
+            
+            # Do not apply if it doesn't actually reduce (prevents inversion bug)
+            if new_temp < current_temp - 1e-6:
                 adjustments['generation_temperature'] = (current_temp, new_temp)
                 self.config.generation_temperature = new_temp
                 logger.warning(f"⚠️  Reducing temperature due to high variance: {current_temp:.4f} → {new_temp:.4f}")
+            else:
+                logger.debug(f"Skipping temperature reduction: would not actually reduce (current={current_temp:.4f}, proposed={new_temp:.4f})")
         
         # Issue 4: Loss is decreasing well but reward not improving
         # CRITICAL: Do NOT increase temperature here - high variance is already a problem
@@ -9507,6 +10655,9 @@ def load_config(config_path: str) -> Tuple[RLAIFConfig, dict]:
             return value.lower() in ('true', '1', 'yes', 'on')
         return bool(value)
     
+    def to_str(value, default):
+        return str(value) if value is not None else default
+    
     rlaif_config = RLAIFConfig(
         base_model=model_cfg.get('base_model', 'Qwen/Qwen2.5-Coder-3B-Instruct'),
         teacher_provider=teacher_cfg.get('provider', 'openai'),
@@ -9531,10 +10682,15 @@ def load_config(config_path: str) -> Tuple[RLAIFConfig, dict]:
         optimizer=str(training_cfg.get('optimizer', 'adamw') or 'adamw'),
         reward_weight=to_float(rlaif_cfg.get('reward_weight'), 1.0),
         kl_penalty=to_float(rlaif_cfg.get('kl_penalty'), 0.1),
+        adaptive_kl_enabled=to_bool(rlaif_cfg.get('adaptive_kl_enabled'), False),
+        target_kl=to_float(rlaif_cfg.get('target_kl'), 0.075),
+        kl_gain=to_float(rlaif_cfg.get('kl_gain'), 0.1),
         reward_threshold=to_float(rlaif_cfg.get('reward_threshold'), None) if rlaif_cfg.get('reward_threshold') is not None else None,
         beta=to_float(rlaif_cfg.get('beta'), 0.1),
         num_samples_per_prompt=to_int(rlaif_cfg.get('num_samples_per_prompt'), 4),
+        top_samples_per_prompt=to_int(rlaif_cfg.get('top_samples_per_prompt'), 1),
         use_advantage_normalization=to_bool(rlaif_cfg.get('use_advantage_normalization'), True),
+        advantage_baseline_type=to_str(rlaif_cfg.get('advantage_baseline_type'), 'per_prompt'),
         advantage_baseline_ema_alpha=to_float(rlaif_cfg.get('advantage_baseline_ema_alpha'), 0.9),
         use_tiered_scoring=to_bool(rlaif_cfg.get('use_tiered_scoring'), True),
         heuristic_score_threshold=to_float(rlaif_cfg.get('heuristic_score_threshold'), 0.3),
@@ -9542,7 +10698,7 @@ def load_config(config_path: str) -> Tuple[RLAIFConfig, dict]:
         prompt_context_chars=to_int(rlaif_cfg.get('prompt_context_chars'), 200),
         move_rubric_to_system_prompt=to_bool(rlaif_cfg.get('move_rubric_to_system_prompt'), True),
         use_frozen_reference_for_kl=to_bool(rlaif_cfg.get('use_frozen_reference_for_kl'), True),
-        generation_temperature=min(to_float(rlaif_cfg.get('generation_temperature'), 0.8), 0.9),  # Clamp to ≤ 0.9 for code tasks
+        generation_temperature=min(to_float(rlaif_cfg.get('generation_temperature'), 0.8), 0.8),  # Clamp to ≤ 0.8 for code tasks
         curriculum_learning=to_bool(rlaif_cfg.get('curriculum_learning'), False),
         curriculum_mix_difficulty=to_bool(rlaif_cfg.get('curriculum_mix_difficulty'), True),
         curriculum_num_buckets=to_int(rlaif_cfg.get('curriculum_num_buckets'), 8),
