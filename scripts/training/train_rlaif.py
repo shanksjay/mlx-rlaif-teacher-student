@@ -356,6 +356,8 @@ class RLAIFConfig:
     use_advantage_normalization: bool = True  # Enable baseline subtraction + advantage whitening to reduce gradient variance
     advantage_baseline_type: str = "per_prompt"  # Baseline type: 'per_prompt' (group by prompt) or 'difficulty_bucket' (group by rubric_demand buckets)
     advantage_baseline_ema_alpha: float = 0.9  # EMA decay factor for baseline (0.9 = 90% old, 10% new)
+    reward_temperature: float = 0.1  # Temperature for reward stretching (lower = more emphasis on best response)
+    use_reward_stretching: bool = True  # Use temperature-scaled softmax to stretch reward signal for better gradient signal
     # Teacher token optimization
     use_tiered_scoring: bool = True  # Use heuristic filter before teacher scoring to reduce API calls
     heuristic_score_threshold: float = 0.3  # Only send samples above this heuristic score to teacher
@@ -412,10 +414,11 @@ class RLAIFConfig:
     reward_bonuses: bool = False  # Enable reward bonuses for specific improvements
     use_lora: bool = False  # Use LoRA for efficient fine-tuning
     use_qlora: bool = False  # Use QLoRA (4-bit + LoRA) for maximum efficiency
-    lora_r: int = 16  # LoRA rank (higher = more parameters, better quality)
-    lora_alpha: int = 32  # LoRA alpha (scaling factor, typically 2x rank)
+    lora_r: int = 32  # LoRA rank (higher = more parameters, better quality)
+    lora_alpha: int = 64  # LoRA alpha (scaling factor, typically 2x rank)
     lora_dropout: float = 0.05  # LoRA dropout
     lora_target_modules: Optional[List[str]] = None  # Target modules for LoRA (None = auto-detect)
+    use_rslora: bool = True  # Use Rank-Stabilized LoRA for faster convergence
     save_mlx_format: bool = True
     mlx_quantization: Optional[str] = None
     upload_to_hub: bool = False
@@ -1582,7 +1585,7 @@ class RLAIFTrainer:
                 setattr(self, "_last_cache_clear_batch", batch_idx)
                 if self.writer:
                     bs = int(getattr(self, "_batch_step", 0))
-                    self.writer.add_scalar("Batch/Metal/Memory/CacheClear_Event", 1.0, bs)
+                    # CacheClear_Event removed - not in requested metrics
             
             # MLX cache clearing logic:
             # - If MLX cache limit is set, the limit should handle eviction automatically.
@@ -1619,7 +1622,7 @@ class RLAIFTrainer:
                         setattr(self, "_last_mlx_cache_clear_batch", batch_idx)
                         if self.writer:
                             bs = int(getattr(self, "_batch_step", 0))
-                            self.writer.add_scalar("Batch/Metal/Memory/MLX_CacheClear_Event", 1.0, bs)
+                            # MLX_CacheClear_Event removed - not in requested metrics
                 except Exception:
                     pass
 
@@ -2045,19 +2048,11 @@ class RLAIFTrainer:
             else:
                 logger.info(base)
 
-            # Optional: log a small set of health flags to TensorBoard for quick filtering
+            # Optional: log health flags to TensorBoard (only requested metrics)
             if self.writer:
                 bs = int(getattr(self, "_batch_step", 0))
+                # Only log Gen_BottleneckPct (requested metric)
                 self.writer.add_scalar("Health/Gen_BottleneckPct", float(gen_pct), bs)
-                self.writer.add_scalar("Health/Score_BottleneckPct", float(score_pct), bs)
-                self.writer.add_scalar("Health/Train_BottleneckPct", float(train_pct), bs)
-                self.writer.add_scalar("Health/DiversityRatio", float(diversity_ratio), bs)
-                self.writer.add_scalar("Health/Reward_EMA", float(ema_reward), bs)
-                if ema_gain_from_baseline is not None:
-                    self.writer.add_scalar("Health/Reward_EMA_GainFromBaseline", float(ema_gain_from_baseline), bs)
-                self.writer.add_scalar("Health/Metal_MPS_Fragmentation_GB", float(frag_mps_gb), bs)
-                self.writer.add_scalar("Health/Metal_MLX_Cache_GB", float(frag_mlx_cache_gb), bs)
-                self.writer.add_scalar("Health/Metal_GC_Triggered", 1.0 if frag_triggered_gc else 0.0, bs)
         except Exception:
             # Never fail training due to health checks
             return
@@ -2152,6 +2147,7 @@ class RLAIFTrainer:
         self._rolling_baseline_samples = []  # Accumulate early epoch rewards for rolling baseline
         self._observed_kl_ema = None  # EMA of observed KL divergence for adaptive KL controller
         self._kl_penalty_initial = None  # Store initial kl_penalty value
+        self._curriculum_gates_cleared = []  # Track which curriculum gates have been cleared (0.45, 0.55, 0.65)
         self._batch_step = 0  # monotonic batch counter for continuous TensorBoard time series
         self._prev_frag_metrics = {}
         self._last_fragment_gc_batch = -10**9
@@ -4143,6 +4139,7 @@ class RLAIFTrainer:
                 lora_dropout=config.lora_dropout,
                 bias="none",
                 task_type=TaskType.CAUSAL_LM,
+                use_rslora=getattr(config, 'use_rslora', True),  # Use Rank-Stabilized LoRA for faster convergence
             )
             
             # Apply LoRA to model
@@ -4309,11 +4306,70 @@ class RLAIFTrainer:
         dt = time.time() - t0
         logger.info(f"LoRA→MLX sync complete at global_step={global_step} (dt={dt:.1f}s, quant={quant})")
     
+    def _should_enable_curriculum_mixing(self) -> bool:
+        """Check if curriculum mixing should be enabled based on reward gates.
+        
+        Gates: 0.45, 0.55, 0.65
+        Mixing is only enabled if the moving average reward has cleared ALL gates.
+        This ensures we maintain "easy → hard" ordering until the model is ready.
+        
+        Returns:
+            True if mixing should be enabled, False otherwise
+        """
+        if not self.config.curriculum_learning:
+            return False
+        
+        # Define curriculum gates (must clear each gate before enabling mixing)
+        curriculum_gates = [0.45, 0.55, 0.65]
+        
+        # Get current reward EMA
+        current_ema = self._reward_ema
+        if current_ema is None:
+            # No reward data yet, don't enable mixing
+            logger.info(
+                "Curriculum: No reward EMA yet. Using strict easy → hard ordering (no mixing)."
+            )
+            return False
+        
+        current_ema = float(current_ema)
+        
+        # Check which gates have been cleared
+        gates_cleared = [gate for gate in curriculum_gates if current_ema >= gate]
+        
+        # Only enable mixing if ALL gates are cleared
+        all_gates_cleared = len(gates_cleared) == len(curriculum_gates)
+        
+        # Track which gates are cleared (for logging)
+        if gates_cleared != self._curriculum_gates_cleared:
+            self._curriculum_gates_cleared = gates_cleared
+            if gates_cleared:
+                remaining = [g for g in curriculum_gates if g not in gates_cleared]
+                if remaining:
+                    logger.info(
+                        f"🎯 Curriculum progress: Reward EMA {current_ema:.3f} has cleared gates: {gates_cleared}. "
+                        f"Remaining gates: {remaining}. Still using easy → hard ordering (no mixing)."
+                    )
+                else:
+                    logger.info(
+                        f"✅ Curriculum: All gates cleared! Reward EMA {current_ema:.3f} >= {max(curriculum_gates):.2f}. "
+                        f"Mixing enabled for next epoch."
+                    )
+            else:
+                logger.info(
+                    f"Curriculum: Reward EMA {current_ema:.3f} has not cleared any gates yet. "
+                    f"Using strict easy → hard ordering (no mixing)."
+                )
+        
+        return all_gates_cleared
+    
     def _apply_curriculum_learning(self, dataset: CodeDataset) -> CodeDataset:
         """Apply curriculum learning: sort prompts by objective difficulty (rubric_demand)
         
         Uses objective difficulty metrics (rubric_demand) instead of prompt length
         to ensure proper curriculum progression based on actual complexity.
+        
+        Always sorts easy → hard, regardless of mixing settings. Mixing is controlled
+        separately by the sampler.
         """
         # Compute objective difficulty for each prompt
         prompt_difficulties = []
@@ -4501,6 +4557,44 @@ class RLAIFTrainer:
                 f"(factor={update_factor:.4f})"
             )
     
+    def _update_kl_penalty_for_reward(self, current_avg_reward: float) -> None:
+        """Relax KL penalty when rewards are not growing to allow more exploration.
+        
+        If reward is below threshold (default 0.5), reduce KL penalty to allow the model
+        to explore more freely. This helps when the model is stuck in a local optimum
+        due to overly restrictive KL constraints.
+        
+        Args:
+            current_avg_reward: Current average reward from training step
+        """
+        if not getattr(self.config, 'use_reward_based_kl_relaxation', True):
+            return
+        
+        # Get threshold from config (default 0.5)
+        reward_threshold = getattr(self.config, 'kl_relaxation_reward_threshold', 0.5)
+        decay_factor = getattr(self.config, 'kl_relaxation_decay_factor', 0.95)
+        min_kl_penalty = getattr(self.config, 'kl_relaxation_min_penalty', 0.01)
+        
+        # Store initial kl_penalty on first call
+        if self._kl_penalty_initial is None:
+            self._kl_penalty_initial = self.config.kl_penalty
+        
+        # If reward is below threshold, decay KL penalty to allow exploration
+        if current_avg_reward < reward_threshold:
+            old_kl_penalty = self.config.kl_penalty
+            new_kl_penalty = max(min_kl_penalty, old_kl_penalty * decay_factor)
+            
+            # Update config
+            self.config.kl_penalty = new_kl_penalty
+            
+            # Log update (only if significant change to avoid log spam)
+            if abs(new_kl_penalty - old_kl_penalty) > 0.001:
+                logger.info(
+                    f"KL Relaxation: reward={current_avg_reward:.3f} < {reward_threshold:.3f}, "
+                    f"kl_penalty {old_kl_penalty:.4f} -> {new_kl_penalty:.4f} "
+                    f"(decay={decay_factor:.2f}, allowing more exploration)"
+                )
+    
     def _get_difficulty_bucket(self, rubric_demand: float) -> str:
         """Get difficulty bucket string for a given rubric_demand value.
         
@@ -4512,6 +4606,100 @@ class RLAIFTrainer:
             return "medium"
         else:
             return "high"
+    
+    def _get_accelerated_reward(self, scores: List[float], temperature: float = 0.1) -> torch.Tensor:
+        """
+        Stretches the reward difference to make the gradient signal stronger.
+        
+        Applies temperature-scaled softmax to emphasize the 'best' response.
+        When rewards are clustered (e.g., between 0.4 and 0.5), this makes
+        the differences more pronounced for better learning signal.
+        
+        Args:
+            scores: List of reward scores for samples from the same prompt
+            temperature: Temperature parameter (lower = more emphasis on best, default 0.1)
+        
+        Returns:
+            Tensor of stretched reward probabilities (sums to 1.0)
+        """
+        if not scores or len(scores) == 0:
+            return torch.tensor([])
+        scores_tensor = torch.tensor(scores, dtype=torch.float32)
+        # Applying temperature-scaled softmax emphasizes the 'best' response
+        probs = torch.softmax(scores_tensor / temperature, dim=0)
+        return probs
+    
+    def _stretch_rewards_per_prompt(
+        self,
+        samples: List[Dict],
+        rewards: List[float],
+        temperature: Optional[float] = None
+    ) -> List[float]:
+        """
+        Apply reward stretching per prompt group using temperature-scaled softmax.
+        
+        This stretches the reward signal within each prompt's samples to make
+        the gradient signal stronger when rewards are clustered.
+        
+        Args:
+            samples: List of sample dicts, each should have a 'prompt' key
+            rewards: List of rewards corresponding to samples
+            temperature: Temperature for stretching (None = use config default)
+        
+        Returns:
+            List of stretched rewards (same length as input, but differences are amplified)
+        """
+        if not getattr(self.config, 'use_reward_stretching', True):
+            return rewards
+        
+        if not samples or not rewards or len(samples) != len(rewards):
+            return rewards
+        
+        if temperature is None:
+            temperature = getattr(self.config, 'reward_temperature', 0.1)
+        
+        # Group samples by prompt
+        prompt_to_indices: Dict[str, List[int]] = {}
+        for idx, sample in enumerate(samples):
+            prompt = sample.get('prompt', '')
+            if prompt not in prompt_to_indices:
+                prompt_to_indices[prompt] = []
+            prompt_to_indices[prompt].append(idx)
+        
+        # Stretch rewards per prompt group
+        stretched_rewards = list(rewards)  # Start with original rewards
+        
+        for prompt, indices in prompt_to_indices.items():
+            if len(indices) <= 1:
+                # No stretching needed for single sample
+                continue
+            
+            # Get rewards for this prompt group
+            prompt_rewards = [rewards[idx] for idx in indices]
+            
+            # Apply temperature-scaled softmax to get stretched probabilities
+            stretched_probs = self._get_accelerated_reward(prompt_rewards, temperature)
+            
+            # Convert probabilities back to reward scale by preserving relative ordering
+            # but amplifying differences. We'll use the probabilities as weights
+            # and scale them to maintain the original reward range.
+            if len(stretched_probs) > 0:
+                # Option 1: Use probabilities directly (they sum to 1.0)
+                # Option 2: Scale probabilities to original reward range
+                # We'll use Option 2 to preserve reward scale while amplifying differences
+                min_reward = min(prompt_rewards)
+                max_reward = max(prompt_rewards)
+                reward_range = max_reward - min_reward if max_reward > min_reward else 1.0
+                
+                # Scale probabilities to reward range and shift to original scale
+                stretched_values = (stretched_probs * reward_range + min_reward).tolist()
+                
+                # Update stretched rewards for this prompt group
+                for i, idx in enumerate(indices):
+                    if i < len(stretched_values):
+                        stretched_rewards[idx] = float(stretched_values[i])
+        
+        return stretched_rewards
     
     def _compute_per_prompt_advantages(
         self, 
@@ -4603,6 +4791,23 @@ class RLAIFTrainer:
                 else:
                     # Use mean as baseline (standard approach)
                     prompt_baselines[prompt] = float(np.mean(reward_values))
+                
+                # Debug: Log if all rewards for a prompt are the same (causes zero advantages)
+                if len(reward_values) > 1:
+                    reward_std = float(np.std(reward_values))
+                    if reward_std < 1e-6:
+                        logger.warning(
+                            f"All rewards for prompt are identical (std={reward_std:.2e}): "
+                            f"rewards={reward_values[:3]}{'...' if len(reward_values) > 3 else ''}, "
+                            f"baseline={prompt_baselines[prompt]:.4f}. "
+                            f"This will result in zero advantages for this prompt."
+                        )
+                elif len(reward_values) == 1:
+                    logger.debug(
+                        f"Only 1 sample per prompt after filtering: reward={reward_values[0]:.4f}, "
+                        f"baseline={prompt_baselines[prompt]:.4f}. "
+                        f"Advantage will be zero (reward - baseline = {reward_values[0]:.4f} - {prompt_baselines[prompt]:.4f} = 0)."
+                    )
             
             # Compute advantages: A_i = r_i - baseline(prompt_i)
             advantages = list(rewards)  # Start with original rewards
@@ -4612,6 +4817,109 @@ class RLAIFTrainer:
                     advantages[idx] = reward - baseline
             
             return advantages
+    
+    def _log_reward_and_advantage_stats(
+        self,
+        raw_rewards: List[float],
+        advantages: List[float],
+        step: int,
+        samples: Optional[List[Dict]] = None
+    ) -> None:
+        """Log comprehensive reward and advantage statistics for debugging and monitoring
+        
+        Logs:
+        - Raw reward distribution (before normalization)
+        - Advantage mean/std per batch
+        - Correlation between reward and logprob improvements
+        - Policy gradient statistics
+        
+        Args:
+            raw_rewards: Raw rewards before any normalization
+            advantages: Final advantages after normalization
+            step: Current training step
+            samples: Optional sample dicts for additional context
+        """
+        if not raw_rewards or not advantages or len(raw_rewards) != len(advantages):
+            return
+        
+        # Only log at configured intervals to reduce noise
+        logging_steps = getattr(self.config, 'logging_steps', 10)
+        if step > 0 and step % logging_steps != 0:
+            # Still log to TensorBoard every step, but only log to console at intervals
+            log_to_console = False
+        else:
+            log_to_console = True
+        
+        import numpy as np
+        
+        # 1. Raw reward distribution before normalization
+        rewards_array = np.array(raw_rewards, dtype=np.float32)
+        reward_mean = float(np.mean(rewards_array))
+        reward_std = float(np.std(rewards_array))
+        reward_min = float(np.min(rewards_array))
+        reward_max = float(np.max(rewards_array))
+        reward_median = float(np.median(rewards_array))
+        reward_q25 = float(np.percentile(rewards_array, 25))
+        reward_q75 = float(np.percentile(rewards_array, 75))
+        
+        if log_to_console:
+            logger.info(
+                f"[Step {step}] Raw Reward Distribution: "
+                f"mean={reward_mean:.4f}, std={reward_std:.4f}, "
+                f"min={reward_min:.4f}, max={reward_max:.4f}, "
+                f"median={reward_median:.4f}, Q25={reward_q25:.4f}, Q75={reward_q75:.4f}"
+            )
+        
+        # 2. Advantage mean/std per batch
+        adv_array = np.array(advantages, dtype=np.float32)
+        adv_mean = float(np.mean(adv_array))
+        adv_std = float(np.std(adv_array))
+        adv_min = float(np.min(adv_array))
+        adv_max = float(np.max(adv_array))
+        adv_median = float(np.median(adv_array))
+        
+        if log_to_console:
+            logger.info(
+                f"[Step {step}] Advantage Stats: "
+                f"mean={adv_mean:.4f}, std={adv_std:.4f}, "
+                f"min={adv_min:.4f}, max={adv_max:.4f}, median={adv_median:.4f}"
+            )
+        
+        # 3. Correlation between raw rewards and advantages
+        if len(raw_rewards) > 1:
+            # Check if advantages have variance (avoid NaN when all advantages are zero)
+            adv_std = float(np.std(adv_array))
+            rewards_std = float(np.std(rewards_array))
+            
+            if adv_std < 1e-6 or rewards_std < 1e-6:
+                # All advantages or rewards are identical, correlation is undefined
+                correlation = 0.0
+                if log_to_console:
+                    logger.warning(
+                        f"[Step {step}] Reward-Advantage Correlation: undefined (all advantages or rewards identical). "
+                        f"Using 0.0 as fallback."
+                    )
+            else:
+                try:
+                    correlation = float(np.corrcoef(rewards_array, adv_array)[0, 1])
+                    if np.isnan(correlation) or np.isinf(correlation):
+                        correlation = 0.0
+                        if log_to_console:
+                            logger.warning(f"[Step {step}] Reward-Advantage Correlation: NaN/Inf, using 0.0 as fallback")
+                except Exception:
+                    correlation = 0.0
+                    if log_to_console:
+                        logger.warning(f"[Step {step}] Reward-Advantage Correlation: computation failed, using 0.0 as fallback")
+            
+            if log_to_console and not (adv_std < 1e-6 or rewards_std < 1e-6):
+                logger.info(f"[Step {step}] Reward-Advantage Correlation: {correlation:.4f}")
+        
+        # 4. Log to TensorBoard if available (only requested metrics)
+        if self.writer:
+            # Only log Reward_Advantage_Correlation (requested metric)
+            if len(raw_rewards) > 1:
+                correlation_val = correlation if 'correlation' in locals() else 0.0
+                self.writer.add_scalar("Stats/Reward_Advantage_Correlation", correlation_val, step)
     
     def _whiten_advantages(self, advantages: List[float], eps: float = 1e-8) -> List[float]:
         """Robust batch scaling with MAD and soft clipping for stable advantage computation.
@@ -4650,12 +4958,28 @@ class RLAIFTrainer:
         # This provides robust scaling that handles outliers gracefully
         scale = 1.4826 * mad + eps
         
+        # Debug: Warn if all advantages are zero or very close to zero
+        adv_std = float(np.std(adv_array))
+        if adv_std < 1e-6:
+            logger.warning(
+                f"All advantages are zero or identical (std={adv_std:.2e}, mad={mad:.2e}). "
+                f"This usually means: (1) all rewards per prompt are identical, or "
+                f"(2) only 1 sample per prompt after filtering. "
+                f"Advantages: min={float(np.min(adv_array)):.4f}, max={float(np.max(adv_array)):.4f}, "
+                f"mean={float(np.mean(adv_array)):.4f}"
+            )
+        
         if scale > eps:
             # Robustly scaled advantages
             z = adv_array / scale
         else:
-            # If scale is too small (all advantages are identical), just use raw values
-            # This prevents division by near-zero
+            # If scale is too small (all advantages are identical), handle the zero-advantage case
+            # WARNING: If all advantages are zero, they will remain zero after whitening
+            if mad < 1e-6:
+                logger.warning(
+                    f"MAD is near-zero ({mad:.2e}), all advantages are identical. "
+                    f"Whitening cannot add variance. Returning zero advantages (caller should handle this)."
+                )
             z = adv_array
         
         # Step 2: Soft clip using tanh to prevent extreme advantages from dominating
@@ -4702,6 +5026,7 @@ class RLAIFTrainer:
                 if hasattr(self, "_latest_batch_rewards") and self._latest_batch_rewards is not None:
                     try:
                         # Sort indices by reward (highest first) and take top N
+                        # (Rewards have already been stretched and normalized in the training loop)
                         sorted_idxs = sorted(
                             idxs, 
                             key=lambda j: float(self._latest_batch_rewards[j]) if j < len(self._latest_batch_rewards) else -1.0,
@@ -4714,16 +5039,16 @@ class RLAIFTrainer:
                     top_idxs = idxs[:top_n]
                 
                 for best_idx in top_idxs:
-                sample = samples[best_idx]
+                    sample = samples[best_idx]
                     selected_samples.append((sample, best_idx))
                     
                     # Reward aligned to the *selected* sample for this prompt
-                rr = 0.5
-                try:
-                    if hasattr(self, "_latest_batch_rewards") and self._latest_batch_rewards is not None and best_idx < len(self._latest_batch_rewards):
-                        rr = float(self._latest_batch_rewards[best_idx])
-                except Exception:
                     rr = 0.5
+                    try:
+                        if hasattr(self, "_latest_batch_rewards") and self._latest_batch_rewards is not None and best_idx < len(self._latest_batch_rewards):
+                            rr = float(self._latest_batch_rewards[best_idx])
+                    except Exception:
+                        rr = 0.5
                     selected_rewards.append(rr)
             
             # Add selected samples to batch
@@ -4820,8 +5145,14 @@ class RLAIFTrainer:
             'rewards': batch_rewards,
         }
     
-    def train_step(self, batch: Dict, rewards: List[float]) -> Dict[str, Any]:
-        """Perform one training step with RLAIF (optimized for M5)"""
+    def train_step(self, batch: Dict, rewards: List[float], raw_rewards: Optional[List[float]] = None) -> Dict[str, Any]:
+        """Perform one training step with RLAIF (optimized for M5)
+        
+        Args:
+            batch: Training batch with input_ids, attention_mask, etc.
+            rewards: Rewards/advantages to use for training (may be normalized)
+            raw_rewards: Optional raw rewards before normalization (for logging)
+        """
         # Unsloth toggle (CUDA-only): switch model to training-optimized mode before forward/backward
         if self._unsloth_enabled and self._unsloth_flm is not None:
             try:
@@ -5211,6 +5542,86 @@ class RLAIFTrainer:
         # Use normalized advantage (or raw rewards if normalization disabled)
         reward_signal = reward_tensor
         
+        # Log comprehensive reward and advantage statistics
+        # Get per-sample reward signal for logging (before expansion to sequence length)
+        if reward_signal.shape[1] == 1:
+            per_sample_reward_signal = reward_signal.squeeze(1).cpu().tolist()
+        else:
+            # If already expanded, take mean over sequence length
+            per_sample_reward_signal = reward_signal.mean(dim=1).cpu().tolist()
+        
+        # Get per-sample logprob for correlation analysis
+        per_sample_logprob = (selected_log_probs * attn_mask).sum(dim=1) / (attn_mask.sum(dim=1) + 1e-8)
+        per_sample_logprob = per_sample_logprob.cpu().tolist()
+        
+        # Log stats if we have enough samples
+        step = getattr(self, '_current_global_step', getattr(self, 'global_step', 0))
+        logging_steps = getattr(self.config, 'logging_steps', 10)
+        log_to_console = (step > 0 and step % logging_steps == 0) or step == 0
+        
+        # Use raw_rewards if provided, otherwise use rewards (which may already be normalized)
+        raw_rewards_for_logging = raw_rewards if raw_rewards is not None and len(raw_rewards) == len(per_sample_reward_signal) else rewards
+        
+        if len(per_sample_reward_signal) > 0 and len(raw_rewards_for_logging) == len(per_sample_reward_signal):
+            # Log reward distribution and advantage stats (respects logging_steps interval)
+            self._log_reward_and_advantage_stats(
+                raw_rewards=raw_rewards_for_logging,
+                advantages=per_sample_reward_signal,
+                step=step
+            )
+            
+            # Log correlation between reward and logprob improvements
+            if len(per_sample_reward_signal) > 1 and len(per_sample_logprob) == len(per_sample_reward_signal):
+                # Use module-level numpy import (already imported at top of file)
+                reward_adv_array = np.array(per_sample_reward_signal, dtype=np.float32)
+                logprob_array = np.array(per_sample_logprob, dtype=np.float32)
+                
+                # Check if arrays have variance (avoid NaN when all values are identical)
+                reward_std = float(np.std(reward_adv_array))
+                logprob_std = float(np.std(logprob_array))
+                
+                if reward_std < 1e-6 or logprob_std < 1e-6:
+                    # All rewards or logprobs are identical, correlation is undefined
+                    reward_logprob_corr = 0.0
+                    if log_to_console:
+                        logger.warning(
+                            f"[Step {step}] Reward-LogProb Correlation: undefined (all rewards or logprobs identical). "
+                            f"Using 0.0 as fallback."
+                        )
+                else:
+                    try:
+                        reward_logprob_corr = float(np.corrcoef(reward_adv_array, logprob_array)[0, 1])
+                        if np.isnan(reward_logprob_corr) or np.isinf(reward_logprob_corr):
+                            reward_logprob_corr = 0.0
+                            if log_to_console:
+                                logger.warning(f"[Step {step}] Reward-LogProb Correlation: NaN/Inf, using 0.0 as fallback")
+                    except Exception:
+                        reward_logprob_corr = 0.0
+                        if log_to_console:
+                            logger.warning(f"[Step {step}] Reward-LogProb Correlation: computation failed, using 0.0 as fallback")
+                
+                if log_to_console and not (reward_std < 1e-6 or logprob_std < 1e-6):
+                    logger.info(
+                        f"[Step {step}] Reward-LogProb Correlation: {reward_logprob_corr:.4f} "
+                        f"(positive = higher reward samples have higher logprobs, good for learning)"
+                    )
+                
+                # Log policy gradient statistics
+                policy_grad_per_sample = -(selected_log_probs * reward_signal * attn_mask).sum(dim=1) / (attn_mask.sum(dim=1) + 1e-8)
+                policy_grad_mean = policy_grad_per_sample.mean().item()
+                policy_grad_std = policy_grad_per_sample.std().item()
+                policy_grad_max = policy_grad_per_sample.max().item()
+                policy_grad_min = policy_grad_per_sample.min().item()
+                
+                if log_to_console:
+                    logger.info(
+                        f"[Step {step}] Policy Gradient Stats: "
+                        f"mean={policy_grad_mean:.4f}, std={policy_grad_std:.4f}, "
+                        f"min={policy_grad_min:.4f}, max={policy_grad_max:.4f}"
+                    )
+                
+                # Removed unnecessary metrics - not in requested dashboard
+        
         # Policy gradient: maximize log_prob * reward_signal
         # Apply reward_weight to scale the reward signal strength
         policy_loss_raw = -(selected_log_probs * reward_signal * attn_mask).mean()
@@ -5426,13 +5837,28 @@ class RLAIFTrainer:
         # - Default: shuffle=True (better generalization).
         # - Curriculum (legacy): no shuffle and dataset sorted by prompt length -> causes reward sawtooth.
         # - Curriculum (recommended): bucketed sampler that mixes difficulties within an epoch.
+        # However, we enforce "easy → hard" ordering until moving average reward clears gates.
         sampler = None
-        if bool(self.config.curriculum_learning) and bool(getattr(self.config, "curriculum_mix_difficulty", True)):
-            sampler = BucketedCurriculumSampler(
-                train_dataset,
-                num_buckets=int(getattr(self.config, "curriculum_num_buckets", 8) or 8),
-                seed=1337,
-            )
+        if bool(self.config.curriculum_learning):
+            # Check if we should enable mixing based on reward gates
+            # Gates: 0.45, 0.55, 0.65 (must clear each gate before enabling mixing)
+            should_mix = self._should_enable_curriculum_mixing()
+            
+            if should_mix and bool(getattr(self.config, "curriculum_mix_difficulty", True)):
+                sampler = BucketedCurriculumSampler(
+                    train_dataset,
+                    num_buckets=int(getattr(self.config, "curriculum_num_buckets", 8) or 8),
+                    seed=1337,
+                )
+                logger.info(
+                    f"Curriculum mixing enabled (reward EMA has cleared gates). "
+                    f"Using BucketedCurriculumSampler with {getattr(self.config, 'curriculum_num_buckets', 8)} buckets."
+                )
+            else:
+                logger.info(
+                    f"Curriculum mixing disabled (reward EMA has not cleared gates). "
+                    f"Using strict easy → hard ordering."
+                )
 
         train_loader = DataLoader(
             train_dataset,
@@ -5582,6 +6008,7 @@ class RLAIFTrainer:
         self._last_grad_memory_gb = 0.0
         
         global_step = 0
+        self._current_global_step = 0  # Track current global step for logging
         
         # Resume from checkpoint epoch if specified
         start_epoch = getattr(self, '_resume_from_epoch', None)
@@ -5737,7 +6164,7 @@ class RLAIFTrainer:
             if self.writer:
                 bs = int(getattr(self, "_batch_step", 0))
                 # Add epoch marker (use epoch number as value to make it visible as a vertical line)
-                self.writer.add_scalar("Batch/EpochMarker", float(epoch + 1), bs)
+                # EpochMarker removed - not in requested metrics
             
             # IMPROVED: Smart cache management instead of full clear
             # Option A: Only clear old/expired entries, not all student scores
@@ -5974,6 +6401,17 @@ class RLAIFTrainer:
                     samples_by_prompt[prompt].append(sample)
                     rewards_by_prompt[prompt].append(reward)
                 
+                # Apply reward stretching to raw rewards per prompt if enabled (BEFORE advantage normalization)
+                # This stretches the reward signal to make differences clearer when rewards are clustered
+                if getattr(self.config, 'use_reward_stretching', True):
+                    # Stretch rewards per prompt group
+                    for prompt in samples_by_prompt.keys():
+                        prompt_samples = samples_by_prompt[prompt]
+                        prompt_rewards = rewards_by_prompt[prompt]
+                        if len(prompt_rewards) > 1:
+                            stretched = self._stretch_rewards_per_prompt(prompt_samples, prompt_rewards)
+                            rewards_by_prompt[prompt] = stretched
+                
                 # Apply per-prompt advantage normalization if enabled (BEFORE best-of-N selection)
                 if getattr(self.config, 'use_advantage_normalization', True):
                     # Flatten samples and rewards for normalization
@@ -5983,7 +6421,7 @@ class RLAIFTrainer:
                         all_samples_flat.extend(samples_by_prompt[prompt])
                         all_rewards_flat.extend(rewards_by_prompt[prompt])
                     
-                    # Compute per-prompt advantages
+                    # Compute per-prompt advantages (now using stretched rewards if enabled)
                     advantages_flat = self._compute_per_prompt_advantages(all_samples_flat, all_rewards_flat, use_median=False)
                     
                     # Optionally whiten across all accumulated samples
@@ -6013,6 +6451,7 @@ class RLAIFTrainer:
                     expanded_prompts = []
                     for prompt in train_batch_prompts:
                         # Select top N samples per prompt (top-1 or top-2) using normalized advantages
+                        # (Rewards have already been stretched and normalized above)
                         prompt_samples = samples_by_prompt[prompt]
                         prompt_rewards = rewards_by_prompt[prompt]
                         if prompt_samples and prompt_rewards:
@@ -6064,7 +6503,8 @@ class RLAIFTrainer:
                         
                         # Training step
                         try:
-                            loss_dict = self.train_step(train_batch, rewards_for_training)
+                            # Pass raw rewards for logging (before normalization)
+                            loss_dict = self.train_step(train_batch, rewards_for_training, raw_rewards=raw_rewards_for_training)
                             
                             # Extract and log per micro-batch metrics
                             policy_loss_val = float(loss_dict.get("policy_loss", 0.0).detach().cpu()) if torch.is_tensor(loss_dict.get("policy_loss")) else float(loss_dict.get("policy_loss", 0.0))
@@ -6073,6 +6513,12 @@ class RLAIFTrainer:
                             # Update adaptive KL penalty based on observed KL divergence
                             if kl_divergence_val is not None and not (np.isnan(kl_divergence_val) or np.isinf(kl_divergence_val)):
                                 self._update_adaptive_kl_penalty(kl_divergence_val)
+                            
+                            # Update KL penalty based on reward (relaxation when reward is low)
+                            avg_reward_val = float(loss_dict.get("avg_reward", 0.0))
+                            if avg_reward_val is not None and not (np.isnan(avg_reward_val) or np.isinf(avg_reward_val)):
+                                self._update_kl_penalty_for_reward(avg_reward_val)
+                            
                             combined_loss_val = float(loss_dict.get("loss", 0.0).detach().cpu()) if torch.is_tensor(loss_dict.get("loss")) else float(loss_dict.get("loss", 0.0))
                             valid_token_count_val = int(loss_dict.get("valid_token_count", 0))
                             
@@ -6193,6 +6639,7 @@ class RLAIFTrainer:
                                 self.optimizer.zero_grad(set_to_none=True)
                                 
                                 global_step += 1
+                                self._current_global_step = global_step
                         except Exception as e:
                             logger.error(f"Error in training step: {e}")
                 
@@ -6351,7 +6798,7 @@ class RLAIFTrainer:
                                 _dt_ms = (time.time() - _t0) * 1000.0
                                 if self.writer:
                                     bs = int(getattr(self, "_batch_step", 0))
-                                    self.writer.add_scalar("Perf/MPS_Synchronize_ms", float(_dt_ms), bs)
+                                    # MPS_Synchronize_ms removed - not in requested metrics
                             except Exception:
                                 pass
                     
@@ -6501,21 +6948,53 @@ class RLAIFTrainer:
                     if rewards and len(rewards) > 0 and samples and len(samples) > 0:
                         train_skipped_reason = "ran"
                         
+                        # Store raw rewards BEFORE normalization for logging
+                        raw_rewards_before_normalization = list(rewards)
+                        
                         # Apply per-prompt advantage normalization if enabled
                         # This should happen BEFORE best-of-N selection so we select based on normalized advantages
                         if getattr(self.config, 'use_advantage_normalization', True):
                             # Step 1: Compute per-prompt advantages (A_i = r_i - mean(r for same prompt))
                             advantages = self._compute_per_prompt_advantages(samples, rewards, use_median=False)
                             
-                            # Step 2: Optionally whiten across batch (normalize to zero mean, unit variance)
-                            # This further reduces gradient variance
-                            advantages = self._whiten_advantages(advantages)
+                            # Check if all advantages are zero (happens when all rewards per prompt are identical)
+                            adv_array = np.array(advantages, dtype=np.float32)
+                            adv_std = float(np.std(adv_array))
+                            if adv_std < 1e-6:
+                                logger.warning(
+                                    f"All advantages are zero (std={adv_std:.2e}). "
+                                    f"This means all rewards per prompt are identical. "
+                                    f"Falling back to raw rewards (no advantage normalization) to preserve learning signal."
+                                )
+                                # Use raw rewards instead of zero advantages to allow learning
+                                advantages = raw_rewards_before_normalization
+                            else:
+                                # Step 2: Optionally whiten across batch (normalize to zero mean, unit variance)
+                                # This further reduces gradient variance
+                                advantages = self._whiten_advantages(advantages)
+                            
+                            # Log reward and advantage statistics
+                            step = getattr(self, '_current_global_step', batch_idx)
+                            self._log_reward_and_advantage_stats(
+                                raw_rewards=raw_rewards_before_normalization,
+                                advantages=advantages,
+                                step=step,
+                                samples=samples
+                            )
                             
                             # Use normalized advantages for best-of-N selection
                             self._latest_batch_rewards = advantages
                         else:
                             # Store original rewards if normalization disabled
-                        self._latest_batch_rewards = rewards
+                            # Still log statistics even without normalization
+                            step = getattr(self, '_current_global_step', batch_idx)
+                            self._log_reward_and_advantage_stats(
+                                raw_rewards=raw_rewards_before_normalization,
+                                advantages=rewards,  # No normalization, so advantages = rewards
+                                step=step,
+                                samples=samples
+                            )
+                            self._latest_batch_rewards = rewards
 
                         # Reconstruct batch from generated samples (with full sequences: prompt + generated code)
                         # The original batch only has prompts, but we need the full sequences for training
@@ -6528,6 +7007,13 @@ class RLAIFTrainer:
                         rewards_for_training = list(train_batch.get("rewards") or [])
                         if not rewards_for_training:
                             rewards_for_training = rewards[:len(batch['prompt'])] if len(rewards) >= len(batch['prompt']) else rewards + [0.0] * (len(batch['prompt']) - len(rewards))
+                        
+                        # Map raw rewards to selected samples for logging
+                        # _create_training_batch_from_samples selects best samples, so we need to find
+                        # the corresponding raw rewards. For simplicity, we'll use the raw rewards
+                        # from the full batch (before selection) for logging the distribution,
+                        # and the selected rewards for training.
+                        raw_rewards_for_training = raw_rewards_before_normalization[:len(rewards_for_training)] if len(raw_rewards_before_normalization) >= len(rewards_for_training) else raw_rewards_before_normalization
                         
                         # Apply reward threshold filtering if enabled
                         reward_threshold = getattr(self.config, 'reward_threshold', None)
@@ -6607,6 +7093,12 @@ class RLAIFTrainer:
                             # Update adaptive KL penalty based on observed KL divergence
                             if kl_divergence_val is not None and not (np.isnan(kl_divergence_val) or np.isinf(kl_divergence_val)):
                                 self._update_adaptive_kl_penalty(kl_divergence_val)
+                            
+                            # Update KL penalty based on reward (relaxation when reward is low)
+                            avg_reward_val = float(loss_dict.get("avg_reward", 0.0))
+                            if avg_reward_val is not None and not (np.isnan(avg_reward_val) or np.isinf(avg_reward_val)):
+                                self._update_kl_penalty_for_reward(avg_reward_val)
+                            
                             combined_loss_val = float(loss_dict.get("loss", 0.0).item()) if torch.is_tensor(loss_dict.get("loss")) else float(loss_dict.get("loss", 0.0))
                             valid_token_count_val = int(loss_dict.get("valid_token_count", 0))
                             
@@ -6971,17 +7463,7 @@ class RLAIFTrainer:
                                 if self._save_config_yaml():
                                     logger.info("✓ Config saved to config.yaml")
                                 
-                                # Log to TensorBoard if available
-                                if self.writer:
-                                    try:
-                                        for param_name, (old_val, new_val) in adjustments.items():
-                                            self.writer.add_scalar(
-                                                f"HealthCheck/WithinEpoch/{param_name}",
-                                                new_val,
-                                                self._batch_step
-                                            )
-                                    except Exception:
-                                        pass
+                                # Log to TensorBoard if available - HealthCheck/WithinEpoch metrics removed (not in requested metrics)
                     
                     # Add error information
                     error_info = ""
@@ -7286,26 +7768,8 @@ class RLAIFTrainer:
                                         # Incorporate rubric demand: scale base length by (1 + 0.75 * demand)
                                         if rubric is not None:
                                             diff_idx = diff_idx * (1.0 + 0.75 * rubric["rubric_demand"])
+                                        # Only log TokenLen_Mean (requested metric)
                                         self.writer.add_scalar("Batch/PromptDifficulty/TokenLen_Mean", float(tok_lens.mean().item()), bs)
-                                        self.writer.add_scalar("Batch/PromptDifficulty/TokenLen_Max", float(tok_lens.max().item()), bs)
-                                        self.writer.add_scalar("Batch/PromptDifficulty/Index_Mean", float(diff_idx.mean().item()), bs)
-                                        self.writer.add_scalar("Batch/PromptDifficulty/Index_Max", float(diff_idx.max().item()), bs)
-                                        # Histograms help correlate spikes with prompt mix shifts.
-                                        try:
-                                            self.writer.add_histogram("Batch/PromptDifficulty/TokenLen", tok_lens.numpy(), bs)
-                                            self.writer.add_histogram("Batch/PromptDifficulty/Index", diff_idx.numpy(), bs)
-                                        except Exception:
-                                            pass
-                                        if rubric is not None:
-                                            self.writer.add_scalar("Batch/PromptDifficulty/RubricDemand_Mean", float(rubric["rubric_demand"].mean().item()), bs)
-                                            self.writer.add_scalar("Batch/PromptDifficulty/RubricDemand_Max", float(rubric["rubric_demand"].max().item()), bs)
-                                            self.writer.add_scalar("Batch/PromptDifficulty/Demand_Correctness_Mean", float(rubric["correctness"].mean().item()), bs)
-                                            self.writer.add_scalar("Batch/PromptDifficulty/Demand_CodeQuality_Mean", float(rubric["code_quality"].mean().item()), bs)
-                                            self.writer.add_scalar("Batch/PromptDifficulty/Demand_Efficiency_Mean", float(rubric["efficiency"].mean().item()), bs)
-                                            self.writer.add_scalar("Batch/PromptDifficulty/Demand_Documentation_Mean", float(rubric["documentation"].mean().item()), bs)
-                                    if char_lens is not None:
-                                        self.writer.add_scalar("Batch/PromptDifficulty/CharLen_Mean", float(char_lens.mean().item()), bs)
-                                        self.writer.add_scalar("Batch/PromptDifficulty/CharLen_Max", float(char_lens.max().item()), bs)
                                 except Exception:
                                     pass
 
@@ -7323,29 +7787,45 @@ class RLAIFTrainer:
                                 grad_accum_growth = getattr(self, "_last_grad_accum_memory_growth_gb", 0.0) or 0.0
                                 grad_memory = getattr(self, "_last_grad_memory_gb", 0.0) or 0.0
                             
-                                # Memory breakdown by gradient accumulation
-                                self.writer.add_scalar("Batch/Metal/Memory/GradientAccum_Growth_GB", float(grad_accum_growth), bs)
-                                self.writer.add_scalar("Batch/Metal/Memory/Gradient_GB", float(grad_memory), bs)
-                            
-                                # Memory breakdown by process: Training (MPS)
-                                self.writer.add_scalar("Batch/Metal/Memory/Training_MPS_Allocated_GB", float(frag.get("mps_alloc_gb", 0.0)), bs)
-                                self.writer.add_scalar("Batch/Metal/Memory/Training_MPS_DriverAllocated_GB", float(frag.get("mps_driver_gb", 0.0)), bs)
-                                self.writer.add_scalar("Batch/Metal/Memory/Training_MPS_Fragmentation_GB", float(frag.get("mps_frag_gb", 0.0)), bs)
-                            
-                                # Memory breakdown by process: Generation (MLX)
-                                self.writer.add_scalar("Batch/Metal/Memory/Generation_MLX_Active_GB", float(frag.get("mlx_active_gb", 0.0)), bs)
-                                self.writer.add_scalar("Batch/Metal/Memory/Generation_MLX_Cache_GB", float(frag.get("mlx_cache_gb", 0.0)), bs)
-                                self.writer.add_scalar("Batch/Metal/Memory/Generation_MLX_Peak_GB", float(frag.get("mlx_peak_gb", 0.0)), bs)
-                            
-                                # Cache accumulation
-                                self.writer.add_scalar("Batch/Metal/Memory/MPS_Fragmentation_Growth_GB", float(frag.get("mps_frag_gb", 0.0)) - float(prev.get("mps_frag_gb", 0.0)), bs)
-                                self.writer.add_scalar("Batch/Metal/Memory/MLX_Cache_Growth_GB", float(frag.get("mlx_cache_gb", 0.0)) - float(prev.get("mlx_cache_gb", 0.0)), bs)
-                            
-                                # Total by process (sum of components)
+                                # Memory metrics (requested)
                                 training_total = float(frag.get("mps_alloc_gb", 0.0)) + float(grad_memory)
-                                generation_total = float(frag.get("mlx_active_gb", 0.0)) + float(frag.get("mlx_cache_gb", 0.0))
                                 self.writer.add_scalar("Batch/Metal/Memory/Total_Training_GB", training_total, bs)
-                                self.writer.add_scalar("Batch/Metal/Memory/Total_Generation_GB", generation_total, bs)
+                                
+                                # Memory utilization percentage and bandwidth
+                                try:
+                                    sys_metrics = self._get_system_metrics()
+                                    memory_used_gb = sys_metrics.get('memory_used_gb', 0.0)
+                                    memory_total_gb = sys_metrics.get('memory_total_gb', 0.0)
+                                    
+                                    # Memory utilization percentage
+                                    if memory_total_gb > 0:
+                                        memory_utilization_pct = (memory_used_gb / memory_total_gb) * 100.0
+                                        self.writer.add_scalar("Batch/Metal/Memory/Utilization_Percent", memory_utilization_pct, bs)
+                                    
+                                    # Memory bandwidth % (estimated from memory usage rate)
+                                    if not hasattr(self, '_prev_memory_used_gb_batch'):
+                                        self._prev_memory_used_gb_batch = memory_used_gb
+                                        self._prev_memory_time_batch = time.time()
+                                        memory_bandwidth_pct = 0.0
+                                    else:
+                                        current_time = time.time()
+                                        time_delta = current_time - self._prev_memory_time_batch
+                                        if time_delta > 0:
+                                            memory_delta_gb = abs(memory_used_gb - self._prev_memory_used_gb_batch)
+                                            # Estimate bandwidth: assume max theoretical bandwidth (e.g., 100 GB/s for unified memory)
+                                            # This is a rough estimate - actual bandwidth depends on hardware
+                                            max_bandwidth_gb_per_sec = 100.0  # Conservative estimate for Apple Silicon
+                                            bandwidth_used_gb_per_sec = memory_delta_gb / time_delta
+                                            memory_bandwidth_pct = min(100.0, (bandwidth_used_gb_per_sec / max_bandwidth_gb_per_sec) * 100.0)
+                                            self._prev_memory_used_gb_batch = memory_used_gb
+                                            self._prev_memory_time_batch = current_time
+                                        else:
+                                            memory_bandwidth_pct = 0.0
+                                    
+                                    self.writer.add_scalar("Batch/Metal/Memory/Bandwidth_Percent", memory_bandwidth_pct, bs)
+                                except Exception:
+                                    # Don't fail training if memory metrics can't be logged
+                                    pass
                             
                                 # GPU utilization by process (will be populated by system monitoring)
                                 # These are logged separately in the monitoring thread
@@ -7357,107 +7837,42 @@ class RLAIFTrainer:
                                 # PERFORMANCE STATS - Token/sec, Latency, Total Tokens
                                 # =========================
                             
-                                # Generation performance
+                                # Only log Generation_TokensPerSec (requested metric)
                                 self.writer.add_scalar("Batch/Performance/Generation_TokensPerSec", float(raw_tokens_per_sec) if 'raw_tokens_per_sec' in locals() else 0.0, bs)
-                                self.writer.add_scalar("Batch/Performance/Generation_RawTokensPerSec", float(raw_tokens_per_sec) if 'raw_tokens_per_sec' in locals() else 0.0, bs)
-                                self.writer.add_scalar("Batch/Performance/Generation_KeptTokensPerSec", float(tokens_per_sec) if 'tokens_per_sec' in locals() else 0.0, bs)
-                                self.writer.add_scalar("Batch/Performance/Generation_Latency_s", float(gen_time), bs)
-                            
-                                # Track memory state before generation to correlate with performance drops
-                                if 'mem_before_gen' in locals() and mem_before_gen:
-                                    if 'mps_allocated' in mem_before_gen:
-                                        self.writer.add_scalar("Batch/Metal/Memory/BeforeGen_MPS_Allocated_GB", float(mem_before_gen['mps_allocated']), bs)
-                                    if 'mps_driver' in mem_before_gen:
-                                        self.writer.add_scalar("Batch/Metal/Memory/BeforeGen_MPS_Driver_GB", float(mem_before_gen['mps_driver']), bs)
-                                        # Calculate fragmentation proxy (driver - allocated)
-                                        frag_proxy = mem_before_gen.get('mps_driver', 0) - mem_before_gen.get('mps_allocated', 0)
-                                        self.writer.add_scalar("Batch/Metal/Memory/BeforeGen_Fragmentation_GB", float(frag_proxy), bs)
-                                # Cumulative total tokens (tracked per epoch)
-                                cum_gen_tokens = getattr(self, "_cumulative_gen_tokens", 0) + float(_gen_kept_tok) if '_gen_kept_tok' in locals() else 0.0
-                                self._cumulative_gen_tokens = int(cum_gen_tokens)
-                                self.writer.add_scalar("Batch/Performance/Generation_TotalTokens_Cumulative", cum_gen_tokens, bs)
-                            
-                                # Scoring performance
-                                self.writer.add_scalar("Batch/Performance/Scoring_TokensPerSec", float(reward_tokens_per_sec) if 'reward_tokens_per_sec' in locals() else 0.0, bs)
-                                self.writer.add_scalar("Batch/Performance/Scoring_Latency_s", float(reward_time), bs)
-                                # Cumulative total tokens
-                                cum_score_in = getattr(self, "_cumulative_score_input_tokens", 0) + float(_teacher_in) if '_teacher_in' in locals() else 0.0
-                                cum_score_out = getattr(self, "_cumulative_score_output_tokens", 0) + float(_teacher_out) if '_teacher_out' in locals() else 0.0
-                                self._cumulative_score_input_tokens = int(cum_score_in)
-                                self._cumulative_score_output_tokens = int(cum_score_out)
-                                self.writer.add_scalar("Batch/Performance/Scoring_TotalTokens_Input_Cumulative", cum_score_in, bs)
-                                self.writer.add_scalar("Batch/Performance/Scoring_TotalTokens_Output_Cumulative", cum_score_out, bs)
-                            
-                                # Training performance
-                                self.writer.add_scalar("Batch/Performance/Training_TokensPerSec", float(train_tokens_per_sec) if 'train_tokens_per_sec' in locals() else 0.0, bs)
-                                self.writer.add_scalar("Batch/Performance/Training_Latency_s", float(train_time), bs)
-                                # Cumulative total tokens
-                                cum_train_tokens = getattr(self, "_cumulative_train_tokens", 0) + float(train_num_tokens) if 'train_num_tokens' in locals() else 0
-                                self._cumulative_train_tokens = int(cum_train_tokens)
-                                self.writer.add_scalar("Batch/Performance/Training_TotalTokens_Cumulative", cum_train_tokens, bs)
                             
                                 # =========================
                                 # FUNCTIONAL STATS - Reward, Loss, Diversity
                                 # =========================
                             
+                                # Only log requested functional metrics
                                 # Reward gain over baseline
                                 if self.baseline_reward is not None:
                                     self.writer.add_scalar("Batch/Functional/Reward_GainFromBaseline", float(ema_gain_from_baseline), bs)
                             
-                                # Actual reward of model as training continues
-                                self.writer.add_scalar("Batch/Functional/Reward_Mean", rewards_mean, bs)
-                                self.writer.add_scalar("Batch/Functional/Reward_EMA", float(ema), bs)
-                                if avg_best_per_prompt is not None:
-                                    self.writer.add_scalar("Batch/Functional/Reward_BestOfN", float(avg_best_per_prompt), bs)
-                            
-                                # Loss changes with batch
-                                # Handle None values safely
+                                # Loss (requested metric)
                                 loss_val = _ls.get("loss")
                                 loss_val = float(loss_val) if loss_val is not None else 0.0
                                 self.writer.add_scalar("Batch/Functional/Loss", loss_val, bs)
-                            
-                                policy_loss_val = _ls.get("policy_loss")
-                                policy_loss_val = float(policy_loss_val) if policy_loss_val is not None else 0.0
-                                self.writer.add_scalar("Batch/Functional/Loss_Policy", policy_loss_val, bs)
-                            
-                                kl_penalty_val = _ls.get("kl_penalty")
-                                kl_penalty_val = float(kl_penalty_val) if kl_penalty_val is not None else 0.0
-                                self.writer.add_scalar("Batch/Functional/Loss_KL", kl_penalty_val, bs)
                                 
-                                # Log KL divergence separately (tokenwise categorical KL)
+                                # KL Divergence (requested metric)
                                 kl_divergence_val = _ls.get("kl_divergence")
                                 kl_divergence_val = float(kl_divergence_val) if kl_divergence_val is not None else 0.0
                                 self.writer.add_scalar("Batch/Functional/KL_Divergence", kl_divergence_val, bs)
-                            
-                                # Code diversity with batch
-                                self.writer.add_scalar("Batch/Functional/Diversity_Ratio", float(diversity_ratio), bs)
-                            
-                                # Cache statistics for correlation analysis
-                                total_score_calls = self.cache_stats.get('teacher_score_calls', 0)
-                                total_score_hits = self.cache_stats.get('teacher_score_cache_hits', 0)
-                                cache_hit_rate = (total_score_hits / (total_score_calls + total_score_hits)) * 100 if (total_score_calls + total_score_hits) > 0 else 0.0
-                                self.writer.add_scalar("Batch/Cache/Score_HitRate_Percent", float(cache_hit_rate), bs)
-                                self.writer.add_scalar("Batch/Cache/Score_Cache_Size", float(len(self.teacher_score_cache)), bs)
-                            
-                                # Track epoch phase (calculate from batch_idx and epoch info)
-                                # epoch_phase should be calculated in the batch loop and stored
-                                if hasattr(self, '_current_epoch_phase'):
-                                    self.writer.add_scalar("Batch/Epoch_Phase", float(self._current_epoch_phase), bs)
-                            
-                                # Track fresh vs cached scores ratio (Option B: separate tracking)
-                                fresh_count = self.cache_stats.get('fresh_scores_count', 0)
-                                cached_count = self.cache_stats.get('cached_scores_count', 0)
-                                total_scores = fresh_count + cached_count
-                                if total_scores > 0:
-                                    fresh_ratio = fresh_count / total_scores
-                                    self.writer.add_scalar("Batch/Cache/FreshScores_Ratio", float(fresh_ratio), bs)
-                                    self.writer.add_scalar("Batch/Cache/FreshScores_Count", float(fresh_count), bs)
-                                    self.writer.add_scalar("Batch/Cache/CachedScores_Count", float(cached_count), bs)
-                            
-                                # Track epoch phase (0.0 = start, 1.0 = end) for correlation
-                                if hasattr(self, '_epoch_batch_count') and hasattr(self, '_current_epoch_batches'):
-                                    epoch_phase = (self._current_epoch_batches / max(self._epoch_batch_count, 1)) if self._epoch_batch_count > 0 else 0.0
-                                    self.writer.add_scalar("Batch/Epoch_Phase", float(epoch_phase), bs)
+                                
+                                # Effective LR (Log) - requested metric
+                                try:
+                                    if hasattr(self, 'scheduler') and self.scheduler is not None:
+                                        if hasattr(self.scheduler, 'get_last_lr'):
+                                            effective_lr = self.scheduler.get_last_lr()[0] if self.scheduler.get_last_lr() else 0.0
+                                        elif hasattr(self.scheduler, 'get_lr'):
+                                            effective_lr = self.scheduler.get_lr()[0] if self.scheduler.get_lr() else 0.0
+                                        else:
+                                            effective_lr = getattr(self.scheduler, 'last_lr', [0.0])[0] if hasattr(self.scheduler, 'last_lr') else 0.0
+                                        # Log scale for better visualization
+                                        lr_log = np.log10(effective_lr + 1e-10) if effective_lr > 0 else -10.0
+                                        self.writer.add_scalar("Batch/Functional/Effective_LR_Log", lr_log, bs)
+                                except Exception:
+                                    pass  # Don't fail on LR logging
                     except Exception:
                         # Never fail training due to metrics logging
                         pass
@@ -7483,7 +7898,7 @@ class RLAIFTrainer:
                         # GC triggered indicator (memory metrics are logged in main section above)
                         if self.writer:
                             bs = int(getattr(self, "_batch_step", 0))
-                            self.writer.add_scalar("Batch/Metal/GC_Triggered", 1.0 if frag_triggered_gc else 0.0, bs)
+                            # GC_Triggered removed - not in requested metrics
 
                         self._run_health_check(
                             epoch=int(epoch + 1),
@@ -7536,7 +7951,7 @@ class RLAIFTrainer:
                             _dt_ms = (time.time() - _t0) * 1000.0
                             if self.writer:
                                 bs = int(getattr(self, "_batch_step", 0))
-                                self.writer.add_scalar("Perf/MPS_EmptyCache_ms", float(_dt_ms), bs)
+                                # MPS_EmptyCache_ms removed - not in requested metrics
                         except Exception:
                             pass
                     elif torch.cuda.is_available():
@@ -7643,7 +8058,7 @@ class RLAIFTrainer:
                     param_changes = self._compute_parameter_changes(param_state_before, param_state_after)
                     # Always append parameter changes (even if zero) to track optimizer steps
                     # This ensures num_updates accurately reflects the number of optimizer steps
-                        epoch_param_changes.append(param_changes)
+                    epoch_param_changes.append(param_changes)
                     if param_changes.get('mean_abs_change', 0.0) > 0:
                         logger.info(f"Parameter changes recorded: mean_abs={param_changes.get('mean_abs_change', 0.0):.2e}, max_abs={param_changes.get('max_abs_change', 0.0):.2e}")
                     else:
@@ -7828,14 +8243,9 @@ class RLAIFTrainer:
                     logger.error(f"Failed to save best checkpoint: {e}")
                     import traceback
                     logger.debug(traceback.format_exc())
-            # Store parameter change summary for this epoch (include epoch total changes)
-            # epoch_param_summary is computed later in the epoch processing (around line 6498)
-            # epoch_total_param_changes is computed later (around line 6546)
-            # Both are initialized at the start of the epoch, so they should always exist here
-            epoch_param_summary_with_total = dict(epoch_param_summary) if epoch_param_summary else {}
-            if epoch_total_param_changes is not None:
-                epoch_param_summary_with_total['epoch_total'] = epoch_total_param_changes
-            self.training_metrics['parameter_changes_by_epoch'].append(epoch_param_summary_with_total)
+            # NOTE: epoch_param_summary and epoch_total_param_changes are computed later in the epoch
+            # (around lines 8281-8334). We will store them after they are computed, not here.
+            # This is a placeholder to ensure the code structure is clear.
             
             # Track divergence signals for this epoch
             # 1. Gradient norms (for detecting exploding gradients)
@@ -8103,15 +8513,6 @@ class RLAIFTrainer:
                     'mean_relative_change': float(np.mean(all_relative_changes)) if all_relative_changes else 0.0,
                     'total_norm_change': float(np.sum(all_norm_changes)) if all_norm_changes else 0.0,
                 }
-            else:
-                # No optimizer steps recorded - create empty summary to show num_updates=0
-                epoch_param_summary = {
-                    'num_updates': 0,
-                    'mean_abs_change': 0.0,
-                    'max_abs_change': 0.0,
-                    'mean_relative_change': 0.0,
-                    'total_norm_change': 0.0,
-                }
                 
                 # Get most changed layers (aggregate across all steps)
                 layer_change_map = {}
@@ -8139,10 +8540,27 @@ class RLAIFTrainer:
                     reverse=True
                 )[:5]
                 epoch_param_summary['top_changed_layers'] = top_layers
+            else:
+                # No optimizer steps recorded - create empty summary to show num_updates=0
+                epoch_param_summary = {
+                    'num_updates': 0,
+                    'mean_abs_change': 0.0,
+                    'max_abs_change': 0.0,
+                    'mean_relative_change': 0.0,
+                    'total_norm_change': 0.0,
+                    'top_changed_layers': [],
+                }
             
             # Compute total parameter change from start to end of epoch
             epoch_end_param_state = self._capture_parameter_state()
             epoch_total_param_changes = self._compute_parameter_changes(epoch_start_param_state, epoch_end_param_state)
+            
+            # Store parameter change summary for this epoch (include epoch total changes)
+            # Now that epoch_param_summary and epoch_total_param_changes are computed, we can store them
+            epoch_param_summary_with_total = dict(epoch_param_summary) if epoch_param_summary else {}
+            if epoch_total_param_changes is not None:
+                epoch_param_summary_with_total['epoch_total'] = epoch_total_param_changes
+            self.training_metrics['parameter_changes_by_epoch'].append(epoch_param_summary_with_total)
             
             # Ensure avg_epoch_reward is not None for formatting
             avg_epoch_reward_display = avg_epoch_reward if avg_epoch_reward is not None else 0.0
@@ -8363,59 +8781,10 @@ class RLAIFTrainer:
                     if reward_threshold is not None:
                         logger.info(f"  Reward Filtering: {filtered_count}/{total_samples} samples filtered ({filter_rate:.1f}%, threshold={reward_threshold:.3f})")
                 
-                # Simplified epoch charts: log only what appears in the epoch summary.
+                # Only log requested epoch metrics
                 ep = int(epoch + 1)
-                epoch_time_for_logging = float(epoch_total_time) if epoch_total_time is not None and not np.isnan(epoch_total_time) else 0.0
-                self.writer.add_scalar("Epoch/Time_Total_s", epoch_time_for_logging, ep)
-
-                # Rewards & loss (summary) - with defensive checks
-                reward_for_logging = float(avg_epoch_reward) if avg_epoch_reward is not None and not np.isnan(avg_epoch_reward) else 0.0
-                self.writer.add_scalar("Epoch/Reward_Mean", reward_for_logging, ep)
-                best_n_for_logging = float(avg_epoch_best_reward_per_prompt) if avg_epoch_best_reward_per_prompt is not None and not np.isnan(avg_epoch_best_reward_per_prompt) else 0.0
-                self.writer.add_scalar("Epoch/Reward_BestOfN_PerPrompt", best_n_for_logging, ep)
-                loss_for_logging = float(avg_epoch_loss) if avg_epoch_loss is not None and not np.isnan(avg_epoch_loss) else 0.0
-                self.writer.add_scalar("Epoch/Loss_Mean", loss_for_logging, ep)
-                variance_for_logging = float(reward_variance) if reward_variance is not None and not np.isnan(reward_variance) else 0.0
-                self.writer.add_scalar("Epoch/RewardVariance", variance_for_logging, ep)
-                self.writer.add_scalar("Epoch/TotalSamples", float(len(epoch_rewards)), ep)
-
-                # Teacher calls/tokens (summary)
-                self.writer.add_scalar("Epoch/TeacherGenCalls", float(epoch_teacher_gen_calls), ep)
-                self.writer.add_scalar("Epoch/TeacherGenCacheHits", float(epoch_teacher_gen_cache_hits), ep)
-                self.writer.add_scalar("Epoch/TeacherGenCacheHitRate", float(teacher_gen_cache_hit_rate), ep)
-                self.writer.add_scalar("Epoch/TeacherScoreCalls", float(epoch_teacher_score_calls), ep)
-                self.writer.add_scalar("Epoch/TeacherScoreCacheHits", float(epoch_teacher_score_cache_hits), ep)
-                self.writer.add_scalar("Epoch/TeacherScoreCacheHitRate", float(teacher_score_cache_hit_rate), ep)
-                self.writer.add_scalar("Epoch/TeacherTokens_Input", float(epoch_input_tokens), ep)
-                self.writer.add_scalar("Epoch/TeacherTokens_Output", float(epoch_output_tokens), ep)
-
-                # Diversity + errors (summary)
+                # Only log CodeDiversity_UniqueRatio (requested metric)
                 self.writer.add_scalar("Epoch/CodeDiversity_UniqueRatio", float(code_diversity.get("unique_ratio", 0.0)), ep)
-                self.writer.add_scalar("Epoch/CodeDiversity_AvgSimilarity", float(code_diversity.get("avg_similarity", 0.0)), ep)
-                self.writer.add_scalar("Epoch/Errors_StudentGeneration", float(epoch_gen_errors), ep)
-                self.writer.add_scalar("Epoch/Errors_TeacherGenerate", float(epoch_teacher_generate_errors), ep)
-                self.writer.add_scalar("Epoch/Errors_TeacherScoring", float(epoch_teacher_scoring_errors), ep)
-
-                # Performance (summary)
-                self.writer.add_scalar("Epoch/Gen_TokPerSec_Raw", float(avg_gen_tokens_per_sec_raw), ep)
-                self.writer.add_scalar("Epoch/Gen_TokPerSec_Kept", float(avg_gen_tokens_per_sec), ep)
-                self.writer.add_scalar("Epoch/Gen_Tokens_Raw", float(total_gen_tokens_raw), ep)
-                self.writer.add_scalar("Epoch/Gen_Tokens_Kept", float(total_gen_tokens), ep)
-                self.writer.add_scalar("Epoch/Gen_Samples_Raw", float(total_gen_samples_raw), ep)
-                self.writer.add_scalar("Epoch/Gen_Samples_Kept", float(total_gen_samples_kept), ep)
-                self.writer.add_scalar("Epoch/Gen_TokPerSample_Raw", float(avg_tok_per_gen_sample_raw), ep)
-                self.writer.add_scalar("Epoch/Gen_TokPerSample_Kept", float(avg_tok_per_gen_sample_kept), ep)
-                self.writer.add_scalar("Epoch/Gen_TokPerSec_RawAvgPerSample", float(avg_gen_sample_tps_raw), ep)
-                self.writer.add_scalar("Epoch/Gen_TokPerSec_KeptAvgPerSample", float(avg_gen_sample_tps_kept), ep)
-                self.writer.add_scalar("Epoch/Gen_AvgBatchLatency_s", float(avg_gen_latency), ep)
-                self.writer.add_scalar("Epoch/Scoring_TokPerSec_Total", float(avg_reward_tokens_per_sec), ep)
-                self.writer.add_scalar("Epoch/Scoring_AvgLatency_s", float(avg_reward_latency), ep)
-                self.writer.add_scalar("Epoch/Training_TokPerSec", float(avg_train_tokens_per_sec), ep)
-                self.writer.add_scalar("Epoch/Training_AvgLatency_s", float(avg_train_latency), ep)
-                self.writer.add_scalar("Epoch/Training_InputTokens", float(total_train_tokens), ep)
-                # Parameter update footprint (useful for LoRA/QLoRA vs full fine-tune)
-                self.writer.add_scalar("Epoch/Training_TrainableParams", float(trainable_params), ep)
-                self.writer.add_scalar("Epoch/Training_TrainablePct", float(trainable_percentage), ep)
             
             # Perform health check and dynamic parameter adjustment after each epoch
             if (self.config.epoch_health_check_enabled and 
@@ -8751,13 +9120,7 @@ class RLAIFTrainer:
                         cpu_utilization = metrics.get('cpu_percent', 0.0)
                         if cpu_utilization is None or np.isnan(cpu_utilization):
                             cpu_utilization = 0.0
-                        self.writer.add_scalar('System/CPU_Utilization_Percent', float(cpu_utilization), step)
-                        
-                        # 2. GPU utilization % (system-wide)
-                        gpu_utilization = metrics.get('gpu_utilization', 0.0)
-                        if gpu_utilization is None or np.isnan(gpu_utilization):
-                            gpu_utilization = 0.0
-                        self.writer.add_scalar('System/GPU_Utilization_Percent', float(gpu_utilization), step)
+                        # System metrics removed - not in requested dashboard
                         
                         # 3. Memory bandwidth % (estimated from memory usage rate)
                         # Track memory usage changes to estimate bandwidth utilization
@@ -8780,15 +9143,11 @@ class RLAIFTrainer:
                                 self._prev_memory_time = current_time
                             else:
                                 memory_bandwidth_pct = 0.0
-                        self.writer.add_scalar('System/Memory_Bandwidth_Percent', float(memory_bandwidth_pct), step)
+                        # System metrics removed - not in requested dashboard
                         
-                        # 4. Memory capacity (total memory in GB)
-                        memory_capacity_gb = metrics.get('memory_total_gb', 0.0)
-                        if memory_capacity_gb is None or np.isnan(memory_capacity_gb):
-                            memory_capacity_gb = 0.0
-                        self.writer.add_scalar('System/Memory_Capacity_GB', float(memory_capacity_gb), step)
+                        # 4. Memory capacity (total memory in GB) - removed
                         
-                        # 5. SSD bandwidth % (estimated from disk I/O)
+                        # 5. SSD bandwidth % (estimated from disk I/O) - removed
                         if not hasattr(self, '_prev_disk_io'):
                             self._prev_disk_io = {'read_bytes': 0, 'write_bytes': 0, 'time': time.time()}
                             ssd_bandwidth_pct = 0.0
@@ -8817,23 +9176,7 @@ class RLAIFTrainer:
                                     ssd_bandwidth_pct = 0.0
                             except Exception:
                                 ssd_bandwidth_pct = 0.0
-                        self.writer.add_scalar('System/SSD_Bandwidth_Percent', float(ssd_bandwidth_pct), step)
-                        
-                        # 6. SSD capacity (total disk space in GB)
-                        try:
-                            disk_usage = psutil.disk_usage('/')
-                            ssd_capacity_gb = disk_usage.total / (1024 ** 3)
-                            if ssd_capacity_gb is None or np.isnan(ssd_capacity_gb):
-                                ssd_capacity_gb = 0.0
-                        except Exception:
-                            ssd_capacity_gb = 0.0
-                        self.writer.add_scalar('System/SSD_Capacity_GB', float(ssd_capacity_gb), step)
-                        
-                        # 7. GPU TFLOPS (estimated based on utilization and peak performance)
-                        gpu_tflops = self._estimate_gpu_tflops(metrics)
-                        if gpu_tflops is None or np.isnan(gpu_tflops):
-                            gpu_tflops = 0.0
-                        self.writer.add_scalar('System/GPU_TFLOPS', float(gpu_tflops), step)
+                        # System metrics removed - not in requested dashboard
                     
                     time.sleep(self.monitoring_interval)
                 except Exception as e:
@@ -9384,10 +9727,10 @@ class RLAIFTrainer:
             baseline = self.baseline_reward if self.baseline_reward is not None else 0.0
             # Only raise threshold if mean reward is at least 0.05 above baseline
             if avg_reward > (baseline + 0.05):
-            new_threshold = min(current_threshold + 0.02, 0.3)  # Increase by 0.02, cap at 0.3
-            if new_threshold != current_threshold:
-                adjustments['reward_threshold'] = (current_threshold, new_threshold)
-                self.config.reward_threshold = new_threshold
+                new_threshold = min(current_threshold + 0.02, 0.3)  # Increase by 0.02, cap at 0.3
+                if new_threshold != current_threshold:
+                    adjustments['reward_threshold'] = (current_threshold, new_threshold)
+                    self.config.reward_threshold = new_threshold
                     logger.info(f"⚠️  Increasing reward threshold: {current_threshold:.4f} → {new_threshold:.4f} (mean reward {avg_reward:.4f} safely above baseline {baseline:.4f})")
             else:
                 logger.debug(f"Skipping reward threshold increase: mean reward {avg_reward:.4f} too close to baseline {baseline:.4f}")
@@ -10411,17 +10754,31 @@ This model was trained to generate high-quality code in Python, C++, and Rust us
         logger.info("Saving datasets locally...")
         
         # Save training dataset (simplified format: only prompt and language)
+        # Skip if file already exists to preserve existing dataset
         if self.dataset_collection['training']:
             train_file = dataset_dir / "train.jsonl"
-            with open(train_file, 'w') as f:
+            if train_file.exists():
+                logger.info(f"Training dataset file {train_file} already exists, skipping overwrite to preserve existing data")
+            else:
+                # Deduplicate entries by (prompt, language) to ensure unique values
+                seen_entries = set()
+                unique_entries = []
                 for entry in self.dataset_collection['training']:
-                    # Extract only prompt and language fields
-                    simplified_entry = {
-                        'prompt': entry.get('prompt', ''),
-                        'language': entry.get('language', 'python')
-                    }
-                    f.write(json.dumps(simplified_entry) + '\n')
-            logger.info(f"Saved {len(self.dataset_collection['training'])} training examples to {train_file}")
+                    prompt = entry.get('prompt', '')
+                    language = entry.get('language', 'python')
+                    # Create a unique key from prompt and language
+                    entry_key = (prompt, language)
+                    if entry_key not in seen_entries:
+                        seen_entries.add(entry_key)
+                        unique_entries.append({
+                            'prompt': prompt,
+                            'language': language
+                        })
+                
+                with open(train_file, 'w') as f:
+                    for simplified_entry in unique_entries:
+                        f.write(json.dumps(simplified_entry) + '\n')
+                logger.info(f"Saved {len(unique_entries)} unique training examples to {train_file} (deduplicated from {len(self.dataset_collection['training'])} total entries)")
         
         # Save validation dataset (simplified format: only prompt and language)
         if self.dataset_collection['validation']:
@@ -10705,10 +11062,13 @@ def load_config(config_path: str) -> Tuple[RLAIFConfig, dict]:
         reward_bonuses=to_bool(rlaif_cfg.get('reward_bonuses'), False),
         use_lora=to_bool(rlaif_cfg.get('use_lora'), False),
         use_qlora=to_bool(rlaif_cfg.get('use_qlora'), False),
-        lora_r=to_int(rlaif_cfg.get('lora_r'), 16),
-        lora_alpha=to_int(rlaif_cfg.get('lora_alpha'), 32),
+        lora_r=to_int(rlaif_cfg.get('lora_r'), 32),
+        lora_alpha=to_int(rlaif_cfg.get('lora_alpha'), 64),
         lora_dropout=to_float(rlaif_cfg.get('lora_dropout'), 0.05),
         lora_target_modules=rlaif_cfg.get('lora_target_modules'),  # Can be None or list
+        use_rslora=to_bool(rlaif_cfg.get('use_rslora'), True),  # Use Rank-Stabilized LoRA for faster convergence
+        reward_temperature=to_float(rlaif_cfg.get('reward_temperature'), 0.1),  # Temperature for reward stretching
+        use_reward_stretching=to_bool(rlaif_cfg.get('use_reward_stretching'), True),  # Use temperature-scaled softmax to stretch reward signal
         max_length=to_int(model_cfg.get('max_length'), 2048),
         use_4bit=to_bool(model_cfg.get('use_4bit'), True),
         use_mps=to_bool(hardware_cfg.get('use_mps'), True),

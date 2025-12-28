@@ -17,17 +17,17 @@ training:
   output_dir: ./checkpoints
   resume_from_checkpoint: null
   num_epochs: 7
-  batch_size: 4
-  gradient_accumulation_steps: 2   # was 10
+  batch_size: 6  # Increased from 4 to reduce gradient noise (more prompts per batch)
+  gradient_accumulation_steps: 3   # Increased from 2 to reduce gradient noise (effective batch = 18 prompts per optimizer step)
   generation_accumulation_batches: 1
-  learning_rate: 3.0e-5            # see LR notes below
+  learning_rate: 1.5e-5            # Reduced from 3.0e-5 to stabilize training and reduce loss jumps
   optimizer: adamw
   warmup_steps: 8  # Set to 5-10 (or ~0.05-0.1 of total steps) for LoRA
   save_steps: 500
   save_every_epochs: 1
   save_every_batches: 0
   eval_steps: 250
-  logging_steps: 2                 # align with optimizer steps
+  logging_steps: 3                 # Aligned with gradient_accumulation_steps: 3 (logs every optimizer step)
   max_grad_norm: 1.0
   weight_decay: 0.0
   lr_scheduler_type: cosine
@@ -39,17 +39,24 @@ rlaif:
   target_kl: 0.075  # Target KL divergence (0.05-0.10 for code tasks)
   kl_gain: 0.1  # Gain factor for adaptive KL controller (k in exp(k*(observed_kl - target_kl)))
   reward_threshold: 0.02  # Filter low-quality samples (was 0.0)
+  # KL penalty relaxation based on reward (allows exploration when rewards are low)
+  use_reward_based_kl_relaxation: true  # Enable KL penalty relaxation when reward is low
+  kl_relaxation_reward_threshold: 0.5  # If avg_reward < this, reduce KL penalty to allow exploration
+  kl_relaxation_decay_factor: 0.95  # Multiply kl_penalty by this factor when reward is low
+  kl_relaxation_min_penalty: 0.01  # Minimum KL penalty (floor to prevent complete removal)
   beta: 0.1
   top_k: 50
   top_p: 0.9  # Reduced from 0.95 to reduce variance and raise mean reward
-  num_samples_per_prompt: 2  # Reduced from 4 to 2 while stabilizing; increase again once mean rises
-  top_samples_per_prompt: 1  # Train on top-1 or top-2 samples per prompt (increases signal-to-noise)
-  generation_temperature: 0.55  # Start at 0.55; if variance persists, go to 0.50
+  num_samples_per_prompt: 4  # Increased from 2 to 4 for better per-prompt baselines and reduced gradient noise
+  top_samples_per_prompt: 1  # Train on top-1 sample per prompt (better baseline from 4 samples improves signal-to-noise)
+  generation_temperature: 0.8  # Increased to 0.8 for maximum exploration diversity to find higher reward paths
   curriculum_learning: true
   reward_bonuses: false
   use_advantage_normalization: true
   advantage_baseline_type: per_prompt  # Use per-prompt group baseline (mean reward across N samples for the prompt)
   advantage_baseline_ema_alpha: 0.8
+  reward_temperature: 0.1  # Temperature for reward stretching (lower = more emphasis on best response)
+  use_reward_stretching: true  # Use temperature-scaled softmax to stretch reward signal for better gradient signal
   use_frozen_reference_for_kl: true
   use_tiered_scoring: true
   heuristic_score_threshold: 0.3
@@ -58,9 +65,10 @@ rlaif:
   move_rubric_to_system_prompt: true
   use_lora: true
   use_qlora: false
-  lora_r: 16
-  lora_alpha: 32
+  lora_r: 32  # Increased from 16 for more "logical" capacity
+  lora_alpha: 64  # Maintain 2x rank ratio (2 * 32)
   lora_dropout: 0.05
+  use_rslora: true  # Use Rank-Stabilized LoRA for faster convergence
 data:
   train_file: ./data/train.jsonl
   eval_file: ./data/eval.jsonl
@@ -85,7 +93,7 @@ logging:
   log_level: INFO
   save_json_summaries: true
   json_summaries_dir: ./logs/json_summaries
-  baseline_eval_batches: 15  # 15 batches × 8 samples/batch (batch_size=4 × num_samples_per_prompt=2) = 120 completions (within 80-160 target range)
+  baseline_eval_batches: 10  # 10 batches × 24 samples/batch (batch_size=6 × num_samples_per_prompt=4) = 240 completions (above 80-160 target for stable reference)
   tensorboard_batch_interval: 1
   monitoring_interval_s: 5
   system_monitor_step_mode: batch
