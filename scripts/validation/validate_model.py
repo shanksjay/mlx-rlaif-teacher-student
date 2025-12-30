@@ -107,6 +107,7 @@ class ModelValidator:
         self.score_mode = str(score_mode or "absolute").strip().lower()
         if self.score_mode not in {"absolute", "normalized", "both"}:
             raise ValueError("score_mode must be one of: 'absolute', 'normalized', 'both'")
+        self.use_thinking = False  # Will be set via generate_code parameter
 
         # Cache teacher reference per prompt+language to reduce API cost when computing normalized reward.
         # key: f"{prompt}:{language}" -> (teacher_code, teacher_score)
@@ -263,8 +264,13 @@ class ModelValidator:
         *,
         tokenizer=None,
         seed: int | None = None,
+        use_thinking: bool = False,
     ) -> Dict[str, float | str]:
         """Generate code from a model and return code + throughput stats.
+
+        Args:
+            use_thinking: If True, prompt model to think through the problem before generating code.
+                         This can improve output quality by encouraging reasoning.
 
         Returns:
             {
@@ -272,9 +278,27 @@ class ModelValidator:
               "seconds": float,
               "output_tokens": int,
               "tokens_per_sec": float,
+              "thinking_used": bool,
             }
         """
-        formatted_prompt = f"Write high-quality {language} code:\n\n{prompt}\n\nCode:"
+        if use_thinking:
+            # Add thinking/reasoning step to improve output quality
+            formatted_prompt = f"""Write high-quality {language} code. Think through the problem step by step before writing the code.
+
+Problem: {prompt}
+
+Let's think through this step by step:
+1. What are the requirements?
+2. What edge cases should we consider?
+3. What's the best approach?
+4. How can we implement it efficiently?
+
+Now write the code:
+
+```{language}
+"""
+        else:
+            formatted_prompt = f"Write high-quality {language} code:\n\n{prompt}\n\nCode:"
 
         if self.use_mlx:
             try:
@@ -314,6 +338,10 @@ class ModelValidator:
                 code = text[len(formatted_prompt):].strip()
             else:
                 code = str(text)
+            
+            # Extract code from thinking output if thinking was used
+            if use_thinking:
+                code = self._extract_code_from_thinking(code, language)
 
             out_tokens = 0
             try:
@@ -326,7 +354,13 @@ class ModelValidator:
                 out_tokens = 0
 
             tps = float(out_tokens) / float(dt) if dt > 0 else 0.0
-            return {"code": code, "seconds": float(dt), "output_tokens": int(out_tokens), "tokens_per_sec": float(tps)}
+            return {
+                "code": code, 
+                "seconds": float(dt), 
+                "output_tokens": int(out_tokens), 
+                "tokens_per_sec": float(tps),
+                "thinking_used": bool(use_thinking)
+            }
 
         assert self.tokenizer is not None
         self._seed_everything(seed if seed is not None else self.generation_seed)
@@ -358,11 +392,86 @@ class ModelValidator:
             outputs[0][inputs['input_ids'].shape[1]:],
             skip_special_tokens=True
         )
+        
+        # Extract code from thinking output if thinking was used
+        if use_thinking:
+            generated_text = self._extract_code_from_thinking(generated_text, language)
 
         # Approx generated token count
         out_tokens = int(outputs.shape[1] - inputs["input_ids"].shape[1]) if hasattr(outputs, "shape") else 0
         tps = float(out_tokens) / float(dt) if dt > 0 else 0.0
-        return {"code": generated_text, "seconds": float(dt), "output_tokens": int(out_tokens), "tokens_per_sec": float(tps)}
+        return {
+            "code": generated_text, 
+            "seconds": float(dt), 
+            "output_tokens": int(out_tokens), 
+            "tokens_per_sec": float(tps),
+            "thinking_used": bool(use_thinking)
+        }
+
+    def _extract_code_from_thinking(self, text: str, language: str) -> str:
+        """Extract code from thinking output that may include reasoning before code.
+        
+        Looks for code blocks (```language ... ```) or code after thinking/reasoning text.
+        """
+        if not text:
+            return text
+        
+        # Try to find code block first (with closing ```)
+        code_block_pattern = rf"```{re.escape(language)}?\s*\n(.*?)```"
+        match = re.search(code_block_pattern, text, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        
+        # Try generic code block (with closing ```)
+        code_block_pattern = r"```\s*\n(.*?)```"
+        match = re.search(code_block_pattern, text, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        
+        # Try to find code block that starts with ```{language} but doesn't close
+        # (model generated code directly after opening fence)
+        code_block_start_pattern = rf"```{re.escape(language)}?\s*\n(.*)"
+        match = re.search(code_block_start_pattern, text, re.DOTALL)
+        if match:
+            code = match.group(1).strip()
+            # Remove any trailing ``` if present
+            code = re.sub(r'```\s*$', '', code, flags=re.MULTILINE)
+            if code:
+                return code
+        
+        # Try generic code block start (without closing)
+        code_block_start_pattern = r"```\s*\n(.*)"
+        match = re.search(code_block_start_pattern, text, re.DOTALL)
+        if match:
+            code = match.group(1).strip()
+            # Remove any trailing ``` if present
+            code = re.sub(r'```\s*$', '', code, flags=re.MULTILINE)
+            if code:
+                return code
+        
+        # If no code block, look for code-like patterns after thinking markers
+        # Common patterns: "Now write the code:", "Implementation:", "Code:", etc.
+        thinking_markers = [
+            r"Now write the code:?\s*\n",
+            r"Implementation:?\s*\n",
+            r"Code:?\s*\n",
+            r"Solution:?\s*\n",
+            r"Here's the code:?\s*\n",
+        ]
+        
+        for marker in thinking_markers:
+            parts = re.split(marker, text, flags=re.IGNORECASE)
+            if len(parts) > 1:
+                # Take everything after the marker
+                code = "\n".join(parts[1:]).strip()
+                # Remove any code fences if present
+                code = re.sub(r'^```\w*\s*\n', '', code, flags=re.MULTILINE)
+                code = re.sub(r'\n```\s*$', '', code, flags=re.MULTILINE)
+                if code:
+                    return code
+        
+        # If no clear separation, return the text as-is (might be pure code)
+        return text.strip()
 
     def prompt_difficulty(self, prompt: str, language: str) -> dict[str, float]:
         """Compute a rubric-aligned prompt difficulty index.
@@ -635,6 +744,7 @@ class ModelValidator:
         *,
         num_generations_per_prompt: int = 1,
         aggregate: str = "mean",
+        use_thinking: bool = False,
     ) -> Dict:
         """Validate models on test prompts"""
         results = {
@@ -692,6 +802,7 @@ class ModelValidator:
                     language,
                     tokenizer=self.baseline_tokenizer,
                     seed=s,
+                    use_thinking=use_thinking,
                 )
                 baseline_code = str(baseline_gen.get("code", "") or "")
                 baseline_sc = self.score_student(baseline_code, prompt, language)
@@ -708,6 +819,7 @@ class ModelValidator:
                     language,
                     tokenizer=self.fine_tuned_tokenizer,
                     seed=s,
+                    use_thinking=use_thinking,
                 )
                 fine_tuned_code = str(fine_tuned_gen.get("code", "") or "")
                 fine_tuned_sc = self.score_student(fine_tuned_code, prompt, language)
@@ -1057,6 +1169,13 @@ def main():
         default=None,
         help="Optional TensorBoard log dir for validation charts (e.g., ./logs/tensorboard/validation).",
     )
+    parser.add_argument(
+        '--use_thinking',
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable thinking/reasoning step before code generation to improve output quality. "
+             "The model will think through the problem before writing code.",
+    )
     
     args = parser.parse_args()
     
@@ -1092,6 +1211,7 @@ def main():
         test_prompts,
         num_generations_per_prompt=int(args.num_generations_per_prompt),
         aggregate=str(args.aggregate),
+        use_thinking=bool(args.use_thinking),
     )
     
     # Print report
@@ -1121,6 +1241,7 @@ def main():
             'seed': (None if int(args.generation_seed) < 0 else int(args.generation_seed)),
             'num_generations_per_prompt': int(args.num_generations_per_prompt),
             'aggregate': str(args.aggregate),
+            'use_thinking': bool(args.use_thinking),
         },
         'score_mode': str(args.score_mode),
     }
