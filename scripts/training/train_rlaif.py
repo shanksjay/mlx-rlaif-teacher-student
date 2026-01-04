@@ -4714,16 +4714,16 @@ class RLAIFTrainer:
                     top_idxs = idxs[:top_n]
                 
                 for best_idx in top_idxs:
-                sample = samples[best_idx]
+                    sample = samples[best_idx]
                     selected_samples.append((sample, best_idx))
                     
                     # Reward aligned to the *selected* sample for this prompt
-                rr = 0.5
-                try:
-                    if hasattr(self, "_latest_batch_rewards") and self._latest_batch_rewards is not None and best_idx < len(self._latest_batch_rewards):
-                        rr = float(self._latest_batch_rewards[best_idx])
-                except Exception:
                     rr = 0.5
+                    try:
+                        if hasattr(self, "_latest_batch_rewards") and self._latest_batch_rewards is not None and best_idx < len(self._latest_batch_rewards):
+                            rr = float(self._latest_batch_rewards[best_idx])
+                    except Exception:
+                        rr = 0.5
                     selected_rewards.append(rr)
             
             # Add selected samples to batch
@@ -6515,7 +6515,7 @@ class RLAIFTrainer:
                             self._latest_batch_rewards = advantages
                         else:
                             # Store original rewards if normalization disabled
-                        self._latest_batch_rewards = rewards
+                            self._latest_batch_rewards = rewards
 
                         # Reconstruct batch from generated samples (with full sequences: prompt + generated code)
                         # The original batch only has prompts, but we need the full sequences for training
@@ -7643,7 +7643,7 @@ class RLAIFTrainer:
                     param_changes = self._compute_parameter_changes(param_state_before, param_state_after)
                     # Always append parameter changes (even if zero) to track optimizer steps
                     # This ensures num_updates accurately reflects the number of optimizer steps
-                        epoch_param_changes.append(param_changes)
+                    epoch_param_changes.append(param_changes)
                     if param_changes.get('mean_abs_change', 0.0) > 0:
                         logger.info(f"Parameter changes recorded: mean_abs={param_changes.get('mean_abs_change', 0.0):.2e}, max_abs={param_changes.get('max_abs_change', 0.0):.2e}")
                     else:
@@ -9384,10 +9384,10 @@ class RLAIFTrainer:
             baseline = self.baseline_reward if self.baseline_reward is not None else 0.0
             # Only raise threshold if mean reward is at least 0.05 above baseline
             if avg_reward > (baseline + 0.05):
-            new_threshold = min(current_threshold + 0.02, 0.3)  # Increase by 0.02, cap at 0.3
-            if new_threshold != current_threshold:
-                adjustments['reward_threshold'] = (current_threshold, new_threshold)
-                self.config.reward_threshold = new_threshold
+                new_threshold = min(current_threshold + 0.02, 0.3)  # Increase by 0.02, cap at 0.3
+                if new_threshold != current_threshold:
+                    adjustments['reward_threshold'] = (current_threshold, new_threshold)
+                    self.config.reward_threshold = new_threshold
                     logger.info(f"⚠️  Increasing reward threshold: {current_threshold:.4f} → {new_threshold:.4f} (mean reward {avg_reward:.4f} safely above baseline {baseline:.4f})")
             else:
                 logger.debug(f"Skipping reward threshold increase: mean reward {avg_reward:.4f} too close to baseline {baseline:.4f}")
