@@ -1216,45 +1216,82 @@ class RLAIFTrainer:
             self.teacher_score_cache.move_to_end(key)
 
     def _clean_cache_by_age(self, current_time: float = None) -> int:
-        """Remove expired cache entries based on age"""
+        """Remove expired cache entries based on age.
+
+        Optimization: Iterate from oldest to newest (LRU order) and stop early or limit scan depth.
+        Since cache is LRU (OrderedDict), items at the beginning are candidates for expiration.
+        We scan at most a fixed number of items to keep this O(1) per call instead of O(N).
+        """
         # Import time module to avoid scoping issues
-        # (module-level import may be shadowed in some contexts)
         import time
         if current_time is None:
             current_time = time.time()
         
         keys_to_remove = []
-        for key, entry in list(self.teacher_score_cache.items()):
+
+        # Optimization: Don't convert entire dict to list. Use iterator.
+        # Limit scan to avoid O(N) when N is large (e.g. 50k items).
+        # We assume that if we see many valid items in a row at the "old" end,
+        # the rest are likely valid too (since they are newer in LRU terms).
+        scan_limit = 2000  # Check at most oldest 2000 items
+        valid_streak_threshold = 100  # Stop if we see 100 valid items in a row
+        valid_streak = 0
+
+        # Create iterator over items (O(1) setup)
+        iterator = iter(self.teacher_score_cache.items())
+
+        for _ in range(scan_limit):
+            try:
+                key, entry = next(iterator)
+            except StopIteration:
+                break
+
+            is_expired = False
             try:
                 if isinstance(entry, tuple) and len(entry) >= 3:
                     score, timestamp, max_age = entry
                     if timestamp is not None and max_age is not None:
                         age = current_time - timestamp
                         if age >= max_age:
-                            keys_to_remove.append(key)
+                            is_expired = True
                     else:
                         # Invalid timestamp or max_age - remove entry
-                        keys_to_remove.append(key)
+                        is_expired = True
                 elif isinstance(entry, tuple) and len(entry) == 2:
                     # Old format without max_age - use default
                     score, timestamp = entry
                     if timestamp is not None:
                         age = current_time - timestamp
                         if age >= self.teacher_score_cache_max_age_seconds:
-                            keys_to_remove.append(key)
+                            is_expired = True
                     else:
                         # Invalid timestamp - remove entry
-                        keys_to_remove.append(key)
+                        is_expired = True
                 elif not isinstance(entry, tuple):
                     # Very old format (just score) - remove it
-                    keys_to_remove.append(key)
+                    is_expired = True
             except Exception:
                 # Invalid entry format - remove it
+                is_expired = True
+
+            if is_expired:
                 keys_to_remove.append(key)
+                valid_streak = 0
+            else:
+                valid_streak += 1
+                # If we encounter a streak of valid items at the "old" end,
+                # we can assume subsequent (newer) items are also valid.
+                # Exception: Teacher items (max_age=inf) sit in cache forever until LRU evicted.
+                # They might be mixed with old student items. The streak logic handles this:
+                # we skip past a block of teacher items, but if it's too long, we stop.
+                if valid_streak >= valid_streak_threshold:
+                    break
         
         for key in keys_to_remove:
             try:
-                del self.teacher_score_cache[key]
+                # Check existence as key might have been removed by another thread/process (unlikely here but safe)
+                if key in self.teacher_score_cache:
+                    del self.teacher_score_cache[key]
             except Exception:
                 pass
         
