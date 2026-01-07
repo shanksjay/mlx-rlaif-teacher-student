@@ -1215,16 +1215,20 @@ class RLAIFTrainer:
         if isinstance(self.teacher_score_cache, OrderedDict) and hasattr(self.teacher_score_cache, 'move_to_end'):
             self.teacher_score_cache.move_to_end(key)
 
-    def _clean_cache_by_age(self, current_time: float = None) -> int:
-        """Remove expired cache entries based on age"""
+    def _clean_cache_by_age(self, current_time: float = None, limit: int = 100) -> int:
+        """Remove expired cache entries based on age (scan limited to oldest entries)"""
         # Import time module to avoid scoping issues
         # (module-level import may be shadowed in some contexts)
         import time
+        from itertools import islice
+
         if current_time is None:
             current_time = time.time()
         
         keys_to_remove = []
-        for key, entry in list(self.teacher_score_cache.items()):
+        # Scan only the oldest 'limit' entries to avoid O(N) iteration
+        # teacher_score_cache is an OrderedDict (LRU), so iteration starts from oldest/least recently used
+        for key, entry in islice(self.teacher_score_cache.items(), limit):
             try:
                 if isinstance(entry, tuple) and len(entry) >= 3:
                     score, timestamp, max_age = entry
