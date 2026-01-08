@@ -1220,11 +1220,17 @@ class RLAIFTrainer:
         # Import time module to avoid scoping issues
         # (module-level import may be shadowed in some contexts)
         import time
+        import itertools
         if current_time is None:
             current_time = time.time()
         
         keys_to_remove = []
-        for key, entry in list(self.teacher_score_cache.items()):
+        # Optimization: Limit cleanup scan to avoid O(N) spikes on large caches.
+        # Check at most 1000 oldest/LRU entries per call.
+        # Since this runs periodically, it will eventually clean up everything.
+        scan_limit = 1000
+
+        for key, entry in itertools.islice(self.teacher_score_cache.items(), scan_limit):
             try:
                 if isinstance(entry, tuple) and len(entry) >= 3:
                     score, timestamp, max_age = entry
