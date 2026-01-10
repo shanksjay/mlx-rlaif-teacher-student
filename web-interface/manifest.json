@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "RLAIF Agent Controller",
+  "version": "1.0",
+  "description": "Local control for RLAIF Agents",
+  "permissions": ["storage", "activeTab"],
+  "host_permissions": ["http://localhost:8000/*"],
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  }
+}
