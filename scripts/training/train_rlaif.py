@@ -22,6 +22,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 
+import itertools
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -1224,7 +1225,14 @@ class RLAIFTrainer:
             current_time = time.time()
         
         keys_to_remove = []
-        for key, entry in list(self.teacher_score_cache.items()):
+        # Optimization: Only check the first 2000 items (LRU items)
+        # OrderedDict is insertion-ordered (or access-ordered if move_to_end is used).
+        # We assume oldest/least-used items are at the front.
+        max_check = 2000
+
+        # Use islice to avoid copying the whole list (O(N) -> O(k))
+        # OrderedDict.items() returns a view, islice works on it without copying everything.
+        for key, entry in itertools.islice(self.teacher_score_cache.items(), max_check):
             try:
                 if isinstance(entry, tuple) and len(entry) >= 3:
                     score, timestamp, max_age = entry
