@@ -21,6 +21,7 @@ from datetime import datetime
 import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
+import itertools
 
 import torch
 import torch.nn as nn
@@ -1216,7 +1217,13 @@ class RLAIFTrainer:
             self.teacher_score_cache.move_to_end(key)
 
     def _clean_cache_by_age(self, current_time: float = None) -> int:
-        """Remove expired cache entries based on age"""
+        """Remove expired cache entries based on age.
+
+        Optimized to be O(1) bounded check:
+        1. Iterates keys directly (no list copy)
+        2. Breaks early on first valid item (OrderedDict is sorted by insertion/update)
+        3. Limits check to oldest 5000 items to guarantee low latency
+        """
         # Import time module to avoid scoping issues
         # (module-level import may be shadowed in some contexts)
         import time
@@ -1224,14 +1231,28 @@ class RLAIFTrainer:
             current_time = time.time()
         
         keys_to_remove = []
-        for key, entry in list(self.teacher_score_cache.items()):
+
+        # Optimization: use islice to check only oldest items (bounded work)
+        # self.teacher_score_cache is an OrderedDict, so iteration yields keys in insertion order (oldest first).
+        # We limit the check to 5000 items to ensure this function never stalls the pipeline,
+        # even if the cache grows very large.
+        check_limit = 5000
+
+        # Iterate keys directly (avoid list(items()) copy which is O(N))
+        for key in itertools.islice(self.teacher_score_cache, check_limit):
             try:
+                entry = self.teacher_score_cache[key]
+
                 if isinstance(entry, tuple) and len(entry) >= 3:
                     score, timestamp, max_age = entry
                     if timestamp is not None and max_age is not None:
                         age = current_time - timestamp
                         if age >= max_age:
                             keys_to_remove.append(key)
+                        else:
+                            # Found a non-expired item. Since items are roughly ordered by time
+                            # (updated items move to end), we can break early.
+                            break
                     else:
                         # Invalid timestamp or max_age - remove entry
                         keys_to_remove.append(key)
@@ -1242,6 +1263,9 @@ class RLAIFTrainer:
                         age = current_time - timestamp
                         if age >= self.teacher_score_cache_max_age_seconds:
                             keys_to_remove.append(key)
+                        else:
+                            # Found valid item, break early
+                            break
                     else:
                         # Invalid timestamp - remove entry
                         keys_to_remove.append(key)
