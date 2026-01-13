@@ -1224,29 +1224,29 @@ class RLAIFTrainer:
             current_time = time.time()
         
         keys_to_remove = []
-        for key, entry in list(self.teacher_score_cache.items()):
+        # Optimization: iterate over view instead of copying list (O(N) memory/time save)
+        # Note: We can modify dict in the deletion loop below, so view iteration here is safe
+        # provided no other thread modifies the dict concurrently (which is true in current training loop).
+        for key, entry in self.teacher_score_cache.items():
             try:
-                if isinstance(entry, tuple) and len(entry) >= 3:
-                    score, timestamp, max_age = entry
-                    if timestamp is not None and max_age is not None:
-                        age = current_time - timestamp
-                        if age >= max_age:
-                            keys_to_remove.append(key)
-                    else:
-                        # Invalid timestamp or max_age - remove entry
+                timestamp = None
+                max_age = None
+
+                # Parse entry
+                if isinstance(entry, tuple):
+                    if len(entry) >= 3:
+                        _, timestamp, max_age = entry
+                    elif len(entry) == 2:
+                        _, timestamp = entry
+                        max_age = self.teacher_score_cache_max_age_seconds
+
+                # Check validity
+                if timestamp is not None and max_age is not None:
+                    age = current_time - timestamp
+                    if age >= max_age:
                         keys_to_remove.append(key)
-                elif isinstance(entry, tuple) and len(entry) == 2:
-                    # Old format without max_age - use default
-                    score, timestamp = entry
-                    if timestamp is not None:
-                        age = current_time - timestamp
-                        if age >= self.teacher_score_cache_max_age_seconds:
-                            keys_to_remove.append(key)
-                    else:
-                        # Invalid timestamp - remove entry
-                        keys_to_remove.append(key)
-                elif not isinstance(entry, tuple):
-                    # Very old format (just score) - remove it
+                else:
+                    # Invalid format or missing timestamp - remove it
                     keys_to_remove.append(key)
             except Exception:
                 # Invalid entry format - remove it
