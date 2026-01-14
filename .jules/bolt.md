@@ -1,0 +1,3 @@
+## 2024-05-22 - [Optimizing Large Cache Iteration]
+**Learning:** `OrderedDict` items iteration in `train_rlaif.py` was using `list(items())` to safely iterate while modifying, creating a massive O(N) copy overhead (100k items).
+**Action:** In fork-join threading architectures (like `ThreadPoolExecutor` context managers used here), worker threads are joined before the main thread performs cleanup. This allows safe, zero-copy iteration over collections using view iterators (`items()`) instead of snapshots (`list(items())`), provided the main thread logic itself is correct. Always verify threading model before removing defensive copies.
