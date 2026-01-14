@@ -21,6 +21,7 @@ from datetime import datetime
 import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
+from collections import OrderedDict
 
 import torch
 import torch.nn as nn
@@ -1196,8 +1197,6 @@ class RLAIFTrainer:
 
     def _add_to_cache(self, key: str, score: float, timestamp: float, max_age: Optional[float] = None):
         """Add entry to LRU cache with size and age management"""
-        from collections import OrderedDict
-        
         # Remove oldest entries if cache is full (LRU eviction)
         while len(self.teacher_score_cache) >= self.teacher_score_cache_max_size:
             # Remove least recently used (first item for OrderedDict, arbitrary for dict)
@@ -1224,7 +1223,7 @@ class RLAIFTrainer:
             current_time = time.time()
         
         keys_to_remove = []
-        for key, entry in list(self.teacher_score_cache.items()):
+        for key, entry in self.teacher_score_cache.items():
             try:
                 if isinstance(entry, tuple) and len(entry) >= 3:
                     score, timestamp, max_age = entry
@@ -2675,7 +2674,6 @@ class RLAIFTrainer:
         # Performance optimizations
         self.teacher_cache = {}  # Cache teacher responses (key: f"{prompt}:{language}")
         # LRU cache for teacher scores with size limit and age tracking
-        from collections import OrderedDict
         self.teacher_score_cache = OrderedDict()  # LRU cache: key -> (score, timestamp)
         self.teacher_score_cache_max_size = int(getattr(config, 'teacher_score_cache_max_size', 10000) or 10000)
         # Default cache TTL: 4 hours (14400s) to reduce cache misses during baseline + early epochs
