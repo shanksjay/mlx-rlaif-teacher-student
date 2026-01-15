@@ -1224,7 +1224,11 @@ class RLAIFTrainer:
             current_time = time.time()
         
         keys_to_remove = []
-        for key, entry in list(self.teacher_score_cache.items()):
+        # Optimization: Iterate over items view directly instead of creating a list copy.
+        # This is safe because we are not modifying the dictionary structure during iteration
+        # (modifications happen in the second loop over keys_to_remove).
+        # This avoids an O(N) copy operation, which is significant for large caches.
+        for key, entry in self.teacher_score_cache.items():
             try:
                 if isinstance(entry, tuple) and len(entry) >= 3:
                     score, timestamp, max_age = entry
@@ -5751,7 +5755,8 @@ class RLAIFTrainer:
             # Optionally: Clear only very old student scores (e.g., >2 epochs old)
             # But keep recent ones to maintain stability
             student_keys_to_remove = []
-            for key, entry in list(self.teacher_score_cache.items()):
+            # Optimization: Iterate over items view directly to avoid list copy
+            for key, entry in self.teacher_score_cache.items():
                 if not key.startswith("TEACHER_CODE:"):
                     try:
                         if entry is not None and isinstance(entry, tuple) and len(entry) >= 2:
