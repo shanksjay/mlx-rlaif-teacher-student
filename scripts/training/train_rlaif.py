@@ -76,6 +76,15 @@ torch_inductor_logger.setLevel(logging.ERROR)  # Only show errors, suppress warn
 # -------------------------
 import re
 
+# Pre-compiled regex patterns for performance optimization
+RE_CONSTRAINTS = re.compile(r"\bconstraints?\b|\bguarantee\b|\bmust\b|\bshould\b")
+RE_TIME_UNITS = re.compile(r"\b\d+\s*(ms|seconds|s)\b")
+RE_SIZE_UNITS = re.compile(r"\b\d+\s*(items|elements|rows|cols|nodes)\b|\bup to\b")
+RE_FENCE_START = re.compile(r"^\s*```[^\n]*\n")
+RE_FENCE_END = re.compile(r"\n```\s*$")
+RE_PERCENT_SCORE = re.compile(r"(?<!\d)(\d+(?:\.\d+)?)\s*%(?!\d)")
+RE_FLOAT_SCORE = re.compile(r"(?<!\d)(?:0(?:\.\d+)?|1(?:\.0+)?|\.\d+)(?!\d)")
+
 
 def _enhance_prompt_with_constraints(
     prompt: str, 
@@ -224,7 +233,7 @@ def _rubric_difficulty_components(prompt: str, language: str) -> dict[str, float
         ]
     )
     # Presence of constraints section-like patterns increases correctness demand.
-    if re.search(r"\bconstraints?\b|\bguarantee\b|\bmust\b|\bshould\b", p):
+    if RE_CONSTRAINTS.search(p):
         correctness_hits += 1
     correctness = min(1.0, correctness_hits / 6.0)
 
@@ -275,9 +284,9 @@ def _rubric_difficulty_components(prompt: str, language: str) -> dict[str, float
             "linear time",
         ]
     )
-    if re.search(r"\b\d+\s*(ms|seconds|s)\b", p):
+    if RE_TIME_UNITS.search(p):
         eff_hits += 1
-    if re.search(r"\b\d+\s*(items|elements|rows|cols|nodes)\b|\bup to\b", p):
+    if RE_SIZE_UNITS.search(p):
         eff_hits += 1
     efficiency = min(1.0, eff_hits / 6.0)
 
@@ -578,6 +587,51 @@ class BucketedCurriculumSampler(torch.utils.data.Sampler[int]):
                     remaining -= 1
 
         return iter(out)
+
+
+def _strip_code_fences(text: str) -> str:
+    """Remove surrounding ```lang ... ``` fences if present."""
+    t = (text or "").strip()
+    # Remove a leading fence line like ``` or ```python
+    t = RE_FENCE_START.sub("", t)
+    # Remove a trailing fence
+    t = RE_FENCE_END.sub("", t)
+    return t.strip()
+
+
+def _extract_score(text: str) -> Optional[float]:
+    """Best-effort extraction of a float score in [0,1] from a teacher response."""
+    if not text:
+        return None
+    cleaned = _strip_code_fences(text).strip()
+    # First token often is the score; this avoids picking up rubric numbers if the model misbehaves.
+    first_tok = cleaned.split()[0].strip() if cleaned.split() else cleaned
+    for candidate in (first_tok, cleaned):
+        try:
+            v = float(candidate)
+            if 0.0 <= v <= 1.0:
+                return v
+        except Exception:
+            pass
+    # Percent form like "75%" -> 0.75
+    m = RE_PERCENT_SCORE.search(cleaned)
+    if m:
+        try:
+            v = float(m.group(1)) / 100.0
+            if 0.0 <= v <= 1.0:
+                return v
+        except Exception:
+            pass
+    # Float in [0,1], including ".75"
+    m = RE_FLOAT_SCORE.search(cleaned)
+    if m:
+        try:
+            v = float(m.group(0))
+            if 0.0 <= v <= 1.0:
+                return v
+        except Exception:
+            pass
+    return None
 
 
 class TeacherModel:
@@ -976,51 +1030,6 @@ IMPORTANT: Respond with ONLY a single float between 0.0 and 1.0 (e.g., 0.75). Do
                 "Output nothing else: no code, no markdown, no words, no extra whitespace, no trailing newline."
             )
 
-        def _strip_code_fences(text: str) -> str:
-            """Remove surrounding ```lang ... ``` fences if present."""
-            import re
-            t = (text or "").strip()
-            # Remove a leading fence line like ``` or ```python
-            t = re.sub(r"^\s*```[^\n]*\n", "", t)
-            # Remove a trailing fence
-            t = re.sub(r"\n```\s*$", "", t)
-            return t.strip()
-
-        def _extract_score(text: str) -> Optional[float]:
-            """Best-effort extraction of a float score in [0,1] from a teacher response."""
-            import re
-            if not text:
-                return None
-            cleaned = _strip_code_fences(text).strip()
-            # First token often is the score; this avoids picking up rubric numbers if the model misbehaves.
-            first_tok = cleaned.split()[0].strip() if cleaned.split() else cleaned
-            for candidate in (first_tok, cleaned):
-                try:
-                    v = float(candidate)
-                    if 0.0 <= v <= 1.0:
-                        return v
-                except Exception:
-                    pass
-            # Percent form like "75%" -> 0.75
-            m = re.search(r"(?<!\d)(\d+(?:\.\d+)?)\s*%(?!\d)", cleaned)
-            if m:
-                try:
-                    v = float(m.group(1)) / 100.0
-                    if 0.0 <= v <= 1.0:
-                        return v
-                except Exception:
-                    pass
-            # Float in [0,1], including ".75"
-            m = re.search(r"(?<!\d)(?:0(?:\.\d+)?|1(?:\.0+)?|\.\d+)(?!\d)", cleaned)
-            if m:
-                try:
-                    v = float(m.group(0))
-                    if 0.0 <= v <= 1.0:
-                        return v
-                except Exception:
-                    pass
-            return None
-        
         # Suppress deprecation warnings for Anthropic API calls
         import warnings
         with warnings.catch_warnings():
