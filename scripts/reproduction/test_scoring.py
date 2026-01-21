@@ -31,6 +31,10 @@ sys.path.append(path)
 from train_rlaif import _rubric_difficulty_components
 
 class TestRubricDifficulty(unittest.TestCase):
+    """
+    Unit tests for the rubric difficulty estimation logic.
+    Automatically discovered and run by unittest.main().
+    """
     def test_rubric_difficulty(self):
         # Test case 1: Complex prompt
         prompt = "Write a python function to implement a thread-safe LRU cache that handles concurrent access and validates input. It should be efficient and well documented."
