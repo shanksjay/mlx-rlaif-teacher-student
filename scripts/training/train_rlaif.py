@@ -77,6 +77,39 @@ torch_inductor_logger.setLevel(logging.ERROR)  # Only show errors, suppress warn
 # -------------------------
 import re
 
+# Pre-compile regex patterns for performance optimization
+# Rubric estimation patterns
+_RE_CONSTRAINTS = re.compile(r"\bconstraints?\b|\bguarantee\b|\bmust\b|\bshould\b")
+_RE_EFFICIENCY_TIME = re.compile(r"\b\d+\s*(ms|seconds|s)\b")
+_RE_EFFICIENCY_SCALE = re.compile(r"\b\d+\s*(items|elements|rows|cols|nodes)\b|\bup to\b")
+
+# Score extraction patterns
+_RE_FENCE_START = re.compile(r"^\s*```[^\n]*\n")
+_RE_FENCE_END = re.compile(r"\n```\s*$")
+_RE_SCORE_PERCENT = re.compile(r"(?<!\d)(\d+(?:\.\d+)?)\s*%(?!\d)")
+_RE_SCORE_FLOAT = re.compile(r"(?<!\d)(?:0(?:\.\d+)?|1(?:\.0+)?|\.\d+)(?!\d)")
+
+# Keyword sets for fast checking
+_CORRECTNESS_KEYWORDS = [
+    "edge case", "corner case", "validate", "invalid", "error handling", "robust", "safely",
+    "thread-safe", "thread safe", "lock-free", "deadlock", "race", "atomic", "parse", "parser",
+    "serialize", "deserialize", "json", "unicode", "overflow", "underflow", "null", "nullptr",
+]
+_QUALITY_KEYWORDS = [
+    "clean", "readable", "well-structured", "well structured", "maintainable", "refactor",
+    "design pattern", "singleton", "raii", "interface", "abstraction", "encapsulation", "modular",
+    "unit test", "tests",
+]
+_QUALITY_CLASS_KEYWORDS = ["class ", "api", "library", "module"]
+_EFFICIENCY_KEYWORDS = [
+    "efficient", "optimize", "performance", "fast", "low latency", "high throughput", "big-o", "o(",
+    "time complexity", "space complexity", "memory", "constant time", "log n", "n log n", "linear time",
+]
+_DOC_KEYWORDS = [
+    "document", "documentation", "docstring", "comments", "commented", "well-documented",
+    "well documented", "explain", "explanation", "examples",
+]
+
 
 def _enhance_prompt_with_constraints(
     prompt: str, 
@@ -196,108 +229,29 @@ def _rubric_difficulty_components(prompt: str, language: str) -> dict[str, float
         return sum(1 for w in words if w in p)
 
     # Correctness: multi-part requirements, edge cases, concurrency/safety, parsing, etc.
-    correctness_hits = 0
-    correctness_hits += count_any(
-        [
-            "edge case",
-            "corner case",
-            "validate",
-            "invalid",
-            "error handling",
-            "robust",
-            "safely",
-            "thread-safe",
-            "thread safe",
-            "lock-free",
-            "deadlock",
-            "race",
-            "atomic",
-            "parse",
-            "parser",
-            "serialize",
-            "deserialize",
-            "json",
-            "unicode",
-            "overflow",
-            "underflow",
-            "null",
-            "nullptr",
-        ]
-    )
+    correctness_hits = count_any(_CORRECTNESS_KEYWORDS)
     # Presence of constraints section-like patterns increases correctness demand.
-    if re.search(r"\bconstraints?\b|\bguarantee\b|\bmust\b|\bshould\b", p):
+    if _RE_CONSTRAINTS.search(p):
         correctness_hits += 1
     correctness = min(1.0, correctness_hits / 6.0)
 
     # Code quality: API design, patterns, RAII, clean architecture, tests.
-    quality_hits = 0
-    quality_hits += count_any(
-        [
-            "clean",
-            "readable",
-            "well-structured",
-            "well structured",
-            "maintainable",
-            "refactor",
-            "design pattern",
-            "singleton",
-            "raii",
-            "interface",
-            "abstraction",
-            "encapsulation",
-            "modular",
-            "unit test",
-            "tests",
-        ]
-    )
+    quality_hits = count_any(_QUALITY_KEYWORDS)
     # If prompt asks for "class" or "library" style implementation, quality demands rise.
-    if has_any(["class ", "api", "library", "module"]):
+    if has_any(_QUALITY_CLASS_KEYWORDS):
         quality_hits += 1
     quality = min(1.0, quality_hits / 6.0)
 
     # Efficiency: performance constraints, complexity, optimization, large input.
-    eff_hits = 0
-    eff_hits += count_any(
-        [
-            "efficient",
-            "optimize",
-            "performance",
-            "fast",
-            "low latency",
-            "high throughput",
-            "big-o",
-            "o(",
-            "time complexity",
-            "space complexity",
-            "memory",
-            "constant time",
-            "log n",
-            "n log n",
-            "linear time",
-        ]
-    )
-    if re.search(r"\b\d+\s*(ms|seconds|s)\b", p):
+    eff_hits = count_any(_EFFICIENCY_KEYWORDS)
+    if _RE_EFFICIENCY_TIME.search(p):
         eff_hits += 1
-    if re.search(r"\b\d+\s*(items|elements|rows|cols|nodes)\b|\bup to\b", p):
+    if _RE_EFFICIENCY_SCALE.search(p):
         eff_hits += 1
     efficiency = min(1.0, eff_hits / 6.0)
 
     # Documentation: explicit documentation/comments, examples.
-    doc_hits = 0
-    doc_hits += count_any(
-        [
-            "document",
-            "documentation",
-            "docstring",
-            "comments",
-            "commented",
-            "well-documented",
-            "well documented",
-            "explain",
-            "explanation",
-            "examples",
-        ]
-    )
+    doc_hits = count_any(_DOC_KEYWORDS)
     documentation = min(1.0, doc_hits / 4.0)
 
     # Composite rubric demand (mirrors scoring weights)
@@ -319,6 +273,51 @@ def _rubric_difficulty_components(prompt: str, language: str) -> dict[str, float
         "rubric_demand": float(min(1.0, max(0.0, demand))),
         "lang_weight": float(lang_weight),
     }
+
+
+def _strip_code_fences(text: str) -> str:
+    """Remove surrounding ```lang ... ``` fences if present."""
+    t = (text or "").strip()
+    # Remove a leading fence line like ``` or ```python
+    t = _RE_FENCE_START.sub("", t)
+    # Remove a trailing fence
+    t = _RE_FENCE_END.sub("", t)
+    return t.strip()
+
+
+def _extract_score(text: str) -> Optional[float]:
+    """Best-effort extraction of a float score in [0,1] from a teacher response."""
+    if not text:
+        return None
+    cleaned = _strip_code_fences(text).strip()
+    # First token often is the score; this avoids picking up rubric numbers if the model misbehaves.
+    first_tok = cleaned.split()[0].strip() if cleaned.split() else cleaned
+    for candidate in (first_tok, cleaned):
+        try:
+            v = float(candidate)
+            if 0.0 <= v <= 1.0:
+                return v
+        except Exception:
+            pass
+    # Percent form like "75%" -> 0.75
+    m = _RE_SCORE_PERCENT.search(cleaned)
+    if m:
+        try:
+            v = float(m.group(1)) / 100.0
+            if 0.0 <= v <= 1.0:
+                return v
+        except Exception:
+            pass
+    # Float in [0,1], including ".75"
+    m = _RE_SCORE_FLOAT.search(cleaned)
+    if m:
+        try:
+            v = float(m.group(0))
+            if 0.0 <= v <= 1.0:
+                return v
+        except Exception:
+            pass
+    return None
 
 
 @dataclass
@@ -977,50 +976,8 @@ IMPORTANT: Respond with ONLY a single float between 0.0 and 1.0 (e.g., 0.75). Do
                 "Output nothing else: no code, no markdown, no words, no extra whitespace, no trailing newline."
             )
 
-        def _strip_code_fences(text: str) -> str:
-            """Remove surrounding ```lang ... ``` fences if present."""
-            import re
-            t = (text or "").strip()
-            # Remove a leading fence line like ``` or ```python
-            t = re.sub(r"^\s*```[^\n]*\n", "", t)
-            # Remove a trailing fence
-            t = re.sub(r"\n```\s*$", "", t)
-            return t.strip()
-
-        def _extract_score(text: str) -> Optional[float]:
-            """Best-effort extraction of a float score in [0,1] from a teacher response."""
-            import re
-            if not text:
-                return None
-            cleaned = _strip_code_fences(text).strip()
-            # First token often is the score; this avoids picking up rubric numbers if the model misbehaves.
-            first_tok = cleaned.split()[0].strip() if cleaned.split() else cleaned
-            for candidate in (first_tok, cleaned):
-                try:
-                    v = float(candidate)
-                    if 0.0 <= v <= 1.0:
-                        return v
-                except Exception:
-                    pass
-            # Percent form like "75%" -> 0.75
-            m = re.search(r"(?<!\d)(\d+(?:\.\d+)?)\s*%(?!\d)", cleaned)
-            if m:
-                try:
-                    v = float(m.group(1)) / 100.0
-                    if 0.0 <= v <= 1.0:
-                        return v
-                except Exception:
-                    pass
-            # Float in [0,1], including ".75"
-            m = re.search(r"(?<!\d)(?:0(?:\.\d+)?|1(?:\.0+)?|\.\d+)(?!\d)", cleaned)
-            if m:
-                try:
-                    v = float(m.group(0))
-                    if 0.0 <= v <= 1.0:
-                        return v
-                except Exception:
-                    pass
-            return None
+        # Helper functions are now top-level for performance optimization (pre-compiled regex)
+        pass
         
         # Suppress deprecation warnings for Anthropic API calls
         import warnings
@@ -1223,6 +1180,10 @@ class RLAIFTrainer:
             current_time = time.time()
         
         keys_to_remove = []
+        # Optimization: Iterate over items view directly instead of creating a list copy.
+        # This is safe because we are not modifying the dictionary structure during iteration
+        # (modifications happen in the second loop over keys_to_remove).
+        # This avoids an O(N) copy operation, which is significant for large caches.
         for key, entry in self.teacher_score_cache.items():
             try:
                 if isinstance(entry, tuple) and len(entry) >= 3:
@@ -5749,7 +5710,8 @@ class RLAIFTrainer:
             # Optionally: Clear only very old student scores (e.g., >2 epochs old)
             # But keep recent ones to maintain stability
             student_keys_to_remove = []
-            for key, entry in list(self.teacher_score_cache.items()):
+            # Optimization: Iterate over items view directly to avoid list copy
+            for key, entry in self.teacher_score_cache.items():
                 if not key.startswith("TEACHER_CODE:"):
                     try:
                         if entry is not None and isinstance(entry, tuple) and len(entry) >= 2:
