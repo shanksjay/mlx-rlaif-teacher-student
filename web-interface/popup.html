@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <style>
+    body { width: 300px; padding: 10px; font-family: sans-serif; }
+    .status { margin-bottom: 10px; padding: 5px; border-radius: 4px; }
+    .online { background-color: #d4edda; color: #155724; }
+    .offline { background-color: #f8d7da; color: #721c24; }
+    button { width: 100%; margin-top: 5px; padding: 8px; cursor: pointer; }
+    pre { background: #f0f0f0; padding: 5px; font-size: 11px; overflow-x: auto; }
+  </style>
+</head>
+<body>
+  <h3>RLAIF Agent Control</h3>
+  <div id="status" class="status offline">Connecting...</div>
+
+  <div id="controls">
+    <button id="check-system">Check System Specs</button>
+    <button id="train-intent">Start Training Task</button>
+  </div>
+
+  <div id="output" style="margin-top: 10px;"></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
