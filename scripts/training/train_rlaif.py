@@ -212,6 +212,7 @@ def _enhance_prompt_with_constraints(
     return "\n".join(enhanced_parts)
 
 
+@lru_cache(maxsize=1024)
 def _rubric_difficulty_components(prompt: str, language: str) -> dict[str, float]:
     """Estimate how *demanding* the prompt is along the teacher rubric dimensions.
 
@@ -291,7 +292,7 @@ def _extract_score(text: str) -> Optional[float]:
         return None
     cleaned = _strip_code_fences(text).strip()
     # First token often is the score; this avoids picking up rubric numbers if the model misbehaves.
-    first_tok = cleaned.split()[0].strip() if cleaned.split() else cleaned
+    first_tok = cleaned.split(maxsplit=1)[0].strip() if cleaned else cleaned
     for candidate in (first_tok, cleaned):
         try:
             v = float(candidate)
