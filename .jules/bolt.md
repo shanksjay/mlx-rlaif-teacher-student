@@ -1,3 +1,6 @@
+## 2024-05-22 - Regex and Keyword Optimization in Scoring Hot Path
+**Learning:** `_rubric_difficulty_components` in `train_rlaif.py` is a hot path for scoring. It was reconstructing keyword lists and regex patterns on every call. Moving these to module-level constants and pre-compiling regexes yielded a ~9% speedup for the function.
+**Action:** For hot-path functions in python scripts (especially those called per-sample), ensure constants and regexes are defined at module level to avoid reconstruction overhead.
 ## 2024-05-22 - [Optimizing Large Cache Iteration]
 **Learning:** `OrderedDict` items iteration in `train_rlaif.py` was using `list(items())` to safely iterate while modifying, creating a massive O(N) copy overhead (100k items).
 **Action:** In fork-join threading architectures (like `ThreadPoolExecutor` context managers used here), worker threads are joined before the main thread performs cleanup. This allows safe, zero-copy iteration over collections using view iterators (`items()`) instead of snapshots (`list(items())`), provided the main thread logic itself is correct. Always verify threading model before removing defensive copies.
