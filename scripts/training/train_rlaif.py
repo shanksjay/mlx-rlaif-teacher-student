@@ -214,6 +214,95 @@ def _enhance_prompt_with_constraints(
 
 @lru_cache(maxsize=1024)
 def _rubric_difficulty_components(prompt: str, language: str) -> dict[str, float]:
+# Constants for rubric difficulty estimation
+_CORRECTNESS_KEYWORDS = [
+    "edge case", "corner case", "validate", "invalid", "error handling",
+    "robust", "safely", "thread-safe", "thread safe", "lock-free",
+    "deadlock", "race", "atomic", "parse", "parser", "serialize",
+    "deserialize", "json", "unicode", "overflow", "underflow",
+    "null", "nullptr",
+]
+_QUALITY_KEYWORDS = [
+    "clean", "readable", "well-structured", "well structured",
+    "maintainable", "refactor", "design pattern", "singleton",
+    "raii", "interface", "abstraction", "encapsulation",
+    "modular", "unit test", "tests",
+]
+_EFFICIENCY_KEYWORDS = [
+    "efficient", "optimize", "performance", "fast",
+    "low latency", "high throughput", "big-o", "o(",
+    "time complexity", "space complexity", "memory",
+    "constant time", "log n", "n log n", "linear time",
+]
+_DOCUMENTATION_KEYWORDS = [
+    "document", "documentation", "docstring",
+    "comments", "commented", "well-documented",
+    "well documented", "explain", "explanation",
+    "examples",
+]
+_CLASS_API_KEYWORDS = ["class ", "api", "library", "module"]
+
+# Pre-compiled regex patterns
+_RE_CONSTRAINTS = re.compile(r"\bconstraints?\b|\bguarantee\b|\bmust\b|\bshould\b")
+_RE_TIME_UNITS = re.compile(r"\b\d+\s*(ms|seconds|s)\b")
+_RE_SIZE_UNITS = re.compile(r"\b\d+\s*(items|elements|rows|cols|nodes)\b|\bup to\b")
+
+# Regex for stripping code fences and score extraction
+_RE_FENCE_START = re.compile(r"^\s*```[^\n]*\n")
+_RE_FENCE_END = re.compile(r"\n```\s*$")
+_RE_SCORE_PERCENT = re.compile(r"(?<!\d)(\d+(?:\.\d+)?)\s*%(?!\d)")
+_RE_SCORE_FLOAT = re.compile(r"(?<!\d)(?:0(?:\.\d+)?|1(?:\.0+)?|\.\d+)(?!\d)")
+
+
+def _strip_code_fences(text: str) -> str:
+    """Remove surrounding ```lang ... ``` fences if present."""
+    t = (text or "").strip()
+    # Remove a leading fence line like ``` or ```python
+    t = _RE_FENCE_START.sub("", t)
+    # Remove a trailing fence
+    t = _RE_FENCE_END.sub("", t)
+    return t.strip()
+
+
+def _extract_score(text: str) -> Optional[float]:
+    """Best-effort extraction of a float score in [0,1] from a teacher response."""
+    if not text:
+        return None
+    cleaned = _strip_code_fences(text).strip()
+    # First token often is the score; this avoids picking up rubric numbers if the model misbehaves.
+    first_tok = cleaned.split()[0].strip() if cleaned.split() else cleaned
+    for candidate in (first_tok, cleaned):
+        try:
+            v = float(candidate)
+            if 0.0 <= v <= 1.0:
+                return v
+        except Exception:
+            pass
+    # Percent form like "75%" -> 0.75
+    m = _RE_SCORE_PERCENT.search(cleaned)
+    if m:
+        try:
+            v = float(m.group(1)) / 100.0
+            if 0.0 <= v <= 1.0:
+                return v
+        except Exception:
+            pass
+    # Float in [0,1], including ".75"
+    m = _RE_SCORE_FLOAT.search(cleaned)
+    if m:
+        try:
+            v = float(m.group(0))
+            if 0.0 <= v <= 1.0:
+                return v
+        except Exception:
+            pass
+    return None
+
+
+# Cache heuristic results to avoid re-scanning the same prompt multiple times
+# (e.g. during num_samples_per_prompt generation loop).
+@lru_cache(maxsize=1024)
+def _rubric_difficulty_components_impl(prompt: str, language: str) -> dict[str, float]:
     """Estimate how *demanding* the prompt is along the teacher rubric dimensions.
 
     Returns values in [0,1] (higher = more demanding).
@@ -274,6 +363,19 @@ def _rubric_difficulty_components(prompt: str, language: str) -> dict[str, float
         "rubric_demand": float(min(1.0, max(0.0, demand))),
         "lang_weight": float(lang_weight),
     }
+
+
+def _rubric_difficulty_components(prompt: str, language: str) -> dict[str, float]:
+    """Estimate how *demanding* the prompt is along the teacher rubric dimensions.
+
+    Returns values in [0,1] (higher = more demanding).
+
+    This is intentionally a lightweight heuristic (keyword/constraint based) so it can run in the hot path.
+
+    Note: This is a wrapper around a cached implementation that returns a defensive copy.
+    This ensures that even if callers modify the returned dictionary, the cache remains unpolluted.
+    """
+    return _rubric_difficulty_components_impl(prompt, language).copy()
 
 
 def _strip_code_fences(text: str) -> str:

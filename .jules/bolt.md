@@ -11,3 +11,6 @@
 ## 2026-01-22 - [Caching Mutable Returns]
 **Learning:** Caching functions that return mutable objects (like dicts) with `lru_cache` returns references to the same object.
 **Action:** Ensure callers treat cached return values as read-only, or return immutable types (tuple/MappingProxyType) if modification risk is high. In `train_rlaif.py`, rubric components are treated as read-only.
+## 2024-05-22 - Safe Caching of Mutable Objects
+**Learning:** `_rubric_difficulty_components` in `train_rlaif.py` returns a mutable dictionary. Simply caching it with `@lru_cache` is dangerous because callers might modify the returned dictionary, polluting the cache for future calls.
+**Action:** When caching functions that return mutable objects (dicts, lists), use a two-layer approach: 1) A cached implementation function (`_impl`) that returns the object, and 2) A wrapper function that calls `_impl(...).copy()` to return a safe, independent copy to the caller. This incurs a small copy cost but guarantees correctness.
