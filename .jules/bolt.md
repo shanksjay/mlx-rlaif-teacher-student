@@ -1,12 +1,3 @@
-## 2024-05-22 - Regex and Keyword Optimization in Scoring Hot Path
-**Learning:** `_rubric_difficulty_components` in `train_rlaif.py` is a hot path for scoring. It was reconstructing keyword lists and regex patterns on every call. Moving these to module-level constants and pre-compiling regexes yielded a ~9% speedup for the function.
-**Action:** For hot-path functions in python scripts (especially those called per-sample), ensure constants and regexes are defined at module level to avoid reconstruction overhead.
-## 2024-05-22 - [Optimizing Large Cache Iteration]
-**Learning:** `OrderedDict` items iteration in `train_rlaif.py` was using `list(items())` to safely iterate while modifying, creating a massive O(N) copy overhead (100k items).
-**Action:** In fork-join threading architectures (like `ThreadPoolExecutor` context managers used here), worker threads are joined before the main thread performs cleanup. This allows safe, zero-copy iteration over collections using view iterators (`items()`) instead of snapshots (`list(items())`), provided the main thread logic itself is correct. Always verify threading model before removing defensive copies.
-## 2024-03-24 - Efficient Dictionary Iteration in Python
-**Learning:** Iterating over `dict.items()` directly (a view) is significantly faster (30-40%) and more memory efficient than `list(dict.items())` for large dictionaries, provided the dictionary structure is not modified *during* the iteration.
-**Action:** When collecting keys for removal or processing dictionary items, iterate directly over `.items()` or `keys()` and defer modification to a second pass, rather than snapshotting the entire dictionary with `list()`.
-## 2024-01-19 - Regex Compilation Performance
-**Learning:** Pre-compiling regex patterns (`re.compile`) at the module level in hot-path functions like `_rubric_difficulty_components` and `_extract_score` provided significant performance gains (14% and 38% respectively) compared to compiling inside the function.
-**Action:** When implementing heuristic functions or text processing utilities that use regex, always extract static patterns to module-level constants. This is especially critical in training loops where these functions are called thousands of times.
+## 2024-05-22 - Safe Caching of Mutable Objects
+**Learning:** `_rubric_difficulty_components` in `train_rlaif.py` returns a mutable dictionary. Simply caching it with `@lru_cache` is dangerous because callers might modify the returned dictionary, polluting the cache for future calls.
+**Action:** When caching functions that return mutable objects (dicts, lists), use a two-layer approach: 1) A cached implementation function (`_impl`) that returns the object, and 2) A wrapper function that calls `_impl(...).copy()` to return a safe, independent copy to the caller. This incurs a small copy cost but guarantees correctness.

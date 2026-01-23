@@ -297,7 +297,10 @@ def _extract_score(text: str) -> Optional[float]:
     return None
 
 
-def _rubric_difficulty_components(prompt: str, language: str) -> dict[str, float]:
+# Cache heuristic results to avoid re-scanning the same prompt multiple times
+# (e.g. during num_samples_per_prompt generation loop).
+@lru_cache(maxsize=1024)
+def _rubric_difficulty_components_impl(prompt: str, language: str) -> dict[str, float]:
     """Estimate how *demanding* the prompt is along the teacher rubric dimensions.
 
     Returns values in [0,1] (higher = more demanding).
@@ -358,6 +361,19 @@ def _rubric_difficulty_components(prompt: str, language: str) -> dict[str, float
         "rubric_demand": float(min(1.0, max(0.0, demand))),
         "lang_weight": float(lang_weight),
     }
+
+
+def _rubric_difficulty_components(prompt: str, language: str) -> dict[str, float]:
+    """Estimate how *demanding* the prompt is along the teacher rubric dimensions.
+
+    Returns values in [0,1] (higher = more demanding).
+
+    This is intentionally a lightweight heuristic (keyword/constraint based) so it can run in the hot path.
+
+    Note: This is a wrapper around a cached implementation that returns a defensive copy.
+    This ensures that even if callers modify the returned dictionary, the cache remains unpolluted.
+    """
+    return _rubric_difficulty_components_impl(prompt, language).copy()
 
 
 def _strip_code_fences(text: str) -> str:
