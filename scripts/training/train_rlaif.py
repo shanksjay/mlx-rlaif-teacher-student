@@ -252,51 +252,6 @@ _RE_SCORE_PERCENT = re.compile(r"(?<!\d)(\d+(?:\.\d+)?)\s*%(?!\d)")
 _RE_SCORE_FLOAT = re.compile(r"(?<!\d)(?:0(?:\.\d+)?|1(?:\.0+)?|\.\d+)(?!\d)")
 
 
-def _strip_code_fences(text: str) -> str:
-    """Remove surrounding ```lang ... ``` fences if present."""
-    t = (text or "").strip()
-    # Remove a leading fence line like ``` or ```python
-    t = _RE_FENCE_START.sub("", t)
-    # Remove a trailing fence
-    t = _RE_FENCE_END.sub("", t)
-    return t.strip()
-
-
-def _extract_score(text: str) -> Optional[float]:
-    """Best-effort extraction of a float score in [0,1] from a teacher response."""
-    if not text:
-        return None
-    cleaned = _strip_code_fences(text).strip()
-    # First token often is the score; this avoids picking up rubric numbers if the model misbehaves.
-    first_tok = cleaned.split()[0].strip() if cleaned.split() else cleaned
-    for candidate in (first_tok, cleaned):
-        try:
-            v = float(candidate)
-            if 0.0 <= v <= 1.0:
-                return v
-        except Exception:
-            pass
-    # Percent form like "75%" -> 0.75
-    m = _RE_SCORE_PERCENT.search(cleaned)
-    if m:
-        try:
-            v = float(m.group(1)) / 100.0
-            if 0.0 <= v <= 1.0:
-                return v
-        except Exception:
-            pass
-    # Float in [0,1], including ".75"
-    m = _RE_SCORE_FLOAT.search(cleaned)
-    if m:
-        try:
-            v = float(m.group(0))
-            if 0.0 <= v <= 1.0:
-                return v
-        except Exception:
-            pass
-    return None
-
-
 # Cache heuristic results to avoid re-scanning the same prompt multiple times
 # (e.g. during num_samples_per_prompt generation loop).
 @lru_cache(maxsize=1024)
@@ -8526,8 +8481,10 @@ class RLAIFTrainer:
         """Get current system metrics (CPU and memory usage)"""
         try:
             # CPU usage
-            cpu_percent = psutil.cpu_percent(interval=0.1)
-            cpu_per_core = psutil.cpu_percent(interval=0.1, percpu=True)
+            # Use interval=None to be non-blocking (returns usage since last call)
+            # This avoids blocking the main thread for 0.2s+ per logging step
+            cpu_percent = psutil.cpu_percent(interval=None)
+            cpu_per_core = psutil.cpu_percent(interval=None, percpu=True)
             
             # Memory usage
             memory = psutil.virtual_memory()
