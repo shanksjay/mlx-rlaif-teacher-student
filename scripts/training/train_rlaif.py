@@ -347,7 +347,9 @@ def _extract_score(text: str) -> Optional[float]:
         return None
     cleaned = _strip_code_fences(text).strip()
     # First token often is the score; this avoids picking up rubric numbers if the model misbehaves.
-    first_tok = cleaned.split()[0].strip() if cleaned.split() else cleaned
+    # Optimization: Use maxsplit=1 to avoid tokenizing the entire text
+    # Note: cleaned is already stripped, so if it's not empty, it has at least one token.
+    first_tok = cleaned.split(maxsplit=1)[0] if cleaned else cleaned
     for candidate in (first_tok, cleaned):
         try:
             v = float(candidate)
