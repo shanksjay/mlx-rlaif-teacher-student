@@ -5,3 +5,7 @@
 ## 2024-05-22 - Non-blocking System Metrics
 **Learning:** `psutil.cpu_percent(interval=0.1)` blocks the calling thread for the specified interval. When used in a training loop (e.g., for logging), this adds unnecessary latency (e.g., 0.2s if called twice).
 **Action:** Use `psutil.cpu_percent(interval=None)` for non-blocking calls. This returns the CPU usage since the last call. Be aware that the first call returns 0.0, which is acceptable for periodic logging.
+
+## 2024-05-22 - Redundant Tokenization in DataLoaders
+**Learning:** `CodeDataset` in `train_rlaif.py` was tokenizing prompts in `__getitem__` (returning `input_ids`), but the training loop (`train`) only used the raw `prompt` string to generate samples (which are then re-tokenized). This meant the initial tokenization was 100% wasted CPU cycles and memory.
+**Action:** When optimizing DataLoaders, check if the returned tensors are actually used in the loop. If the loop consumes raw text (e.g. for generation), remove tokenization from the Dataset class.
