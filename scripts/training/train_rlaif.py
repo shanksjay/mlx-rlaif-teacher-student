@@ -528,7 +528,10 @@ class RLAIFConfig:
 
 
 class CodeDataset(Dataset):
-    """Dataset for code training examples"""
+    """Dataset for code training examples.
+
+    Returns raw prompts for generation. Tokenization is handled during generation.
+    """
     
     def __init__(self, data_file: str, tokenizer, max_length: int = 2048):
         self.tokenizer = tokenizer
@@ -560,18 +563,11 @@ class CodeDataset(Dataset):
         # Format prompt with language context
         formatted_prompt = f"Write high-quality {language} code:\n\n{prompt}\n\nCode:"
         
-        # Tokenize
-        encoding = self.tokenizer(
-            formatted_prompt,
-            truncation=True,
-            max_length=self.max_length,
-            padding='max_length',
-            return_tensors='pt'
-        )
+        # Optimization: Skip tokenization as it is redundant.
+        # The training loop uses the prompt text to generate samples via generate_student_samples,
+        # which handles its own tokenization.
         
         return {
-            'input_ids': encoding['input_ids'].squeeze(),
-            'attention_mask': encoding['attention_mask'].squeeze(),
             'prompt': prompt,
             'language': language,
             'prompt_text': formatted_prompt
