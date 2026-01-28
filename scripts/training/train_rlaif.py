@@ -557,24 +557,19 @@ class CodeDataset(Dataset):
         prompt = item.get('prompt', '')
         language = item.get('language', 'python')
         
-        # Format prompt with language context
-        formatted_prompt = f"Write high-quality {language} code:\n\n{prompt}\n\nCode:"
-        
-        # Tokenize
-        encoding = self.tokenizer(
-            formatted_prompt,
-            truncation=True,
-            max_length=self.max_length,
-            padding='max_length',
-            return_tensors='pt'
-        )
+        # PERFORMANCE OPTIMIZATION:
+        # We deliberately skip tokenization here ('input_ids') because:
+        # 1. The training loop (RLAIF) uses raw 'prompt' strings to generate student samples first.
+        # 2. Training happens on (Prompt + Generated Response), so the initial prompt-only input_ids
+        #    computed here would be discarded/unused anyway.
+        # 3. This avoids wasted CPU cycles and memory allocation in the data loader.
+        #    (Especially critical when num_workers=0 on M5/MPS setups).
         
         return {
-            'input_ids': encoding['input_ids'].squeeze(),
-            'attention_mask': encoding['attention_mask'].squeeze(),
             'prompt': prompt,
             'language': language,
-            'prompt_text': formatted_prompt
+            # 'prompt_text' kept for compatibility if needed, though mostly reconstructed later
+            'prompt_text': f"Write high-quality {language} code:\n\n{prompt}\n\nCode:"
         }
 
 
