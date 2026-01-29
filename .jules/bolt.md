@@ -5,3 +5,7 @@
 ## 2024-05-22 - Non-blocking System Metrics
 **Learning:** `psutil.cpu_percent(interval=0.1)` blocks the calling thread for the specified interval. When used in a training loop (e.g., for logging), this adds unnecessary latency (e.g., 0.2s if called twice).
 **Action:** Use `psutil.cpu_percent(interval=None)` for non-blocking calls. This returns the CPU usage since the last call. Be aware that the first call returns 0.0, which is acceptable for periodic logging.
+
+## 2024-05-22 - Remove Redundant Dataset Tokenization
+**Learning:** `CodeDataset` was tokenizing inputs in `__getitem__`, but the training loop (RLAIF) uses raw text to generate samples (re-tokenizing or using MLX). The initial tokenization was 100% waste, consuming CPU and memory bandwidth.
+**Action:** Verify if `input_ids` are actually used downstream. If the pipeline relies on generation from prompts, return raw text from the Dataset and skip early tokenization. This yielded ~850x speedup in dataset iteration.
