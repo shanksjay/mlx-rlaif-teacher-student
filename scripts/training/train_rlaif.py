@@ -2156,6 +2156,7 @@ class RLAIFTrainer:
         self.config = config
         self.config_path = config_path  # Store path to config.yaml for dynamic updates
         self.device = self._setup_device()
+        self._peak_gpu_tflops = None  # Cache for peak GPU TFLOPS to avoid repeated sysctl calls
         self._unsloth_enabled = False
         self._unsloth_flm = None  # set to unsloth.FastLanguageModel when available
         self._json_summaries_dir = None
@@ -8659,7 +8660,13 @@ class RLAIFTrainer:
             return 0.0
     
     def _get_peak_gpu_tflops(self) -> float:
-        """Get peak GPU TFLOPS for the current hardware"""
+        """Get peak GPU TFLOPS for the current hardware (cached)"""
+        if self._peak_gpu_tflops is None:
+            self._peak_gpu_tflops = self._get_peak_gpu_tflops_impl()
+        return self._peak_gpu_tflops
+
+    def _get_peak_gpu_tflops_impl(self) -> float:
+        """Get peak GPU TFLOPS for the current hardware (implementation)"""
         try:
             # Check if configured peak TFLOPS is provided
             configured_peak = getattr(self.config, 'gpu_peak_tflops', None)
