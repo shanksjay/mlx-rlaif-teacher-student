@@ -6130,9 +6130,13 @@ class RLAIFTrainer:
                                 self._epoch_grad_norms.append(float(grad_norm))
                                 
                                 # Comprehensive gradient and optimizer debugging before step
-                                self._debug_gradients_and_optimizer(self.optimizer, self.scheduler, global_step)
-                                
-                                param_state_before = self._capture_parameter_state()
+                                # Optimization: Only run on logging steps (or initial steps for sanity check) to reduce overhead
+                                should_monitor_params = (global_step % self.config.logging_steps == 0) or (global_step <= 5)
+                                if should_monitor_params:
+                                    self._debug_gradients_and_optimizer(self.optimizer, self.scheduler, global_step)
+                                    param_state_before = self._capture_parameter_state()
+                                else:
+                                    param_state_before = {}
                                 
                                 # Sanity test: verify parameters change (run at step 1 or 2, or when LR > 0)
                                 should_run_sanity = (
@@ -6205,9 +6209,10 @@ class RLAIFTrainer:
                                             logger.info(f"[Step {global_step}] Effective LR (after step): {lr_after:.2e}")
                                     except Exception:
                                         pass  # Don't fail on LR logging
-                                param_state_after = self._capture_parameter_state()
-                                param_changes = self._compute_parameter_changes(param_state_before, param_state_after)
-                                epoch_param_changes.append(param_changes)
+                                if should_monitor_params:
+                                    param_state_after = self._capture_parameter_state()
+                                    param_changes = self._compute_parameter_changes(param_state_before, param_state_after)
+                                    epoch_param_changes.append(param_changes)
                                 self.optimizer.zero_grad(set_to_none=True)
                                 
                                 global_step += 1
@@ -6717,10 +6722,13 @@ class RLAIFTrainer:
                             self._epoch_grad_norms.append(float(grad_norm))
                             
                             # Comprehensive gradient and optimizer debugging before step
-                            self._debug_gradients_and_optimizer(optimizer, scheduler, global_step)
-                            
-                            # Capture parameter state before optimizer step to track changes
-                            param_state_before = self._capture_parameter_state()
+                            # Optimization: Only run on logging steps (or initial steps) to reduce overhead
+                            should_monitor_params = (global_step % self.config.logging_steps == 0) or (global_step <= 5)
+                            if should_monitor_params:
+                                self._debug_gradients_and_optimizer(optimizer, scheduler, global_step)
+                                param_state_before = self._capture_parameter_state()
+                            else:
+                                param_state_before = {}
                             
                             # Sanity test: verify parameters change (run at step 1 or 2, or when LR > 0)
                             should_run_sanity = (
@@ -6808,9 +6816,10 @@ class RLAIFTrainer:
                                 except Exception:
                                     pass  # Don't fail on LR logging
                             # Capture parameter state after optimizer step and compute changes
-                            param_state_after = self._capture_parameter_state()
-                            param_changes = self._compute_parameter_changes(param_state_before, param_state_after)
-                            epoch_param_changes.append(param_changes)
+                            if should_monitor_params:
+                                param_state_after = self._capture_parameter_state()
+                                param_changes = self._compute_parameter_changes(param_state_before, param_state_after)
+                                epoch_param_changes.append(param_changes)
                             self.optimizer.zero_grad(set_to_none=True)
                             # Reset gradient accumulation memory tracking after zero_grad
                             # This marks the start of a new accumulation cycle
@@ -7577,10 +7586,13 @@ class RLAIFTrainer:
                     self._epoch_grad_norms.append(float(grad_norm))
                     
                     # Comprehensive gradient and optimizer debugging before step
-                    self._debug_gradients_and_optimizer(optimizer, scheduler, global_step)
-                    
-                    # Track parameter changes for epoch-end flush
-                    param_state_before = self._capture_parameter_state()
+                    # Optimization: Only run on logging steps (or initial steps) to reduce overhead
+                    should_monitor_params = (global_step % self.config.logging_steps == 0) or (global_step <= 5)
+                    if should_monitor_params:
+                        self._debug_gradients_and_optimizer(optimizer, scheduler, global_step)
+                        param_state_before = self._capture_parameter_state()
+                    else:
+                        param_state_before = {}
                     if param_state_before:
                         logger.debug(f"Captured {len(param_state_before)} parameters before optimizer step")
                     
@@ -7655,13 +7667,14 @@ class RLAIFTrainer:
                                 logger.info(f"[Step {global_step}] Effective LR (after step): {lr_after:.2e}")
                         except Exception:
                             pass  # Don't fail on LR logging
-                    param_state_after = self._capture_parameter_state()
-                    if param_state_after:
-                        logger.debug(f"Captured {len(param_state_after)} parameters after optimizer step")
-                    param_changes = self._compute_parameter_changes(param_state_before, param_state_after)
-                    # Always append parameter changes (even if zero) to track optimizer steps
-                    # This ensures num_updates accurately reflects the number of optimizer steps
-                    epoch_param_changes.append(param_changes)
+                    if should_monitor_params:
+                        param_state_after = self._capture_parameter_state()
+                        if param_state_after:
+                            logger.debug(f"Captured {len(param_state_after)} parameters after optimizer step")
+                        param_changes = self._compute_parameter_changes(param_state_before, param_state_after)
+                        # Always append parameter changes (even if zero) to track optimizer steps
+                        # This ensures num_updates accurately reflects the number of optimizer steps
+                        epoch_param_changes.append(param_changes)
                     if param_changes.get('mean_abs_change', 0.0) > 0:
                         logger.info(f"Parameter changes recorded: mean_abs={param_changes.get('mean_abs_change', 0.0):.2e}, max_abs={param_changes.get('max_abs_change', 0.0):.2e}")
                     else:
