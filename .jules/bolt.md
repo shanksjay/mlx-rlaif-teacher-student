@@ -5,3 +5,7 @@
 ## 2024-05-22 - Non-blocking System Metrics
 **Learning:** `psutil.cpu_percent(interval=0.1)` blocks the calling thread for the specified interval. When used in a training loop (e.g., for logging), this adds unnecessary latency (e.g., 0.2s if called twice).
 **Action:** Use `psutil.cpu_percent(interval=None)` for non-blocking calls. This returns the CPU usage since the last call. Be aware that the first call returns 0.0, which is acceptable for periodic logging.
+
+## 2026-02-03 - Expensive Monitoring in Hot Loop
+**Learning:** `train_rlaif.py` was calling `_capture_parameter_state()` (cloning all model parameters) and `_compute_parameter_changes()` on *every* optimizer step to track updates. This caused massive overhead due to memory allocation, copy, and CPU-GPU synchronization (`.item()` calls), reducing training throughput significantly (simulated ~4x slowdown).
+**Action:** Gate expensive monitoring/debugging checks behind `if step % logging_steps == 0`. Ensure monitoring code (like parameter diffing or gradient norm checks) runs only when necessary for logging, not on every iteration.
