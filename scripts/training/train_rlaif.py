@@ -560,18 +560,13 @@ class CodeDataset(Dataset):
         # Format prompt with language context
         formatted_prompt = f"Write high-quality {language} code:\n\n{prompt}\n\nCode:"
         
-        # Tokenize
-        encoding = self.tokenizer(
-            formatted_prompt,
-            truncation=True,
-            max_length=self.max_length,
-            padding='max_length',
-            return_tensors='pt'
-        )
+        # Optimization: Return raw text only.
+        # We avoid tokenizing here because:
+        # 1. Generation phase uses raw text prompts (re-tokenizing would be redundant).
+        # 2. Training phase uses (prompt + generated_code) which needs to be tokenized together.
+        # This removes the CPU bottleneck in the DataLoader.
         
         return {
-            'input_ids': encoding['input_ids'].squeeze(),
-            'attention_mask': encoding['attention_mask'].squeeze(),
             'prompt': prompt,
             'language': language,
             'prompt_text': formatted_prompt
